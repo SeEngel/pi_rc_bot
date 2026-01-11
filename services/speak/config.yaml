@@ -19,7 +19,7 @@ tts:
   # - openai uses OpenAI TTS (requires OPENAI_API_KEY)
   # - piper uses local Piper voices (auto-downloads models)
   #engine: openai
-  engine: openai
+  engine: piper
 
   # Language (used for Pico2Wave). Examples:
   #   en-US, en-GB, de-DE, es-ES, fr-FR, it-IT

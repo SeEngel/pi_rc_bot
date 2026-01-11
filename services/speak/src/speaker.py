@@ -141,10 +141,19 @@ class Speaker:
                     # Non-streaming playback with optional gain.
                     from sunfounder_voice_assistant._audio_player import AudioPlayer  # type: ignore
 
-                    file = "/tmp/tts_piper.wav"
-                    self._tts_obj.tts(text, file)
-                    with AudioPlayer(gain=gain) as player:
-                        player.play_file(file)
+                    # Use a unique temporary file per request to avoid collisions and
+                    # permission issues (e.g. when switching between sudo/non-sudo runs).
+                    fd, file = tempfile.mkstemp(prefix="pi_rc_bot_tts_piper_", suffix=".wav")
+                    os.close(fd)
+                    try:
+                        self._tts_obj.tts(text, file)
+                        with AudioPlayer(gain=gain) as player:
+                            player.play_file(file)
+                    finally:
+                        try:
+                            os.remove(file)
+                        except Exception:
+                            pass
                     return True
 
                 # pico2wave/espeak via robot_hat
