@@ -5,3 +5,6 @@ uvicorn[standard]>=0.27
 
 # Vision model client (OpenAI-compatible API)
 openai>=1.0.0
+
+# Image manipulation (grid overlay)
+Pillow>=10.0

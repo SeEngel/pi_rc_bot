@@ -405,6 +405,165 @@ def main() -> int:
 			text = ""
 		return {"text": text}
 
+	@app.post(
+		"/observe/direction",
+		summary="Observe and suggest direction",
+		description=(
+			"Captures one image from the camera, draws a **red 2x3 grid overlay**, and asks a vision model "
+			"to select **one grid cell** that the robot should move toward.\n\n"
+			"The coordinate system is **normalized** to the image size:\n"
+			"- Rows are indexed **top → bottom**: `0` (top / **far**), `1` (bottom / **near**)\n"
+			"- Columns are indexed **left → right**: `0` (left), `1` (center/forward), `2` (right)\n\n"
+			"### Movement mapping (hard-coded)\n\n"
+			"| cell (row,col) | meaning returned as `action` |\n"
+			"|---|---|\n"
+			"| (0,0) | go far left |\n"
+			"| (0,1) | go far forward |\n"
+			"| (0,2) | go far right |\n"
+			"| (1,0) | left |\n"
+			"| (1,1) | forward |\n"
+			"| (1,2) | right |\n\n"
+			"### How an agent should use this endpoint\n\n"
+			"1) Call this endpoint (optionally with a goal/question).\n"
+			"2) Read `cell.row`/`cell.col` and the mapped `action`.\n"
+			"3) Use `why` as the model's justification, and `fit` as the model's commentary about whether the mapped "
+			"movement string actually makes sense for the scene (e.g., it may say the object is on a wall so moving "
+			"forward doesn't help).\n\n"
+			"This endpoint uses the **system prompt configured in** `config.yaml` (vision.instructions)."
+		),
+		openapi_extra={
+			"requestBody": {
+				"required": False,
+				"content": {
+					"application/json": {
+						"schema": {
+							"type": "object",
+							"properties": {
+								"question": {
+									"type": "string",
+									"description": "Optional extra goal/question to guide cell selection.",
+								}
+							},
+						},
+					}
+				},
+			},
+			"responses": {
+				"200": {
+					"description": "Successful response",
+					"content": {
+						"application/json": {
+							"schema": {
+								"type": "object",
+								"properties": {
+									"cell": {
+										"type": "object",
+										"properties": {
+											"row": {"type": "integer", "enum": [0, 1]},
+											"col": {"type": "integer", "enum": [0, 1, 2]},
+										},
+										"required": ["row", "col"],
+									},
+									"action": {"type": "string"},
+									"why": {"type": "string"},
+									"fit": {"type": "string"},
+									"llm": {
+										"type": "object",
+										"description": "Parsed model output as JSON.",
+										"properties": {
+											"row": {"type": "integer", "enum": [0, 1]},
+											"col": {"type": "integer", "enum": [0, 1, 2]},
+											"why": {"type": "string"},
+											"fit": {"type": "string"},
+										},
+										"required": ["row", "col", "why", "fit"],
+									},
+									"parse_error": {
+										"type": "string",
+										"description": "Present if the model response could not be parsed cleanly; defaults are used.",
+									},
+									"llm_raw_text": {
+										"type": "string",
+										"description": "Only present when `parse_error` is present (debugging).",
+									},
+									"debug": {
+										"type": "object",
+										"description": "Optional debugging fields controlled by config.yaml (vision.debug.*).",
+										"properties": {
+											"grid_image_saved_path": {"type": "string", "nullable": True},
+											"grid_image_data_url": {
+												"type": "string",
+												"description": "If enabled, a data URL: data:image/jpeg;base64,...",
+											},
+										},
+									},
+								},
+								"required": ["cell", "action", "why", "fit", "llm"],
+							},
+						}
+					},
+				}
+			}
+		},
+	)
+	async def observe_direction(request: Request) -> dict[str, Any]:
+		ob = observer
+		if ob is None:
+			raise HTTPException(status_code=503, detail="Observer not initialized")
+		if not ob.is_available:
+			raise HTTPException(status_code=503, detail=ob.unavailable_reason or "Vision unavailable")
+
+		raw = await request.body()
+		question: str | None = None
+		try:
+			if raw:
+				import json
+
+				data = json.loads(raw.decode("utf-8", errors="strict"))
+				if isinstance(data, dict) and data.get("question") is not None:
+					question = str(data.get("question") or "").strip() or None
+		except Exception:
+			pass
+
+		def _do_observe() -> dict[str, Any]:
+			with observer_lock:
+				return ob.observe_direction_once(question=question)
+
+		try:
+			import anyio
+
+			res = await anyio.to_thread.run_sync(_do_observe)
+		except Exception as exc:
+			raise HTTPException(status_code=500, detail=f"Observe-direction failed: {exc}") from exc
+
+		# Return a stable, minimal shape (additional debug keys may be present).
+		cell = res.get("cell") if isinstance(res, dict) else None
+		if not isinstance(cell, dict):
+			cell = {"row": 1, "col": 1}
+		llm = res.get("llm") if isinstance(res, dict) else None
+		if not isinstance(llm, dict):
+			llm = {"row": int(cell.get("row", 1)), "col": int(cell.get("col", 1)), "why": "", "fit": ""}
+
+		out: dict[str, Any] = {
+			"cell": {"row": int(cell.get("row", 1)), "col": int(cell.get("col", 1))},
+			"action": str(res.get("action") or ""),
+			"why": str(res.get("why") or ""),
+			"fit": str(res.get("fit") or ""),
+			"llm": {
+				"row": int(llm.get("row", int(cell.get("row", 1)))),
+				"col": int(llm.get("col", int(cell.get("col", 1)))),
+				"why": str(llm.get("why") or ""),
+				"fit": str(llm.get("fit") or ""),
+			},
+		}
+		debug = res.get("debug") if isinstance(res, dict) else None
+		if isinstance(debug, dict) and debug:
+			out["debug"] = debug
+		if res.get("parse_error"):
+			out["parse_error"] = str(res.get("parse_error"))
+			out["llm_raw_text"] = str(res.get("llm_raw_text") or "")
+		return out
+
 	# Start the HTTP server.
 	_ensure_port_free(port)
 	uvicorn.run(app, host=host, port=port, log_level="info")

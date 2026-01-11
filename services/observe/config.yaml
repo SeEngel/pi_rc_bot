@@ -35,6 +35,13 @@ vision:
   # System prompt / behavior instructions (optional)
   instructions: "You are a helpful assistant that describes what is visible in the image."
 
+  # Debug options for /observe/direction
+  # - return_grid_image: if true, the response includes `debug.grid_image_data_url` (a base64 data URL)
+  # - save_grid_image_path: if non-empty, also writes the grid-overlay JPEG to that path
+  debug:
+    return_grid_image: false
+    save_grid_image_path: "./observe-direction-grid.jpg"  # Example: /tmp/observe-direction-grid.jpg
+
   openai:
     # Read API key from environment (recommended):
     #   export OPENAI_API_KEY=...
