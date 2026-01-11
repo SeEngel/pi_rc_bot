@@ -1,0 +1,87 @@
+## Listening service configuration
+##
+## This service mirrors the PiCar-X example `example/16.voice_controlled_car.py`:
+##
+##   from picarx.stt import Vosk
+##   stt = Vosk(language="en-us")
+##   res = stt.listen(stream=False)
+##   text = res.get("text", "")
+##
+## Notes
+## - This service provides a single endpoint to listen once: POST /listen
+## - Select the STT backend via `stt.engine`:
+##     - vosk   (local, uses the PiCar-X / robot_hat Vosk wrapper)
+##     - openai (cloud, uses OpenAI Audio Transcriptions)
+
+stt:
+  # engine: vosk | openai
+  engine: vosk
+
+  # --- Vosk settings (engine=vosk) ---
+  # Language string for Vosk (robot_hat / picarx).
+  # You can find all available language codes here:
+  #   https://alphacephei.com/vosk/models/model-list.json
+  #
+  # Examples:
+  #   - German (default): de
+  #   - US English:       en-us
+  language: de
+
+  # Print transcripts to console for debugging
+  print_text: true
+
+  # If true, do NOT access microphone; endpoints will return a dummy string.
+  # Useful for developing on machines without audio hardware.
+  dry_run: false
+
+  # Text post-processing applied by the service
+  normalize:
+    lowercase: true
+    strip: true
+
+  # --- OpenAI settings (engine=openai) ---
+  # Uses https://platform.openai.com/docs/guides/speech-to-text
+  # (requires OPENAI_API_KEY in the environment or in repo root .env)
+  openai:
+    # Recommended models:
+    #   - gpt-4o-mini-transcribe (good + cheaper)
+    #   - gpt-4o-transcribe      (best quality)
+    #   - whisper-1              (legacy; supports more response_format values)
+    model: gpt-4o-mini-transcribe
+
+    # Optional hint to improve accuracy/latency.
+    # Docs recommend ISO-639-1 codes (e.g. "de", "en").
+    language: de
+
+    # Optional prompt/context to bias transcription.
+    prompt: ""
+
+    # Maximum recording length for microphone capture (seconds).
+    # The service may stop earlier after sustained silence (see stop_silence_seconds).
+    record_seconds: 60.0
+
+    # Stop recording after this much continuous silence *after speech has started*.
+    # Increase this to allow short pauses/breathing between sentences.
+    stop_silence_seconds: 2.0
+
+    # Simple voice activity threshold (RMS). If recording stops too early, lower it.
+    # If it keeps recording background noise, raise it.
+    energy_threshold: 300.0
+
+    # Streaming capture chunk size (ms). Smaller = more responsive, bigger = less overhead.
+    chunk_ms: 50
+
+    # Keep a bit of audio from before speech starts.
+    pre_roll_seconds: 0.25
+
+    # Audio capture settings (keep defaults unless you know you need to change them)
+    # NOTE: Some ALSA devices reject 16000 Hz (paInvalidSampleRate).
+    # If you see that error, set this to 44100 or 48000, or set it to null to auto-use
+    # the microphone device's default sample rate.
+    sample_rate_hz: 16000
+    device: null  # e.g. 0, 1, ... (sounddevice input device index)
+
+service:
+  # HTTP bind
+  host: 0.0.0.0
+  port: 8002
