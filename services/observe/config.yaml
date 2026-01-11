@@ -1,0 +1,57 @@
+## Observe service configuration
+##
+## This service captures an image from the robot camera and asks a vision model
+## to describe what it sees.
+##
+## The default implementation uses the OpenAI Python SDK against an
+## OpenAI-compatible API.
+
+camera:
+  # backend: picamera2
+  backend: picamera2
+
+  # Still capture resolution (Picamera2)
+  width: 1280
+  height: 720
+
+  # Camera warmup time after start (seconds)
+  warmup_seconds: 2.0
+
+  # If non-empty, also save the last captured image to this path (debugging).
+  # Example: /tmp/observe-last.jpg
+  save_last_path: ""
+
+vision:
+  # engine: openai
+  engine: openai
+
+  # If true, do NOT access the camera or call any external API.
+  # Endpoint will return a dummy response.
+  dry_run: false
+
+  # Default question asked when the endpoint body doesn't provide one.
+  default_question: "Describe what you see in this image."
+
+  # System prompt / behavior instructions (optional)
+  instructions: "You are a helpful assistant that describes what is visible in the image."
+
+  openai:
+    # Read API key from environment (recommended):
+    #   export OPENAI_API_KEY=...
+    # or put it in repo root .env as OPENAI_API_KEY=...
+
+    # Vision-capable model name.
+    model: gpt-4o
+
+    # OpenAI-compatible base URL.
+    # - Leave empty ("") to use OpenAI's default API base URL.
+    # - For other providers, this is often something like:
+    #     http://localhost:8000/v1
+    base_url: ""
+
+    temperature: 0.2
+    max_tokens: 200
+
+service:
+  host: 0.0.0.0
+  port: 8003
