@@ -17,6 +17,26 @@ from .protocol import ProtocolLogger
 
 
 @dataclass(frozen=True)
+class AdvisorMemorizerConfig:
+	"""Configuration for the optional MemorizerAgent integration."""
+
+	enabled: bool
+	# Path to agent/memorizer/config.yaml (absolute).
+	config_path: str
+
+	# Behavior toggles.
+	ingest_user_utterances: bool
+	recall_for_questions: bool
+
+	# Retrieval settings.
+	recall_top_n: int
+
+	# Timeouts (seconds) so the advisor loop can't stall forever.
+	ingest_timeout_seconds: float
+	recall_timeout_seconds: float
+
+
+@dataclass(frozen=True)
 class AdvisorMemoryConfig:
 	max_tokens: int
 	avg_chars_per_token: int
@@ -85,6 +105,7 @@ class AdvisorSettings:
 	sound_fallback_to_interaction_on_error: bool
 
 	memory: AdvisorMemoryConfig
+	memorizer: AdvisorMemorizerConfig
 
 
 class AdvisorBrain(BaseWorkbenchChatAgent):
@@ -109,6 +130,8 @@ class AdvisorAgent:
 		self._ledger = AdvisorLedger(entries=[], chars=0)
 		self._summary: str | None = None
 		self._brain: AdvisorBrain | None = None
+		self._memorizer: Any | None = None
+		self._memorizer_task: asyncio.Task[None] | None = None
 		self._last_alone_think_ts = 0.0
 		self._force_interaction_until_ts = 0.0
 		self._protocol = ProtocolLogger(enabled=bool(settings.debug), log_path=settings.debug_log_path)
@@ -222,6 +245,7 @@ class AdvisorAgent:
 		alone_cfg = cfg.get("alone", {}) if isinstance(cfg, dict) else {}
 		sound_cfg = cfg.get("sound_activity", {}) if isinstance(cfg, dict) else {}
 		memory_cfg = cfg.get("memory", {}) if isinstance(cfg, dict) else {}
+		memorizer_cfg = cfg.get("memorizer", {}) if isinstance(cfg, dict) else {}
 
 		name = str((advisor_cfg or {}).get("name") or "AdvisorAgent")
 		persona_instructions = str((advisor_cfg or {}).get("persona_instructions") or "").strip() or "You are an always-on robot advisor."
@@ -237,6 +261,30 @@ class AdvisorAgent:
 		listen_mcp_url = str((mcp_cfg or {}).get("listen_mcp_url") or "http://127.0.0.1:8602/mcp").strip()
 		speak_mcp_url = str((mcp_cfg or {}).get("speak_mcp_url") or "http://127.0.0.1:8601/mcp").strip()
 		observe_mcp_url = str((mcp_cfg or {}).get("observe_mcp_url") or "http://127.0.0.1:8603/mcp").strip()
+
+		# Memorizer (optional, separate agent that uses services/memory MCP)
+		memorizer_enabled = bool((memorizer_cfg or {}).get("enabled") if "enabled" in (memorizer_cfg or {}) else True)
+		memorizer_ingest = bool(
+			(memorizer_cfg or {}).get("ingest_user_utterances")
+			if "ingest_user_utterances" in (memorizer_cfg or {})
+			else True
+		)
+		memorizer_recall = bool(
+			(memorizer_cfg or {}).get("recall_for_questions")
+			if "recall_for_questions" in (memorizer_cfg or {})
+			else True
+		)
+		recall_top_n = int((memorizer_cfg or {}).get("recall_top_n") or 3)
+		recall_top_n = max(1, min(10, recall_top_n))
+		ingest_timeout_seconds = float((memorizer_cfg or {}).get("ingest_timeout_seconds") or 12.0)
+		recall_timeout_seconds = float((memorizer_cfg or {}).get("recall_timeout_seconds") or 12.0)
+
+		config_path_raw = str((memorizer_cfg or {}).get("config_path") or "agent/memorizer/config.yaml").strip()
+		# Resolve relative paths from repo root.
+		memorizer_config_path = config_path_raw
+		if not os.path.isabs(memorizer_config_path):
+			memorizer_config_path = os.path.join(repo_root, memorizer_config_path)
+		memorizer_config_path = os.path.abspath(memorizer_config_path)
 
 		min_transcript_chars = int((interaction_cfg or {}).get("min_transcript_chars") or 3)
 		max_listen_attempts = int((interaction_cfg or {}).get("max_listen_attempts") or 2)
@@ -302,6 +350,16 @@ class AdvisorAgent:
 			summary_max_chars=int((memory_cfg or {}).get("summary_max_chars") or 2500),
 		)
 
+		memorizer = AdvisorMemorizerConfig(
+			enabled=bool(memorizer_enabled),
+			config_path=memorizer_config_path,
+			ingest_user_utterances=bool(memorizer_ingest),
+			recall_for_questions=bool(memorizer_recall),
+			recall_top_n=int(recall_top_n),
+			ingest_timeout_seconds=float(ingest_timeout_seconds),
+			recall_timeout_seconds=float(recall_timeout_seconds),
+		)
+
 		return cls(
 			AdvisorSettings(
 				name=name,
@@ -338,8 +396,32 @@ class AdvisorAgent:
 				sound_arecord_device=sound_arecord_device,
 				sound_fallback_to_interaction_on_error=sound_fallback_to_interaction_on_error,
 				memory=mem,
+				memorizer=memorizer,
 			)
 		)
+
+	async def _ensure_memorizer(self) -> Any:
+		"""Create and enter the MemorizerAgent if enabled."""
+		if self._dry_run:
+			raise RuntimeError("Memorizer disabled in dry-run mode")
+		if not bool(self.settings.memorizer.enabled):
+			raise RuntimeError("Memorizer is disabled by config")
+		if self._memorizer is not None:
+			return self._memorizer
+
+		# Lazy import so advisor can run even if memorizer module isn't present.
+		from agent.memorizer.src.memorizer_agent import MemorizerAgent
+
+		cfg_path = str(self.settings.memorizer.config_path)
+		memorizer = MemorizerAgent.from_config_yaml(cfg_path)
+		await memorizer.__aenter__()
+		self._memorizer = memorizer
+		self._emit(
+			"memorizer_start",
+			component="advisor.memorizer",
+			config_path=cfg_path,
+		)
+		return memorizer
 
 	async def _wait_for_speech_completion(self, *, context: str, max_wait_seconds: float | None = None) -> None:
 		"""Optionally wait until the speak service reports not speaking.
@@ -467,7 +549,199 @@ class AdvisorAgent:
 		self._brain = None
 		if brain is not None:
 			await brain.__aexit__(None, None, None)
+		mem_task = self._memorizer_task
+		self._memorizer_task = None
+		if mem_task is not None and not mem_task.done():
+			mem_task.cancel()
+			try:
+				await mem_task
+			except Exception:
+				pass
+		memorizer = self._memorizer
+		self._memorizer = None
+		if memorizer is not None:
+			try:
+				await memorizer.__aexit__(None, None, None)
+			except Exception:
+				pass
 		self._protocol.close()
+
+	def _should_query_memorizer(self, text: str) -> bool:
+		"""Heuristic: only ask the memorizer for recall when it seems useful."""
+		low = (text or "").strip().lower()
+		if not low:
+			return False
+
+		# Direct memory cues.
+		cues = (
+			"remember",
+			"do you remember",
+			"what did i",
+			"what was my",
+			"what's my",
+			"what is my",
+			"who am i",
+			"my name",
+			"where did i",
+			"where is my",
+			"last time",
+			"earlier",
+			"before",
+			"we talked",
+			"i told you",
+			"did i tell you",
+			# German
+			"erinnerst du",
+			"erinnern",
+			"weißt du noch",
+			"wie heiße ich",
+			"mein name",
+			"wo habe ich",
+			"vorhin",
+			"letztes mal",
+			"habe ich dir gesagt",
+		)
+		if any(c in low for c in cues):
+			return True
+
+		# If the user asks something personal/ongoing (often preference or past fact).
+		if low.startswith("my ") or low.startswith("mein ") or "my " in low or "mein " in low:
+			# Avoid spamming recall for every "my"; keep it to question forms.
+			if "?" in low or any(x in low for x in ("what", "where", "which", "wer", "was", "wo", "welche")):
+				return True
+
+		return False
+
+	async def _memorizer_recall(self, query: str) -> str | None:
+		if self._dry_run:
+			return None
+		if not self.settings.memorizer.enabled or not self.settings.memorizer.recall_for_questions:
+			return None
+		if not self._should_query_memorizer(query):
+			return None
+
+		try:
+			memorizer = await self._ensure_memorizer()
+		except Exception as exc:
+			self._emit("memorizer_warning", component="advisor.memorizer", kind="ensure_failed", error=str(exc))
+			return None
+
+		start = time.perf_counter()
+		self._emit(
+			"memorizer_call_start",
+			component="advisor.memorizer",
+			kind="recall",
+			query=query,
+			url=getattr(memorizer.settings, "memory_mcp_url", None),
+		)
+		try:
+			out = await asyncio.wait_for(
+				memorizer.recall(query, top_n=int(self.settings.memorizer.recall_top_n)),
+				timeout=float(self.settings.memorizer.recall_timeout_seconds),
+			)
+		except asyncio.TimeoutError:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"memorizer_call_error",
+				component="advisor.memorizer",
+				kind="recall",
+				duration_ms=round(dur_ms, 2),
+				error="timeout",
+			)
+			return None
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"memorizer_call_error",
+				component="advisor.memorizer",
+				kind="recall",
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return None
+		else:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			out_s = str(out or "").strip()
+			self._emit(
+				"memorizer_call_end",
+				component="advisor.memorizer",
+				kind="recall",
+				duration_ms=round(dur_ms, 2),
+				preview=out_s[:400],
+			)
+			if not out_s:
+				return None
+			# If memorizer returns an explicit error, don't inject into prompt.
+			if out_s.lower().startswith("error:"):
+				return None
+			return out_s
+
+	async def _memorizer_ingest_background(self, text: str) -> None:
+		"""Ask memorizer to decide whether to store the user utterance.
+
+		Runs as a background task (best-effort) so it doesn't block speaking.
+		"""
+		if self._dry_run:
+			return
+		if not self.settings.memorizer.enabled or not self.settings.memorizer.ingest_user_utterances:
+			return
+		if self._is_bad_transcript(text):
+			return
+		if self._matches_stop_word(text):
+			return
+
+		try:
+			memorizer = await self._ensure_memorizer()
+		except Exception as exc:
+			self._emit("memorizer_warning", component="advisor.memorizer", kind="ensure_failed", error=str(exc))
+			return
+
+		start = time.perf_counter()
+		self._emit(
+			"memorizer_call_start",
+			component="advisor.memorizer",
+			kind="ingest",
+			chars=len(text or ""),
+			preview=text,
+			url=getattr(memorizer.settings, "memory_mcp_url", None),
+		)
+		try:
+			out = await asyncio.wait_for(
+				memorizer.ingest(text, force_store=False),
+				timeout=float(self.settings.memorizer.ingest_timeout_seconds),
+			)
+		except asyncio.TimeoutError:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"memorizer_call_error",
+				component="advisor.memorizer",
+				kind="ingest",
+				duration_ms=round(dur_ms, 2),
+				error="timeout",
+			)
+			return
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"memorizer_call_error",
+				component="advisor.memorizer",
+				kind="ingest",
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return
+		else:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			out_s = str(out or "").strip()
+			self._emit(
+				"memorizer_call_end",
+				component="advisor.memorizer",
+				kind="ingest",
+				duration_ms=round(dur_ms, 2),
+				preview=out_s[:400],
+			)
+			if out_s:
+				self._ledger.append(f"[memorizer] {out_s}")
 
 	def _emit(self, event: str, **fields: Any) -> None:
 		# Streaming JSONL protocol for live debugging.
@@ -535,9 +809,46 @@ class AdvisorAgent:
 
 	def _parse_decision_json(self, raw: str) -> tuple[str | None, bool | None]:
 		"""Parse a brain JSON response. Returns (response_text, need_observe)."""
-		try:
-			obj = json.loads((raw or "").strip())
-		except Exception:
+		def _strip_code_fence(s: str) -> str:
+			s = (s or "").strip()
+			if not s.startswith("```"):
+				return s
+			lines = s.splitlines()
+			if not lines:
+				return ""
+			# Drop opening fence line (``` or ```json)
+			if lines[0].lstrip().startswith("```"):
+				lines = lines[1:]
+			# Drop closing fence line
+			if lines and lines[-1].strip().startswith("```"):
+				lines = lines[:-1]
+			return "\n".join(lines).strip()
+
+		def _try_load_json(s: str) -> Any | None:
+			s = (s or "").strip()
+			if not s:
+				return None
+			try:
+				return json.loads(s)
+			except Exception:
+				pass
+			# Fallback: extract the largest {...} span (handles stray text around the JSON).
+			start = s.find("{")
+			end = s.rfind("}")
+			if start != -1 and end != -1 and end > start:
+				candidate = s[start : end + 1].strip()
+				try:
+					return json.loads(candidate)
+				except Exception:
+					return None
+			return None
+
+		normalized = _strip_code_fence(raw or "")
+		obj = _try_load_json(normalized)
+		if obj is None and normalized != (raw or ""):
+			# One more try on the original (in case the JSON wasn't inside the code fence).
+			obj = _try_load_json(raw or "")
+		if obj is None:
 			return (None, None)
 		if not isinstance(obj, dict):
 			return (None, None)
@@ -779,7 +1090,13 @@ class AdvisorAgent:
 		self._protocol.open()
 		self._emit("memory_summarize_end", component="advisor.memory", path=path)
 
-	async def _decide_and_respond(self, *, human_text: str, observation: str | None) -> tuple[str, bool | None]:
+	async def _decide_and_respond(
+		self,
+		*,
+		human_text: str,
+		observation: str | None,
+		memory_hint: str | None,
+	) -> tuple[str, bool | None]:
 		if self._dry_run:
 			# Minimal, deterministic behavior for test runs.
 			if observation and observation.strip():
@@ -791,6 +1108,11 @@ class AdvisorAgent:
 		obs_block = ""
 		if observation and observation.strip():
 			obs_block = f"\n\nObservation (camera):\n{observation.strip()}\n"
+
+		mem_block = ""
+		if memory_hint and memory_hint.strip():
+			# Keep it clearly separated so the model treats it as tool-provided context.
+			mem_block = "\n\nMemory report (from memorizer agent):\n" + memory_hint.strip() + "\n"
 
 		# Include a small recall window so the model can answer questions about what was
 		# said earlier (otherwise each prompt is effectively standalone).
@@ -815,6 +1137,7 @@ class AdvisorAgent:
 			+ ctx_block
 			+ f"Human said: {human_text.strip()}"
 			+ obs_block
+			+ mem_block
 		)
 		start = time.perf_counter()
 		self._emit(
@@ -900,13 +1223,16 @@ class AdvisorAgent:
 
 		# Decide response.
 		self._emit("state", component="advisor", state="interaction_think")
-		response, need_observe = await self._decide_and_respond(human_text=text, observation=obs)
+		mem_hint = await self._memorizer_recall(text)
+		if mem_hint:
+			self._ledger.append(f"[recall] {mem_hint}")
+		response, need_observe = await self._decide_and_respond(human_text=text, observation=obs, memory_hint=mem_hint)
 
 		# If the brain asked for an observation and we haven't taken one yet, do it once.
 		if need_observe is True and not (obs and obs.strip()):
 			self._emit("state", component="advisor", state="interaction_observe_assist")
 			obs = await self._observe(f"Help answer the human request: {text}")
-			response, _ = await self._decide_and_respond(human_text=text, observation=obs)
+			response, _ = await self._decide_and_respond(human_text=text, observation=obs, memory_hint=mem_hint)
 
 		response = response.strip()
 		if not response:
@@ -915,6 +1241,14 @@ class AdvisorAgent:
 		self._emit("state", component="advisor", state="interaction_speak")
 		await self._speak(response)
 		self._ledger.append(f"Assistant: {response}")
+
+		# Ask memorizer to decide whether to store this user utterance (best-effort, non-blocking).
+		if self.settings.memorizer.enabled and self.settings.memorizer.ingest_user_utterances and not self._dry_run:
+			# Cancel previous background ingest if still running (avoid backlog).
+			if self._memorizer_task is not None and not self._memorizer_task.done():
+				self._memorizer_task.cancel()
+			self._memorizer_task = asyncio.create_task(self._memorizer_ingest_background(text))
+
 		await self._maybe_summarize_and_reset()
 		self._emit("state", component="advisor", state="interaction_end")
 

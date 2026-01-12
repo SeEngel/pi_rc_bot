@@ -41,6 +41,29 @@ mcp:
   speak_mcp_url: "http://127.0.0.1:8601/mcp"
   observe_mcp_url: "http://127.0.0.1:8603/mcp"
 
+memorizer:
+  # If enabled, the advisor will:
+  # - ask the MemorizerAgent to decide whether to store user utterances
+  # - sometimes ask it to recall relevant memories for user questions
+  enabled: true
+
+  # Path to the memorizer agent config.
+  # Relative paths are resolved from repo root.
+  config_path: "agent/memorizer/config.yaml"
+
+  # Store decisions are made by the memorizer (not the advisor).
+  ingest_user_utterances: true
+
+  # Only recall when it seems necessary (advisor uses a light heuristic).
+  recall_for_questions: true
+
+  # How many results per tier (short + long) to request.
+  recall_top_n: 3
+
+  # Safety timeouts (seconds) so the advisor loop can't stall forever.
+  ingest_timeout_seconds: 12.0
+  recall_timeout_seconds: 12.0
+
 interaction:
   # When sound is detected, we attempt STT.
   # If transcript is empty/too short, we can reprompt once.
