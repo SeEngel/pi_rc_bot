@@ -19,7 +19,7 @@ tts:
   # - openai uses OpenAI TTS (requires OPENAI_API_KEY)
   # - piper uses local Piper voices (auto-downloads models)
   #engine: openai
-  engine: piper
+  engine: openai
 
   # Language (used for Pico2Wave). Examples:
   #   en-US, en-GB, de-DE, es-ES, fr-FR, it-IT
@@ -74,9 +74,17 @@ tts:
     # Optional: style instructions
     instructions: ""
     # Stream audio while downloading (low latency)
-    stream: true
-    # Playback gain (1.0 = unchanged). Try 1.5..3.0.
-    gain: 1.5
+    # Note: some robot_hat/OpenAI streaming setups produce artifacts on long texts.
+    # If you hear crackling/noise, set stream=false and enable chunking.
+    stream: false
+    # Playback gain (1.0 = unchanged). Higher values can clip/distort ("crackling").
+    gain: 1.0
+
+    # Long-text handling: split long input into smaller chunks and speak sequentially.
+    # This avoids some backend issues with very long inputs.
+    chunking: true
+    # Max characters per request/chunk.
+    max_chars: 600
 
   # Piper (engine=piper)
   piper:

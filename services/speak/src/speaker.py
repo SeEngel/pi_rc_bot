@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,6 +50,12 @@ class SpeakerSettings:
     openai_instructions: str | None = None
     openai_stream: bool = True
     openai_gain: float = 1.5
+
+    # OpenAI long-text handling
+    # Some backends/streaming modes can produce artifacts on long inputs.
+    # When enabled, we split text into smaller chunks and speak them sequentially.
+    openai_chunking: bool = True
+    openai_max_chars: int = 600
 
     # robot_hat/Piper
     piper_model: str | None = None
@@ -123,11 +130,16 @@ class Speaker:
             try:
                 if engine == "openai":
                     # robot_hat.tts.OpenAI_TTS supports instructions + stream.
-                    self._tts_obj.say(
-                        text,
-                        instructions=self.settings.openai_instructions,
-                        stream=bool(self.settings.openai_stream),
-                    )
+                    chunks = [text]
+                    if self.settings.openai_chunking:
+                        chunks = chunk_text_for_tts(text, max_chars=int(self.settings.openai_max_chars or 600))
+
+                    for chunk in chunks:
+                        self._tts_obj.say(
+                            chunk,
+                            instructions=self.settings.openai_instructions,
+                            stream=bool(self.settings.openai_stream),
+                        )
                     return True
 
                 if engine == "piper":
@@ -214,6 +226,29 @@ class Speaker:
         openai_cfg = tts_cfg.get("openai", {}) if isinstance(tts_cfg, dict) else {}
         piper_cfg = tts_cfg.get("piper", {}) if isinstance(tts_cfg, dict) else {}
 
+        def _get_cfg_bool(obj: Any, key: str, default: bool) -> bool:
+            if not isinstance(obj, dict) or key not in obj:
+                return default
+            val = obj.get(key)
+            if val is None:
+                return default
+            if isinstance(val, str):
+                v = val.strip().lower()
+                if v in {"1", "true", "yes", "y", "on"}:
+                    return True
+                if v in {"0", "false", "no", "n", "off"}:
+                    return False
+            return bool(val)
+
+        def _get_cfg_int(obj: Any, key: str, default: int) -> int:
+            if not isinstance(obj, dict) or key not in obj:
+                return default
+            val = obj.get(key)
+            try:
+                return int(val)
+            except Exception:
+                return default
+
         settings = SpeakerSettings(
             backend=_get_str("backend", "robot_hat"),
             engine=_get_str("engine", "openai"),
@@ -240,6 +275,8 @@ class Speaker:
                 if openai_cfg.get("gain") is not None and openai_cfg.get("gain") != ""
                 else 1.5
             ),
+            openai_chunking=_get_cfg_bool(openai_cfg, "chunking", True),
+            openai_max_chars=max(100, min(4000, _get_cfg_int(openai_cfg, "max_chars", 600))),
             piper_model=(
                 str(piper_cfg.get("model"))
                 if piper_cfg.get("model") is not None and piper_cfg.get("model") != ""
@@ -516,3 +553,88 @@ class Speaker:
 
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
+
+
+def chunk_text_for_tts(text: str, max_chars: int = 600) -> list[str]:
+    """Split long text into reasonably-sized chunks for TTS.
+
+    Goals:
+    - keep chunks under `max_chars` where possible
+    - preserve paragraph boundaries
+    - avoid breaking in the middle of words
+
+    This is intentionally conservative and dependency-free.
+    """
+
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    max_chars = int(max_chars or 600)
+    max_chars = max(100, max_chars)
+
+    # Normalize line endings.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Split on blank lines (paragraphs).
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+
+    def split_sentences(paragraph: str) -> list[str]:
+        # Simple sentence split. Not perfect, but good enough for TTS chunking.
+        # Keeps punctuation attached to the sentence.
+        parts = re.split(r"(?<=[.!?])\s+", paragraph.strip())
+        return [p.strip() for p in parts if p and p.strip()]
+
+    def hard_wrap(s: str) -> list[str]:
+        # Fallback for very long sentences: wrap by words.
+        words = s.split()
+        out: list[str] = []
+        cur: list[str] = []
+        cur_len = 0
+        for w in words:
+            add_len = len(w) + (1 if cur else 0)
+            if cur and cur_len + add_len > max_chars:
+                out.append(" ".join(cur).strip())
+                cur = [w]
+                cur_len = len(w)
+            else:
+                cur.append(w)
+                cur_len += add_len
+        if cur:
+            out.append(" ".join(cur).strip())
+        return [c for c in out if c]
+
+    chunks: list[str] = []
+    buf = ""
+
+    def flush_buf() -> None:
+        nonlocal buf
+        b = buf.strip()
+        if b:
+            chunks.append(b)
+        buf = ""
+
+    for para in paragraphs:
+        sentences = split_sentences(para)
+        if not sentences:
+            continue
+
+        for sent in sentences:
+            if len(sent) > max_chars:
+                # Flush what we have, then add hard-wrapped parts.
+                flush_buf()
+                chunks.extend(hard_wrap(sent))
+                continue
+
+            candidate = sent if not buf else f"{buf} {sent}"
+            if len(candidate) <= max_chars:
+                buf = candidate
+            else:
+                flush_buf()
+                buf = sent
+
+        # Paragraph boundary: flush so TTS inserts a short pause naturally.
+        flush_buf()
+
+    flush_buf()
+    return chunks

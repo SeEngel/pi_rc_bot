@@ -33,6 +33,21 @@ python services/speak/main.py
 
 For `tts.engine: openai` and `tts.engine: piper`, use `tts.openai.gain` / `tts.piper.gain`.
 
+## Troubleshooting crackling/noise (OpenAI TTS)
+
+If you hear "good first sentence, then loud noise/crackling" on longer texts, the two most common causes are:
+
+- **Streaming artifacts** in some `robot_hat` setups. Try:
+	- `tts.openai.stream: false`
+	- `tts.openai.chunking: true`
+	- `tts.openai.max_chars: 400..800`
+
+- **Clipping/distortion** from too much gain/volume. Try:
+	- `tts.openai.gain: 1.0`
+	- reduce OS volume a bit (e.g. `tts.system_volume_percent: 70..90`)
+
+Chunking is implemented in `src/speaker.py` and speaks chunks sequentially (no parallelism, no audio-file concatenation needed).
+
 If you're on `tts.backend: robot_hat`, loudness is primarily controlled by the OS mixer / amp, not by `config.yaml`.
 
 If you have no audio device / no TTS binaries installed, set `tts.dry_run: true` in `services/speak/config.yaml`.
