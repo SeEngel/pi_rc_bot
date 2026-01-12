@@ -2,3 +2,4 @@ robot-hat
 .venv
 __pycache__/
 .env
+*.out
