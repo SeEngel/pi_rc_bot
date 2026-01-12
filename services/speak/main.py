@@ -262,10 +262,9 @@ def _ensure_port_free(port: int) -> None:
 def main() -> int:
 	here = os.path.dirname(os.path.abspath(__file__))
 
-	# Ensure FastAPI deps exist (auto-venv for Debian/PEP-668 systems).
+	# We intentionally do NOT auto-create venvs here.
+	# Install deps globally if needed (e.g. `pip3 install -r services/speak/requirements.txt`).
 	if not FASTAPI_AVAILABLE or uvicorn is None:
-		_ensure_local_venv(here)
-		# If bootstrap couldn't exec, bail out gracefully.
 		print("[speak] FastAPI/uvicorn not available")
 		return 1
 
@@ -320,6 +319,7 @@ def main() -> int:
 
 	@app.post(
 		"/speak",
+		operation_id="speak",
 		summary="Speak a text",
 		description=(
 			"Consumes a string (JSON: {text: <string>}) and speaks it out loud on the speakers so a human can hear it."
@@ -387,9 +387,78 @@ def main() -> int:
 			"tts_available": True,
 		}
 
-	# Start the HTTP server.
-	_ensure_port_free(8001)
-	uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
+	# Start the HTTP API server + a proper MCP server (separate port).
+	import asyncio
+
+	try:
+		from fastmcp import FastMCP
+	except Exception as exc:
+		print(f"[speak] fastmcp not installed: {exc}")
+		print("[speak] Install it with: pip3 install fastmcp")
+		return 1
+
+	api_host = "0.0.0.0"
+	api_port = 8001
+	mcp_host = api_host
+	mcp_port = api_port + 600
+
+	# Convert FastAPI -> MCP (tools by default) and expose streamable HTTP at /mcp.
+	mcp = FastMCP.from_fastapi(app=app, name="pi_rc_bot Speak MCP")
+	mcp_app = mcp.http_app(path="/mcp")
+
+	_ensure_port_free(api_port)
+	_ensure_port_free(mcp_port)
+
+	async def _serve_both() -> None:
+		api_server = uvicorn.Server(
+			uvicorn.Config(app, host=api_host, port=api_port, log_level="info", loop="asyncio")
+		)
+		mcp_server = uvicorn.Server(
+			uvicorn.Config(mcp_app, host=mcp_host, port=mcp_port, log_level="info", loop="asyncio")
+		)
+
+		# We'll manage signals once for both servers.
+		api_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+		mcp_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+
+		def _request_shutdown() -> None:
+			api_server.should_exit = True
+			mcp_server.should_exit = True
+
+		try:
+			loop = asyncio.get_running_loop()
+			for sig in (signal.SIGINT, signal.SIGTERM):
+				try:
+					loop.add_signal_handler(sig, _request_shutdown)
+				except NotImplementedError:
+					signal.signal(sig, lambda *_: _request_shutdown())
+		except Exception:
+			# Fall back to uvicorn defaults if signal handler wiring fails.
+			pass
+
+		t1 = asyncio.create_task(api_server.serve())
+		t2 = asyncio.create_task(mcp_server.serve())
+		done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_EXCEPTION)
+
+		# If one server errors, stop the other.
+		exc: BaseException | None = None
+		for d in done:
+			try:
+				e = d.exception()
+			except asyncio.CancelledError:
+				e = None
+			if e is not None:
+				exc = e
+				break
+
+		_request_shutdown()
+		for p in pending:
+			p.cancel()
+		await asyncio.gather(*pending, return_exceptions=True)
+		if exc is not None:
+			raise exc
+
+	asyncio.run(_serve_both())
 	return 0
 
 

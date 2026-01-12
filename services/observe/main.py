@@ -262,10 +262,9 @@ def _ensure_port_free(port: int) -> None:
 def main() -> int:
 	here = os.path.dirname(os.path.abspath(__file__))
 
-	# Ensure FastAPI deps exist (auto-venv for Debian/PEP-668 systems).
+	# We intentionally do NOT auto-create venvs here.
+	# Install deps globally if needed (e.g. `pip3 install -r services/observe/requirements.txt`).
 	if not FASTAPI_AVAILABLE or uvicorn is None:
-		_ensure_local_venv(here)
-		# If bootstrap couldn't exec, bail out gracefully.
 		print("[observe] FastAPI/uvicorn not available")
 		return 1
 
@@ -332,6 +331,7 @@ def main() -> int:
 
 	@app.post(
 		"/observe",
+		operation_id="observe",
 		summary="Observe once",
 		description=(
 			"Captures one image from the camera and asks a vision model to describe it.\n\n"
@@ -407,6 +407,7 @@ def main() -> int:
 
 	@app.post(
 		"/observe/direction",
+		operation_id="observe_direction",
 		summary="Observe and suggest direction",
 		description=(
 			"Captures one image from the camera, draws a **red 2x3 grid overlay**, and asks a vision model "
@@ -564,9 +565,71 @@ def main() -> int:
 			out["llm_raw_text"] = str(res.get("llm_raw_text") or "")
 		return out
 
-	# Start the HTTP server.
+	# Start the HTTP API server + a proper MCP server (separate port).
+	import asyncio
+
+	try:
+		from fastmcp import FastMCP
+	except Exception as exc:
+		print(f"[observe] fastmcp not installed: {exc}")
+		print("[observe] Install it with: pip3 install fastmcp")
+		return 1
+
+	mcp_host = host
+	mcp_port = int(port) + 600
+
+	# Convert FastAPI -> MCP (tools by default) and expose streamable HTTP at /mcp.
+	mcp = FastMCP.from_fastapi(app=app, name="pi_rc_bot Observe MCP")
+	mcp_app = mcp.http_app(path="/mcp")
+
 	_ensure_port_free(port)
-	uvicorn.run(app, host=host, port=port, log_level="info")
+	_ensure_port_free(mcp_port)
+
+	async def _serve_both() -> None:
+		api_server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info", loop="asyncio"))
+		mcp_server = uvicorn.Server(
+			uvicorn.Config(mcp_app, host=mcp_host, port=mcp_port, log_level="info", loop="asyncio")
+		)
+
+		api_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+		mcp_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+
+		def _request_shutdown() -> None:
+			api_server.should_exit = True
+			mcp_server.should_exit = True
+
+		try:
+			loop = asyncio.get_running_loop()
+			for sig in (signal.SIGINT, signal.SIGTERM):
+				try:
+					loop.add_signal_handler(sig, _request_shutdown)
+				except NotImplementedError:
+					signal.signal(sig, lambda *_: _request_shutdown())
+		except Exception:
+			pass
+
+		t1 = asyncio.create_task(api_server.serve())
+		t2 = asyncio.create_task(mcp_server.serve())
+		done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_EXCEPTION)
+
+		exc: BaseException | None = None
+		for d in done:
+			try:
+				e = d.exception()
+			except asyncio.CancelledError:
+				e = None
+			if e is not None:
+				exc = e
+				break
+
+		_request_shutdown()
+		for p in pending:
+			p.cancel()
+		await asyncio.gather(*pending, return_exceptions=True)
+		if exc is not None:
+			raise exc
+
+	asyncio.run(_serve_both())
 	return 0
 
 

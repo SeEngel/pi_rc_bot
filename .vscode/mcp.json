@@ -1,0 +1,13 @@
+{
+    "servers": {
+        "speak": {
+            "url": "http://127.0.0.1:8601/mcp"
+        },
+        "listen": {
+            "url": "http://127.0.0.1:8602/mcp"
+        },
+        "observe": {
+            "url": "http://127.0.0.1:8603/mcp"
+        }
+    }
+}

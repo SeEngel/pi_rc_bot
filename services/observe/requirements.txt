@@ -3,6 +3,9 @@ PyYAML>=6.0
 fastapi>=0.110
 uvicorn[standard]>=0.27
 
+# Expose this service as an MCP server (real MCP protocol over HTTP)
+fastmcp>=2.3.1
+
 # Vision model client (OpenAI-compatible API)
 openai>=1.0.0
 
