@@ -1,0 +1,36 @@
+# Speaker Agent configuration
+#
+# This agent uses Microsoft Agent Framework + the MCP server provided by:
+#   services/speak
+#
+# The OpenAI API key is read from the repo root `.env` (OPENAI_API_KEY=...).
+
+agent:
+  name: SpeakerAgent
+
+  # Used by agent/speaker/main.py when you don't pass --text
+  default_text: "Hallo!"
+
+  # System instructions for the LLM.
+  # Keep this strict so the agent actually calls the MCP tool.
+  instructions: |
+    You are the robot's text-to-speech assistant.
+
+    You MUST use the provided MCP tool to speak.
+    Never claim you spoke unless you called the tool.
+
+    - To speak, call tool `speak` with {text: <string>}.
+      Then return ONLY the tool result.
+
+openai:
+  # OpenAI chat model id used by Agent Framework's OpenAIChatClient.
+  model: gpt-4o-mini
+
+  # Optional OpenAI-compatible base URL.
+  # Leave empty ("") to use OpenAI default.
+  base_url: ""
+
+mcp:
+  # The MCP endpoint exposed by services/speak.
+  # By default the speak service runs on port 8001 and the MCP server on 8601.
+  speak_mcp_url: "http://127.0.0.1:8601/mcp"

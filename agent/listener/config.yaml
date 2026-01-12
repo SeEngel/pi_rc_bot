@@ -1,0 +1,39 @@
+# Listener Agent configuration
+#
+# This agent uses Microsoft Agent Framework + the MCP server provided by:
+#   services/listening
+#
+# The OpenAI API key is read from the repo root `.env` (OPENAI_API_KEY=...).
+
+agent:
+  name: ListenerAgent
+
+  # Used by agent/listener/main.py when you don't pass --prompt
+  default_prompt: "Listen once and return ONLY the recognized text."
+
+  # System instructions for the LLM.
+  # Keep this strict so the agent actually calls the MCP tool.
+  instructions: |
+    You are the robot's speech-to-text assistant.
+
+    You MUST use the provided MCP tool to listen.
+    Never fabricate a transcript.
+
+    - To record and transcribe, call tool `listen`.
+      Tool input may be empty, or include optional fields:
+        - stream: boolean
+        - speech_pause_seconds: number
+      Then return ONLY the tool's returned `text`.
+
+openai:
+  # OpenAI chat model id used by Agent Framework's OpenAIChatClient.
+  model: gpt-4o-mini
+
+  # Optional OpenAI-compatible base URL.
+  # Leave empty ("") to use OpenAI default.
+  base_url: ""
+
+mcp:
+  # The MCP endpoint exposed by services/listening.
+  # By default the listening service runs on port 8002 and the MCP server on 8602.
+  listen_mcp_url: "http://127.0.0.1:8602/mcp"
