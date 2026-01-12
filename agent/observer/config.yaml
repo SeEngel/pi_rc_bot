@@ -1,0 +1,39 @@
+# Observer Agent configuration
+#
+# This agent uses Microsoft Agent Framework + an MCP server provided by:
+#   services/observe
+#
+# The OpenAI API key is read from the repo root `.env` (OPENAI_API_KEY=...).
+
+agent:
+  name: ObserverAgent
+
+  # Default question used by agent/observer/main.py when you don't pass --question
+  default_question: "Describe what you see in front of the robot."
+
+  # System instructions for the LLM.
+  # Keep this strict so the agent actually calls the MCP tools.
+  instructions: |
+    You are the robot's observer.
+
+    You MUST use the provided MCP tools to see the world.
+    Never fabricate what you see.
+
+    - For scene description, call tool `observe` with {question: <string>}.
+      Then return ONLY the tool's `text`.
+
+    - For movement suggestion, call tool `observe_direction` with {question: <string>}.
+      Then summarize: action, why, fit.
+
+openai:
+  # OpenAI chat model id used by Agent Framework's OpenAIChatClient.
+  model: gpt-4o-mini
+
+  # Optional OpenAI-compatible base URL.
+  # Leave empty ("") to use OpenAI default.
+  base_url: ""
+
+mcp:
+  # The MCP endpoint exposed by services/observe.
+  # By default the observe service runs on port 8003 and the MCP server on 8603.
+  observe_mcp_url: "http://127.0.0.1:8603/mcp"
