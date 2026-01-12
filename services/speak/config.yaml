@@ -13,13 +13,11 @@ tts:
   # Note: backend is only relevant for engine=pico2wave/espeak.
   backend: robot_hat
 
-  # engine: openai | piper | pico2wave | espeak
-  # - pico2wave supports set_lang like in the example (en-US, en-GB, de-DE, es-ES, fr-FR, it-IT)
-  # - espeak uses a voice name (e.g. "de", "en", "en-us")
+  # engine: openai | piper 
   # - openai uses OpenAI TTS (requires OPENAI_API_KEY)
   # - piper uses local Piper voices (auto-downloads models)
-  #engine: openai
-  engine: openai
+  #engine: o
+  engine: piper
 
   # Language (used for Pico2Wave). Examples:
   #   en-US, en-GB, de-DE, es-ES, fr-FR, it-IT
