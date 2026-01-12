@@ -1,0 +1,130 @@
+# Advisor Agent configuration
+#
+# The advisor orchestrates listening/speaking/observing.
+# It runs forever (unless you limit iterations via CLI).
+
+advisor:
+  name: AdvisorAgent
+
+  # Spoken response language.
+  # Note: the advisor's internal reasoning can be in English, but everything it speaks
+  # (and `response_text`) should be in this language.
+  response_language: de-DE
+
+  # The advisor's core reasoning persona.
+  # Keep it concise; tool usage is handled by code.
+  persona_instructions: |
+    You are an always-on robot advisor.
+    Be helpful, concise, and polite.
+    If you are unsure, ask a short clarifying question.
+
+  # If true, emit a live, streaming debug protocol (JSON lines) showing:
+  # - advisor state/mode transitions
+  # - which component is used (brain vs MCP tools)
+  # - tool calls, retries, durations, errors
+  #
+  # Tip: pipe through `jq` or save to a file for later inspection.
+  debug: true
+
+  # Optional: also append the debug protocol to a JSONL file (in addition to stdout).
+  # Example: "memory/advisor/protocol.jsonl"
+  debug_log_path: "./protocol.jsonl"
+
+openai:
+  # Model used for the advisor's reasoning (NOT the vision/STT/TTS backends).
+  model: gpt-4o-mini
+  base_url: ""
+
+mcp:
+  # MCP endpoints for the running services.
+  listen_mcp_url: "http://127.0.0.1:8602/mcp"
+  speak_mcp_url: "http://127.0.0.1:8601/mcp"
+  observe_mcp_url: "http://127.0.0.1:8603/mcp"
+
+interaction:
+  # When sound is detected, we attempt STT.
+  # If transcript is empty/too short, we can reprompt once.
+  min_transcript_chars: 3
+  max_listen_attempts: 2
+  reprompt_text: "Bitte sag das noch einmal."
+
+  # Optional: set to true to call Vosk stream mode (only if your stack supports it).
+  listen_stream: false
+
+  # Allow humans to interrupt speech.
+  # If sound is detected while the robot is speaking, we call the speak service's `stop` tool
+  # before starting STT, so the mic doesn't just capture the robot's own voice.
+  interrupt_speech_on_sound: true
+
+  # Speech gating / coordination:
+  # The speak service plays audio asynchronously (it returns quickly with a PID).
+  # These settings prevent the advisor from starting another speech (e.g. in alone mode)
+  # while the current one is still playing.
+
+  # If true, after calling `speak` the advisor will poll `status` until speech finishes.
+  # During this wait it can still stop speech if sound is detected.
+  wait_for_speech_finish: true
+
+  # How often to poll the speak service's `status` while waiting.
+  speech_status_poll_interval_seconds: 0.2
+
+  # Safety timeout for waiting.
+  speech_max_wait_seconds: 120.0
+
+  # If true, skip alone-mode observe/thought/speak while the robot is currently speaking.
+  suppress_alone_mode_while_speaking: true
+
+  # When waiting for speech to finish, the mic will often pick up the robot's own voice.
+  # Stopping on generic sound therefore tends to cut speech off.
+  # Keep this false unless you have a more robust "human interrupt" signal.
+  stop_speech_on_sound_while_waiting: false
+
+  # If sound happened during speech playback, force one interaction attempt shortly
+  # after speech ends so the human can be captured even if they spoke over the robot.
+  post_speech_interaction_grace_seconds: 1.5
+
+  # If the transcript matches one of these, stop speech immediately.
+  # (Useful when someone says "Stop!" while the robot is talking.)
+  stop_words:
+    - stop
+    - stopp
+    - halt
+    - genug
+    - ruhig
+    - leise
+
+alone:
+  # How often to "think out loud" when quiet.
+  think_interval_seconds: 20.0
+  observation_question: "Briefly describe what you see in front of the robot."
+  max_thought_chars: 240
+
+sound_activity:
+  # Sound activity detection.
+  # The detector tries:
+  # 1) sounddevice (if installed)
+  # 2) arecord (ALSA)
+  # If neither works, it will behave as "always quiet".
+  enabled: true
+  # Tune this using the debug protocol's "sound" events.
+  # Start around 250-400 for typical USB mics; increase if it triggers too easily.
+  threshold_rms: 350
+  sample_rate_hz: 16000
+  window_seconds: 0.15
+  poll_interval_seconds: 0.25
+
+  # Optional: choose a specific ALSA capture device for arecord, e.g.:
+  #   arecord_device: "plughw:1,0"
+  arecord_device: ""
+
+  # If sound detection is unavailable or errors, fall back to interaction mode
+  # (attempt listening) rather than staying in alone mode forever.
+  fallback_to_interaction_on_error: true
+
+memory:
+  # Approximate token budgeting.
+  # We estimate tokens ~ chars/4 (English average).
+  max_tokens: 30000
+  avg_chars_per_token: 4
+  summary_dir: "memory/advisor"
+  summary_max_chars: 2500

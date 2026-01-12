@@ -3,3 +3,4 @@ robot-hat
 __pycache__/
 .env
 *.out
+protocol.jsonl

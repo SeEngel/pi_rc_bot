@@ -4,6 +4,7 @@ import os
 import signal
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -287,6 +288,41 @@ def main() -> int:
 	# Global-ish state for the service process.
 	speaker_lock = threading.Lock()
 	speaker: Speaker | None = None
+	current_job: subprocess.Popen[bytes] | None = None
+	current_job_started_ts: float | None = None
+	current_job_text_preview: str | None = None
+
+	def _stop_current_job() -> bool:
+		"""Best-effort stop of any in-flight playback job."""
+		nonlocal current_job, current_job_started_ts, current_job_text_preview
+		p = current_job
+		if p is None:
+			return False
+		# Already exited
+		if p.poll() is not None:
+			current_job = None
+			current_job_started_ts = None
+			current_job_text_preview = None
+			return False
+		try:
+			p.terminate()
+		except Exception:
+			pass
+		try:
+			p.wait(timeout=1.0)
+		except Exception:
+			try:
+				p.kill()
+			except Exception:
+				pass
+			try:
+				p.wait(timeout=1.0)
+			except Exception:
+				pass
+		current_job = None
+		current_job_started_ts = None
+		current_job_text_preview = None
+		return True
 
 	def _init_speaker() -> Speaker:
 		sp = Speaker.from_config_dict(cfg)
@@ -370,21 +406,73 @@ def main() -> int:
 			raise HTTPException(status_code=422, detail="Missing text")
 
 		# Serialize speech to avoid overlapping playback.
-		def _do_say() -> bool:
-			with speaker_lock:
-				return sp.say(text)
+		with speaker_lock:
+			# Stop any previous playback first (makes speech effectively interruptible).
+			stopped_prev = _stop_current_job()
 
-		try:
-			import anyio
+			job_path = os.path.join(here, "src", "speak_job.py")
+			# Run playback in a separate process so we can interrupt it via /stop.
+			try:
+				p = subprocess.Popen(
+					[
+						sys.executable,
+						os.path.abspath(job_path),
+						"--config",
+						os.path.abspath(cfg_path),
+						"--text",
+						text,
+					],
+					stdout=subprocess.DEVNULL,
+					stderr=subprocess.DEVNULL,
+					cwd=here,
+				)
+			except Exception as exc:
+				raise HTTPException(status_code=500, detail=f"Speak failed (spawn): {exc}") from exc
 
-			attempted_audio = await anyio.to_thread.run_sync(_do_say)
-		except Exception as exc:
-			raise HTTPException(status_code=500, detail=f"Speak failed: {exc}") from exc
+			nonlocal current_job, current_job_started_ts, current_job_text_preview
+			current_job = p
+			current_job_started_ts = time.time()
+			current_job_text_preview = (text[:200] + ("…" if len(text) > 200 else ""))
 
 		return {
 			"ok": True,
-			"attempted_audio": bool(attempted_audio),
+			"started": True,
+			"pid": int(p.pid) if p.pid is not None else None,
+			"stopped_previous": bool(stopped_prev),
 			"tts_available": True,
+		}
+
+	@app.post(
+		"/stop",
+		operation_id="stop",
+		summary="Stop current speech",
+		description="Interrupt any in-progress audio playback started via /speak.",
+	)
+	async def stop() -> dict[str, Any]:
+		with speaker_lock:
+			stopped = _stop_current_job()
+		return {"ok": True, "stopped": bool(stopped)}
+
+	@app.get(
+		"/status",
+		operation_id="status",
+		summary="Playback status",
+		description="Returns whether the service is currently speaking and basic metadata.",
+	)
+	async def status() -> dict[str, Any]:
+		with speaker_lock:
+			p = current_job
+			speaking = bool(p is not None and p.poll() is None)
+			pid = int(p.pid) if (p is not None and p.pid is not None) else None
+			started_ts = current_job_started_ts
+			age_ms = int((time.time() - started_ts) * 1000) if (speaking and started_ts) else None
+			preview = current_job_text_preview
+		return {
+			"ok": True,
+			"speaking": speaking,
+			"pid": pid,
+			"age_ms": age_ms,
+			"text_preview": preview,
 		}
 
 	# Start the HTTP API server + a proper MCP server (separate port).

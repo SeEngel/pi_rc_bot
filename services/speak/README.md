@@ -20,6 +20,20 @@ pip install -r services/speak/requirements.txt
 python services/speak/main.py
 ```
 
+## Interrupting speech (stop)
+
+The service exposes an interrupt tool:
+
+- HTTP: `POST /stop`
+- MCP tool: `stop`
+
+It also exposes a status endpoint/tool:
+
+- HTTP: `GET /status`
+- MCP tool: `status`
+
+These are used by the advisor to let a human interrupt the robot mid-utterance.
+
 ## Making it louder
 
 - If you're on Raspberry Pi OS and the sound gets louder when you raise the *system* volume, set:
