@@ -15,7 +15,7 @@
 
 stt:
   # engine: vosk | openai
-  engine: vosk
+  engine: openai
 
   # --- Vosk settings (engine=vosk) ---
   # Language string for Vosk (robot_hat / picarx).

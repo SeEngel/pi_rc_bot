@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import time
+from glob import glob
 from dataclasses import dataclass
 from typing import Any
 
@@ -112,6 +113,100 @@ class AdvisorAgent:
 		self._force_interaction_until_ts = 0.0
 		self._protocol = ProtocolLogger(enabled=bool(settings.debug), log_path=settings.debug_log_path)
 		self._protocol.open()
+		# Best-effort persistent memory: load newest summary file (if any) to seed this run.
+		self._load_latest_persisted_summary()
+
+	def _load_latest_persisted_summary(self) -> None:
+		"""Load the newest persisted summary into `_summary`.
+
+		Note: the advisor already writes summaries on rollover, but previously it did not
+		reload them on startup. Without this, restarts lose all memory.
+		"""
+		try:
+			mem = self.settings.memory
+			repo_root = resolve_repo_root(os.path.dirname(__file__))
+			summary_dir = os.path.join(repo_root, str(mem.summary_dir))
+			pattern = os.path.join(summary_dir, "summary_*.txt")
+			paths = sorted(glob(pattern))
+			if not paths:
+				return
+			latest = paths[-1]
+			with open(latest, "r", encoding="utf-8") as f:
+				summary = (f.read() or "").strip()
+			if not summary:
+				return
+			self._summary = summary
+			# Seed ledger with summary so prompt-time recall can include it.
+			self._ledger = AdvisorLedger(entries=[f"[summary]\n{summary}"], chars=len(summary))
+			self._emit("memory_load", component="advisor.memory", path=latest, chars=len(summary))
+		except Exception as exc:
+			# Never fail startup due to memory IO.
+			self._emit("memory_load_warning", component="advisor.memory", error=str(exc))
+
+	def _conversation_context(self, *, max_chars: int) -> str:
+		"""Return a tail snippet of the conversation (human/assistant) from the ledger."""
+		max_chars_i = max(0, int(max_chars))
+		if max_chars_i <= 0:
+			return ""
+		lines: list[str] = []
+		for entry in self._ledger.entries:
+			e = str(entry)
+			if e.startswith("Human:") or e.startswith("Assistant:") or e.startswith("[summary]"):
+				lines.append(e)
+		text = "\n".join(lines).strip()
+		if not text:
+			return ""
+		if len(text) <= max_chars_i:
+			return text
+		return text[-max_chars_i:]
+
+	def _wants_conversation_summary(self, text: str) -> bool:
+		low = (text or "").strip().lower()
+		if not low:
+			return False
+		# German + English triggers.
+		keywords = (
+			"zusammenfassung",
+			"fass zusammen",
+			"fasse zusammen",
+			"kurze zusammenfassung",
+			"summary",
+			"summarize",
+			"recap",
+			"was haben wir bisher",
+			"unser bisheriges gespräch",
+		)
+		return any(k in low for k in keywords)
+
+	async def _summarize_conversation_for_user(self) -> str:
+		if self._dry_run:
+			return "(dry_run) (Zusammenfassung)"
+		brain = await self._ensure_brain()
+		lang = self.settings.response_language
+		# Use a bounded context window to avoid extremely long prompts.
+		mem = self.settings.memory
+		max_chars_budget = int(mem.max_tokens) * max(1, int(mem.avg_chars_per_token))
+		ctx = self._conversation_context(max_chars=min(12000, max(1500, max_chars_budget // 6)))
+		if not ctx:
+			return "Ich habe in diesem Lauf noch kein Gesprächsprotokoll, das ich zusammenfassen kann."
+		prompt = (
+			"Gib eine kurze, hilfreiche Zusammenfassung unseres bisherigen Gesprächs.\n"
+			"Behalte: wichtige Fakten, meine Präferenzen, offene Aufgaben, und was zuletzt passiert ist.\n"
+			"Antworte NUR als Fließtext, keine JSON.\n"
+			"Sprache der Ausgabe MUSS sein: "
+			+ str(lang)
+			+ ".\n\n"
+			"Gesprächsverlauf (Ausschnitt, zuletzt am Ende):\n"
+			+ ctx
+		)
+		start = time.perf_counter()
+		self._emit("brain_call_start", component="advisor.brain", kind="user_summary")
+		try:
+			summary = str(await brain.run(prompt)).strip()
+		finally:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit("brain_call_end", component="advisor.brain", kind="user_summary", duration_ms=round(dur_ms, 2))
+		return summary or "Ich konnte gerade keine sinnvolle Zusammenfassung erzeugen."
 
 	@classmethod
 	def from_config_yaml(cls, path: str) -> "AdvisorAgent":
@@ -697,6 +792,15 @@ class AdvisorAgent:
 		if observation and observation.strip():
 			obs_block = f"\n\nObservation (camera):\n{observation.strip()}\n"
 
+		# Include a small recall window so the model can answer questions about what was
+		# said earlier (otherwise each prompt is effectively standalone).
+		mem = self.settings.memory
+		max_chars_budget = int(mem.max_tokens) * max(1, int(mem.avg_chars_per_token))
+		ctx = self._conversation_context(max_chars=min(8000, max(1200, max_chars_budget // 10)))
+		ctx_block = ""
+		if ctx:
+			ctx_block = "\n\nConversation so far (most recent last):\n" + ctx + "\n"
+
 		# Ask for a JSON decision so we can optionally trigger observation earlier later.
 		lang = self.settings.response_language
 		prompt = (
@@ -708,7 +812,8 @@ class AdvisorAgent:
 			"Return ONLY a JSON object with keys:\n"
 			"- response_text: string (what the robot should say out loud)\n"
 			"- need_observe: boolean (true if you need camera info to answer well)\n\n"
-			f"Human said: {human_text.strip()}"
+			+ ctx_block
+			+ f"Human said: {human_text.strip()}"
 			+ obs_block
 		)
 		start = time.perf_counter()
@@ -773,6 +878,15 @@ class AdvisorAgent:
 			return
 
 		self._ledger.append(f"Human: {text}")
+		# If user explicitly asks for a conversation summary, do it directly.
+		if self._wants_conversation_summary(text):
+			summary = await self._summarize_conversation_for_user()
+			self._emit("state", component="advisor", state="interaction_speak_summary")
+			await self._speak(summary)
+			self._ledger.append(f"Assistant: {summary}")
+			await self._maybe_summarize_and_reset()
+			self._emit("state", component="advisor", state="interaction_end")
+			return
 		await self._maybe_summarize_and_reset()
 
 		wants_vision = self._wants_vision(text)
