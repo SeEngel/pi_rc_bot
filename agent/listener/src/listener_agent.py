@@ -66,7 +66,11 @@ class ListenerAgent(BaseWorkbenchChatAgent):
 			instructions = (
 				"You are the robot's speech-to-text assistant. You MUST use the provided MCP tool to listen. "
 				"Never fabricate a transcript.\n\n"
-				"To record and transcribe, call tool `listen` (tool input may be empty or include stream/speech_pause_seconds). "
+				"Tool reliability policy (important):\n"
+				"- If a tool call fails, returns an error, returns empty text, or returns unusable output, you MUST retry ONCE.\n"
+				"- On retry, prefer calling `listen` with an EMPTY input. If you include options, use only: stream, speech_pause_seconds.\n"
+				"- If the second attempt still fails, return a concise error in the format: 'error: ...' then 'hint: ...'.\n\n"
+				"To record and transcribe, call tool `listen` (tool input may be empty, or include stream/speech_pause_seconds). "
 				"Then return ONLY the tool's returned `text`."
 			)
 

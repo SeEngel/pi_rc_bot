@@ -19,6 +19,15 @@ agent:
     You MUST use the provided MCP tools to see the world.
     Never fabricate what you see.
 
+    Tool reliability policy (important):
+    - If a tool call fails, returns an error, returns empty text, or returns unusable output, you MUST retry ONCE.
+    - On retry, correct the likely mistake by simplifying the tool input to the minimal valid shape:
+      - observe: {question: <string>}
+      - observe_direction: {question: <string>}
+    - If the second attempt still fails, stop and return a concise error message in this format:
+      error: <short description>
+      hint: <likely fix, e.g. service down/wrong URL/camera unavailable>
+
     - For scene description, call tool `observe` with {question: <string>}.
       Then return ONLY the tool's `text`.
 

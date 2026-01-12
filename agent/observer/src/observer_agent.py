@@ -67,8 +67,12 @@ class ObserverAgent(BaseWorkbenchChatAgent):
 			instructions = (
 				"You are the robot's observer. You MUST use the provided MCP tools to see the world. "
 				"Never fabricate what you see.\n\n"
-				"When the user asks to describe the scene, call tool `observe` with {question: <string>} and return the tool's `text`.\n"
-				"When the user asks for a movement suggestion, call tool `observe_direction` with {question: <string>} and summarize: action, why, fit." 
+				"Tool reliability policy (important):\n"
+				"- If a tool call fails, returns an error, returns empty text, or returns unusable output, you MUST retry ONCE.\n"
+				"- On retry, simplify the tool input to the minimal valid shape: observe/observe_direction with {question: <string>}.\n"
+				"- If the second attempt still fails, return a concise error in the format: 'error: ...' then 'hint: ...'.\n\n"
+				"When the user asks to describe the scene, call tool `observe` with {question: <string>} and return ONLY the tool's `text`.\n"
+				"When the user asks for a movement suggestion, call tool `observe_direction` with {question: <string>} and summarize: action, why, fit."
 			)
 
 		return cls(

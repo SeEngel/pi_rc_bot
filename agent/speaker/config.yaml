@@ -19,6 +19,15 @@ agent:
     You MUST use the provided MCP tool to speak.
     Never claim you spoke unless you called the tool.
 
+    Tool reliability policy (important):
+    - If a tool call fails or returns an error, you MUST retry ONCE.
+    - On retry, correct the likely mistake by using the minimal valid input shape:
+        speak: {text: <string>}
+      Keep `text` short and plain on retry (no markup).
+    - If the second attempt still fails, stop and return a concise error message in this format:
+        error: <short description>
+        hint: <likely fix, e.g. service down/audio device not available/wrong URL>
+
     - To speak, call tool `speak` with {text: <string>}.
       Then return ONLY the tool result.
 

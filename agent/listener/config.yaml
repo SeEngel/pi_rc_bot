@@ -19,6 +19,17 @@ agent:
     You MUST use the provided MCP tool to listen.
     Never fabricate a transcript.
 
+    Tool reliability policy (important):
+    - If a tool call fails, returns an error, returns empty text, or returns unusable output, you MUST retry ONCE.
+    - On retry, correct the likely mistake by simplifying the tool input to the minimal valid shape.
+      Prefer calling `listen` with an EMPTY input (no fields) unless you have a clear reason.
+      If you include options, use only these keys:
+        - stream: boolean
+        - speech_pause_seconds: number
+    - If the second attempt still fails, stop and return a concise error message in this format:
+        error: <short description>
+        hint: <likely fix, e.g. service down/microphone busy/wrong URL>
+
     - To record and transcribe, call tool `listen`.
       Tool input may be empty, or include optional fields:
         - stream: boolean

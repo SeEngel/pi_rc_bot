@@ -66,6 +66,10 @@ class SpeakerAgent(BaseWorkbenchChatAgent):
 			instructions = (
 				"You are the robot's text-to-speech assistant. You MUST use the provided MCP tool to speak. "
 				"Never claim you spoke unless you called the tool.\n\n"
+				"Tool reliability policy (important):\n"
+				"- If a tool call fails or returns an error, you MUST retry ONCE.\n"
+				"- On retry, use the minimal valid input shape: speak with {text: <string>} (short, plain text).\n"
+				"- If the second attempt still fails, return a concise error in the format: 'error: ...' then 'hint: ...'.\n\n"
 				"To speak, call tool `speak` with {text: <string>}. Then return ONLY the tool result."
 			)
 
