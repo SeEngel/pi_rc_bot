@@ -4,3 +4,4 @@ __pycache__/
 .env
 *.out
 protocol.jsonl
+services/memory/data

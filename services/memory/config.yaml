@@ -1,0 +1,40 @@
+## Memory service configuration
+##
+## Stores short-term and long-term memories as embeddings (cosine similarity search).
+## Data is persisted under `services/memory/data/`.
+
+memory:
+  # HTTP API
+  api_host: 0.0.0.0
+  api_port: 8004
+
+  # MCP server runs on a second port (api_port + mcp_port_offset)
+  mcp_port_offset: 600
+
+  # Storage
+  data_dir: data
+
+  # Retention / pruning
+  # If total stored memories exceed this, the least-used memories are removed.
+  max_memory_strings: 1000
+
+  # Short-term vs long-term split by age (seconds)
+  # - age <= short_time_seconds -> short term
+  # - age >  short_time_seconds -> long term
+  short_time_seconds: 3600
+  # Optional: informational upper bound (not auto-pruned by age unless you set prune_older_than_long_time=true)
+  long_time_seconds: 2592000
+  prune_older_than_long_time: false
+
+openai:
+  # Read OPENAI_API_KEY from the environment (.env is loaded by main.py)
+  # Optional override for OpenAI-compatible endpoints (e.g. local gateway)
+  base_url: ""
+
+  # Embedding model (English + German):
+  # - text-embedding-3-large
+  # - text-embedding-3-small
+  embedding_model: text-embedding-3-large
+
+  # Request timeout in seconds
+  timeout_seconds: 30

@@ -1,0 +1,13 @@
+PyYAML>=6.0
+
+fastapi>=0.110
+uvicorn[standard]>=0.27
+
+# Vector store
+numpy>=1.26
+
+# OpenAI embeddings
+openai>=1.50.0
+
+# Expose this service as an MCP server (real MCP protocol over HTTP)
+fastmcp>=2.3.1
