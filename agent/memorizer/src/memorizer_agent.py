@@ -84,18 +84,117 @@ class MemorizerAgent(BaseWorkbenchChatAgent):
 			)
 		)
 
+	@staticmethod
+	def _looks_sensitive(text: str) -> bool:
+		"""Best-effort filter to avoid storing secrets.
+
+		We keep this simple and conservative: if it looks like credentials or keys,
+		we avoid forcing storage.
+		"""
+		low = (text or "").lower()
+		if not low.strip():
+			return False
+		# Obvious credential keywords
+		bad_keywords = (
+			"api key",
+			"openai_api_key",
+			"token",
+			"password",
+			"passwort",
+			"secret",
+			"private key",
+			"ssh-rsa",
+			"-----begin",
+		)
+		if any(k in low for k in bad_keywords):
+			return True
+		# Looks like a long opaque key
+		compact = "".join(ch for ch in (text or "") if ch.isalnum())
+		if len(compact) >= 40:
+			# Many keys are long and mostly alnum; treat as sensitive.
+			return True
+		return False
+
+	@staticmethod
+	def _is_obviously_memorable(text: str) -> bool:
+		"""Heuristic: should we strongly bias toward storing?"""
+		low = (text or "").strip().lower()
+		if not low:
+			return False
+		cues = (
+			# explicit requests
+			"remember this",
+			"please remember",
+			"remember that",
+			"this is important",
+			"that's important",
+			"note this",
+			"write this down",
+			"merk dir",
+			"merk dir das",
+			"bitte merk dir",
+			"das ist wichtig",
+			"wichtig:",
+			"das musst du dir merken",
+			"notier",
+			"schreib dir auf",
+			"erinnere dich",
+			# identity
+			"my name is",
+			"i am ",
+			"ich heiße",
+			"mein name ist",
+			# preferences
+			"i like",
+			"i love",
+			"i prefer",
+			"i don't like",
+			"ich mag",
+			"ich liebe",
+			"ich bevorzuge",
+			"ich hasse",
+			"ich will nicht",
+			# constraints/rules
+			"always",
+			"never",
+			"immer",
+			"niemals",
+		)
+		return any(c in low for c in cues)
+
 	async def ingest(self, info: str, *, force_store: bool = False) -> str:
 		"""Decide whether to store `info` (and store if appropriate)."""
 		text = (info or "").strip()
 		if not text:
 			return "error: empty input\nhint: pass --text or provide a non-empty info string"
 
-		policy = "You MAY store only if it is genuinely useful long-term." if not force_store else "You MUST store something useful derived from the input."
+		# If the user clearly states a stable fact (name/preference) or explicitly asks to remember,
+		# bias strongly toward storing. Still avoid forcing storage for sensitive-looking content.
+		force_store_effective = bool(force_store)
+		if not force_store_effective and self._is_obviously_memorable(text) and not self._looks_sensitive(text):
+			force_store_effective = True
+
+		policy = (
+			"You MAY store only if it is genuinely useful long-term."
+			if not force_store_effective
+			else "You MUST store something useful derived from the input (unless it contains secrets)."
+		)
 		prompt = (
 			"Decide whether the following information should be stored in memory. "
 			"If you store it, you MUST call the MCP tool `store_memory`. "
 			"If you skip storing, do NOT call any tool.\n\n"
 			f"{policy}\n\n"
+			"Store these kinds of things (common cases):\n"
+			"- User identity: name, role, language preference\n"
+			"- User preferences: likes/dislikes, style preferences (e.g. 'short answers')\n"
+			"- Stable environment facts: locations, charging station, recurring setup\n"
+			"- Safety/operating constraints: 'never do X', 'always do Y'\n\n"
+			"Do NOT store:\n"
+			"- Secrets/credentials (API keys, passwords, tokens)\n"
+			"- One-off commands or transient chatter\n\n"
+			"IMPORTANT (avoid duplicates):\n"
+			"- If you are about to store a memory, FIRST call `get_top_n_memory` with content=<your candidate memory statement> and top_n=3.\n"
+			"- If the returned memories already contain the same or near-identical fact, SKIP storing.\n\n"
 			"When storing:\n"
 			"- Create ONE compact atomic memory statement (prefer <= 280 characters).\n"
 			"- Optionally add 0..8 tags.\n\n"

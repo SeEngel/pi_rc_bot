@@ -26,3 +26,12 @@ Defaults:
 
 - API: http://0.0.0.0:8004
 - MCP: http://0.0.0.0:8604/mcp
+
+## Retention / pruning
+
+Configure caps in `services/memory/config.yaml`:
+
+- `memory.max_short_memory_strings` (default: 100)
+- `memory.max_long_memory_strings` (default: 1000)
+
+These are enforced independently (short-term churn won’t evict long-term memories).

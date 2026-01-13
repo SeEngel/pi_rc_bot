@@ -188,14 +188,24 @@ class MemoryStore:
         short_time_seconds: float = 3600.0,
         long_time_seconds: float = 2592000.0,
         prune_older_than_long_time: bool = False,
-        max_memory_strings: int = 1000,
+        # Legacy: global cap across BOTH tiers. If per-tier caps are provided,
+        # this is ignored.
+        max_memory_strings: int | None = 1000,
+        # Preferred: independent caps per tier.
+        max_short_memory_strings: int | None = None,
+        max_long_memory_strings: int | None = None,
     ):
         self.data_dir = os.path.abspath(data_dir)
         self.embedder = embedder
         self.short_time_seconds = float(short_time_seconds)
         self.long_time_seconds = float(long_time_seconds)
         self.prune_older_than_long_time = bool(prune_older_than_long_time)
-        self.max_memory_strings = int(max_memory_strings)
+
+        self.max_memory_strings = int(max_memory_strings) if max_memory_strings is not None else None
+        self.max_short_memory_strings = (
+            int(max_short_memory_strings) if max_short_memory_strings is not None else None
+        )
+        self.max_long_memory_strings = int(max_long_memory_strings) if max_long_memory_strings is not None else None
 
         self._short_meta: list[dict[str, Any]] = []
         self._long_meta: list[dict[str, Any]] = []
@@ -226,6 +236,8 @@ class MemoryStore:
             "long_count": len(self._long_meta),
             "total_count": len(self._short_meta) + len(self._long_meta),
             "max_memory_strings": self.max_memory_strings,
+            "max_short_memory_strings": self.max_short_memory_strings,
+            "max_long_memory_strings": self.max_long_memory_strings,
             "short_time_seconds": self.short_time_seconds,
             "long_time_seconds": self.long_time_seconds,
             "data_dir": self.data_dir,
@@ -261,8 +273,16 @@ class MemoryStore:
                 "(Did you change embedding_model?)"
             )
 
+        is_short = (now - float(ts_epoch)) <= float(self.short_time_seconds)
+
         # Prune if needed BEFORE adding a new item.
-        self._enforce_limits(now_epoch=now, incoming=1)
+        # In per-tier mode this only affects the relevant tier.
+        self._enforce_limits(
+            now_epoch=now,
+            incoming_total=1,
+            incoming_short=1 if is_short else 0,
+            incoming_long=0 if is_short else 1,
+        )
 
         item: dict[str, Any] = {
             "id": str(uuid.uuid4()),
@@ -273,7 +293,6 @@ class MemoryStore:
             "usage_count": 0,
         }
 
-        is_short = (now - float(ts_epoch)) <= float(self.short_time_seconds)
         if is_short:
             self._append_short(vec, item)
         else:
@@ -465,16 +484,77 @@ class MemoryStore:
             out.append(m)
         return out
 
-    def _enforce_limits(self, *, now_epoch: float, incoming: int = 0) -> None:
-        if self.max_memory_strings <= 0:
+    def _enforce_limits(
+        self,
+        *,
+        now_epoch: float,
+        incoming_total: int = 0,
+        incoming_short: int = 0,
+        incoming_long: int = 0,
+    ) -> None:
+        """Enforce capacity limits.
+
+        - If per-tier limits are configured, prune each tier independently.
+        - Otherwise, fall back to legacy global pruning across both tiers.
+        """
+
+        per_tier = (self.max_short_memory_strings is not None) or (self.max_long_memory_strings is not None)
+        if per_tier:
+            if self.max_short_memory_strings is not None and int(self.max_short_memory_strings) > 0:
+                target_s = int(self.max_short_memory_strings)
+                while len(self._short_meta) + int(incoming_short) > target_s and len(self._short_meta) > 0:
+                    self._prune_one_in_bucket(bucket="short", now_epoch=now_epoch)
+            if self.max_long_memory_strings is not None and int(self.max_long_memory_strings) > 0:
+                target_l = int(self.max_long_memory_strings)
+                while len(self._long_meta) + int(incoming_long) > target_l and len(self._long_meta) > 0:
+                    self._prune_one_in_bucket(bucket="long", now_epoch=now_epoch)
+            return
+
+        # Legacy global mode
+        if self.max_memory_strings is None or int(self.max_memory_strings) <= 0:
             return
         total = len(self._short_meta) + len(self._long_meta)
         target = int(self.max_memory_strings)
-        while total + int(incoming) > target and total > 0:
-            self._prune_one(now_epoch=now_epoch)
+        while total + int(incoming_total) > target and total > 0:
+            self._prune_one_global(now_epoch=now_epoch)
             total = len(self._short_meta) + len(self._long_meta)
 
-    def _prune_one(self, *, now_epoch: float) -> None:
+    def _prune_one_in_bucket(self, *, bucket: str, now_epoch: float) -> None:
+        if bucket == "short":
+            meta = self._short_meta
+            mat = self._short_mat
+        elif bucket == "long":
+            meta = self._long_meta
+            mat = self._long_mat
+        else:
+            raise MemoryError(f"Invalid bucket: {bucket!r}")
+
+        if not meta:
+            return
+
+        best: tuple[int, float, int] | None = None
+        # tuple: (usage_count, timestamp_epoch, index)
+        for i, m in enumerate(meta):
+            u = int(m.get("usage_count", 0))
+            ts = float(m.get("timestamp_epoch", now_epoch))
+            cand = (u, ts, i)
+            if best is None or cand < best:
+                best = cand
+        if best is None:
+            return
+        _, _, idx = best
+
+        meta.pop(idx)
+        if mat.size:
+            mat = np.delete(mat, idx, axis=1)
+            if mat.shape[1] == 0:
+                mat = np.zeros((self.dim, 0), dtype=np.float32)
+        if bucket == "short":
+            self._short_mat = np.asarray(mat, dtype=np.float32)
+        else:
+            self._long_mat = np.asarray(mat, dtype=np.float32)
+
+    def _prune_one_global(self, *, now_epoch: float) -> None:
         # Find least-used across both.
         best: tuple[int, float, str, int] | None = None
         # tuple: (usage_count, timestamp_epoch, bucket, index)

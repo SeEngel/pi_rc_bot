@@ -167,6 +167,15 @@ def _get_cfg(cfg: dict[str, Any], path: str, default: Any) -> Any:
 	return cur if cur is not None else default
 
 
+def _has_cfg(cfg: dict[str, Any], path: str) -> bool:
+	cur: Any = cfg
+	for part in path.split("."):
+		if not isinstance(cur, dict) or part not in cur:
+			return False
+		cur = cur.get(part)
+	return True
+
+
 class StoreMemoryRequest(BaseModel):
 	content: str = Field(
 		...,
@@ -232,7 +241,18 @@ def main() -> int:
 	mcp_offset = int(_get_cfg(cfg, "memory.mcp_port_offset", 600))
 
 	data_dir = os.path.join(here, str(_get_cfg(cfg, "memory.data_dir", "data")))
-	max_mem = int(_get_cfg(cfg, "memory.max_memory_strings", 1000))
+	# Prefer independent per-tier caps when configured; otherwise fall back to the
+	# legacy global cap (prunes across both tiers combined).
+	has_short_cap = _has_cfg(cfg, "memory.max_short_memory_strings")
+	has_long_cap = _has_cfg(cfg, "memory.max_long_memory_strings")
+	if has_short_cap or has_long_cap:
+		max_short_mem = int(_get_cfg(cfg, "memory.max_short_memory_strings", 100))
+		max_long_mem = int(_get_cfg(cfg, "memory.max_long_memory_strings", 1000))
+		max_mem = None
+	else:
+		max_short_mem = None
+		max_long_mem = None
+		max_mem = int(_get_cfg(cfg, "memory.max_memory_strings", 1000))
 	short_time = float(_get_cfg(cfg, "memory.short_time_seconds", 3600))
 	long_time = float(_get_cfg(cfg, "memory.long_time_seconds", 2592000))
 	prune_old = bool(_get_cfg(cfg, "memory.prune_older_than_long_time", False))
@@ -251,6 +271,8 @@ def main() -> int:
 		long_time_seconds=long_time,
 		prune_older_than_long_time=prune_old,
 		max_memory_strings=max_mem,
+		max_short_memory_strings=max_short_mem,
+		max_long_memory_strings=max_long_mem,
 	)
 
 	lock = threading.Lock()

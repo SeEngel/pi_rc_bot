@@ -15,8 +15,15 @@ memory:
   data_dir: data
 
   # Retention / pruning
-  # If total stored memories exceed this, the least-used memories are removed.
-  max_memory_strings: 1000
+  # Prefer per-tier caps (independent pruning):
+  # - short-term is a small working set (fast churn)
+  # - long-term is a larger archive
+  max_short_memory_strings: 100
+  max_long_memory_strings: 1000
+
+  # Legacy global cap (deprecated): if you remove the per-tier caps above,
+  # the service falls back to pruning across BOTH tiers combined.
+  # max_memory_strings: 1000
 
   # Short-term vs long-term split by age (seconds)
   # - age <= short_time_seconds -> short term

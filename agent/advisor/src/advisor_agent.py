@@ -576,6 +576,7 @@ class AdvisorAgent:
 		cues = (
 			"remember",
 			"do you remember",
+			"can you remember",
 			"what did i",
 			"what was my",
 			"what's my",
@@ -594,8 +595,15 @@ class AdvisorAgent:
 			"erinnerst du",
 			"erinnern",
 			"weißt du noch",
+			"kannst du dich erinnern",
+			"merkst du dir",
+			"merk dir",
+			"hast du dir gemerkt",
+			"wie war nochmal",
 			"wie heiße ich",
 			"mein name",
+			"wie heißt mein",
+			"was war mein",
 			"wo habe ich",
 			"vorhin",
 			"letztes mal",
@@ -784,6 +792,8 @@ class AdvisorAgent:
 			"what do you see",
 			"what can you see",
 			"can you see",
+			"look at",
+			"look at me",
 			"look",
 			"in front",
 			"camera",
@@ -795,6 +805,12 @@ class AdvisorAgent:
 			"was kannst du sehen",
 			"kannst du sehen",
 			"siehst du",
+			"schau mich an",
+			"schau mal",
+			"schau",
+			"guck",
+			"guck mal",
+			"guck mich an",
 			"schau",
 			"sieh",
 			"vor dir",
@@ -804,6 +820,10 @@ class AdvisorAgent:
 			"was ist vor",
 			"observier",
 			"beobacht",
+			"was ist vor dir",
+			"was ist da vorne",
+			"was ist da",
+			"was steht da",
 		)
 		return any(k in low for k in keywords)
 
@@ -1125,6 +1145,17 @@ class AdvisorAgent:
 
 		# Ask for a JSON decision so we can optionally trigger observation earlier later.
 		lang = self.settings.response_language
+		few_shots = (
+			"Examples (decision JSON only):\n"
+			"Human: Was siehst du?\n"
+			"Assistant: {\"response_text\": \"Einen Moment, ich schaue nach.\", \"need_observe\": true}\n\n"
+			"Human: Schau mich an.\n"
+			"Assistant: {\"response_text\": \"Okay, ich schaue dich an.\", \"need_observe\": true}\n\n"
+			"Human: Was ist vor dir?\n"
+			"Assistant: {\"response_text\": \"Einen Moment, ich beschreibe, was vor mir ist.\", \"need_observe\": true}\n\n"
+			"Human: Wie spät ist es?\n"
+			"Assistant: {\"response_text\": \"Ich kann dir helfen, aber ich habe keine Uhrzeit-Sensorik.\", \"need_observe\": false}\n"
+		)
 		prompt = (
 			"You are responding to a human speaking to the robot.\n"
 			"The robot MUST speak in language: "
@@ -1134,6 +1165,8 @@ class AdvisorAgent:
 			"Return ONLY a JSON object with keys:\n"
 			"- response_text: string (what the robot should say out loud)\n"
 			"- need_observe: boolean (true if you need camera info to answer well)\n\n"
+			+ few_shots
+			+ "\n"
 			+ ctx_block
 			+ f"Human said: {human_text.strip()}"
 			+ obs_block
