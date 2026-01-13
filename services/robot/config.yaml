@@ -1,0 +1,15 @@
+## Robot (shared hardware) service configuration
+
+robot:
+  # If true, do not touch hardware; return dummy responses.
+  dry_run: false
+
+  # Limits for steering and head angles.
+  max_steer_deg: 35
+  max_speed: 100
+  max_pan_deg: 35
+  max_tilt_deg: 35
+
+service:
+  host: 0.0.0.0
+  port: 8010

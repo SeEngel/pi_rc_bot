@@ -1,26 +1,41 @@
 import unittest
 
-from agent.advisor.src.advisor_agent import AdvisorAgent, AdvisorMemoryConfig, AdvisorMemorizerConfig, AdvisorSettings
+from agent.advisor.src.advisor_agent import (
+	AdvisorAgent,
+	AdvisorMemoryConfig,
+	AdvisorMemorizerConfig,
+	AdvisorSettings,
+	AdvisorTodoConfig,
+)
 
 
 class TestDecisionParsing(unittest.TestCase):
 	def test_parse_plain_json(self):
 		raw = '{"response_text": "Hallo!", "need_observe": false}'
-		resp, need = AdvisorAgent._parse_decision_json(object(), raw)
-		self.assertEqual(resp, "Hallo!")
-		self.assertIs(need, False)
+		dec = AdvisorAgent._parse_decision_json(object(), raw)
+		self.assertIsNotNone(dec)
+		assert dec is not None
+		self.assertEqual(dec.response_text, "Hallo!")
+		self.assertIs(dec.need_observe, False)
+		self.assertEqual(dec.actions, [])
 
 	def test_parse_code_fenced_json(self):
 		raw = """```json\n{\n  \"response_text\": \"Ich bin hier.\",\n  \"need_observe\": false\n}\n```"""
-		resp, need = AdvisorAgent._parse_decision_json(object(), raw)
-		self.assertEqual(resp, "Ich bin hier.")
-		self.assertIs(need, False)
+		dec = AdvisorAgent._parse_decision_json(object(), raw)
+		self.assertIsNotNone(dec)
+		assert dec is not None
+		self.assertEqual(dec.response_text, "Ich bin hier.")
+		self.assertIs(dec.need_observe, False)
+		self.assertEqual(dec.actions, [])
 
 	def test_parse_json_with_prefix_suffix(self):
 		raw = "Sure! Here you go:\n```json\n{\"response_text\": \"Okay\", \"need_observe\": true}\n```\n"  # stray text
-		resp, need = AdvisorAgent._parse_decision_json(object(), raw)
-		self.assertEqual(resp, "Okay")
-		self.assertIs(need, True)
+		dec = AdvisorAgent._parse_decision_json(object(), raw)
+		self.assertIsNotNone(dec)
+		assert dec is not None
+		self.assertEqual(dec.response_text, "Okay")
+		self.assertIs(dec.need_observe, True)
+		self.assertEqual(dec.actions, [])
 
 
 class TestDecideAndRespondIntegration(unittest.IsolatedAsyncioTestCase):
@@ -35,9 +50,14 @@ class TestDecideAndRespondIntegration(unittest.IsolatedAsyncioTestCase):
 			openai_model="dummy",
 			openai_base_url=None,
 			env_file_path=None,
-			listen_mcp_url="http://127.0.0.1:8600/mcp",
+			listen_mcp_url="http://127.0.0.1:8602/mcp",
 			speak_mcp_url="http://127.0.0.1:8601/mcp",
-			observe_mcp_url="http://127.0.0.1:8602/mcp",
+			observe_mcp_url="http://127.0.0.1:8603/mcp",
+			move_mcp_url="http://127.0.0.1:8605/mcp",
+			head_mcp_url="http://127.0.0.1:8606/mcp",
+			proximity_mcp_url="http://127.0.0.1:8607/mcp",
+			perception_mcp_url="http://127.0.0.1:8608/mcp",
+			safety_mcp_url="http://127.0.0.1:8609/mcp",
 			min_transcript_chars=1,
 			max_listen_attempts=1,
 			reprompt_text="Bitte wiederholen.",
@@ -55,6 +75,7 @@ class TestDecideAndRespondIntegration(unittest.IsolatedAsyncioTestCase):
 			max_thought_chars=200,
 			sound_enabled=False,
 			sound_threshold_rms=0,
+			sound_active_windows_required=1,
 			sound_sample_rate_hz=16000,
 			sound_window_seconds=0.1,
 			sound_poll_interval_seconds=0.1,
@@ -75,6 +96,12 @@ class TestDecideAndRespondIntegration(unittest.IsolatedAsyncioTestCase):
 				ingest_timeout_seconds=0.1,
 				recall_timeout_seconds=0.1,
 			),
+			todo=AdvisorTodoConfig(
+				enabled=False,
+				config_path="/dev/null",
+				include_in_prompt=False,
+				mention_next_in_response=False,
+			),
 		)
 		agent = AdvisorAgent(settings, dry_run=False)
 
@@ -86,13 +113,14 @@ class TestDecideAndRespondIntegration(unittest.IsolatedAsyncioTestCase):
 				return None
 
 			async def run(self, prompt: str) -> str:
-				return """```json\n{\n  \"response_text\": \"Ich bin hier. Wie kann ich weiterhelfen?\",\n  \"need_observe\": false\n}\n```"""
+				return """```json\n{\n  \"response_text\": \"Ich bin hier. Wie kann ich weiterhelfen?\",\n  \"need_observe\"\n: false\n}\n```"""
 
 		agent._brain = MockBrain()  # type: ignore[assignment]
 
-		resp, need_observe = await agent._decide_and_respond(human_text="Hi", observation=None, memory_hint=None)
+		resp, need_observe, actions = await agent._decide_and_respond(human_text="Hi", observation=None, memory_hint=None)
 		self.assertEqual(resp, "Ich bin hier. Wie kann ich weiterhelfen?")
 		self.assertIs(need_observe, False)
+		self.assertEqual(actions, [])
 
 		await agent.close()
 

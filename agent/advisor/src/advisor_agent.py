@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from glob import glob
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import Any
 
 from agent.src.base_agent import BaseAgentConfig, BaseWorkbenchChatAgent
 from agent.src.config import OpenAIClientConfig, load_yaml, resolve_repo_root
+from agent.todo.src import TodoAgent
 
 from .mcp_client import call_mcp_tool_json
 from .sound_activity import detect_sound_activity
@@ -34,6 +36,21 @@ class AdvisorMemorizerConfig:
 	# Timeouts (seconds) so the advisor loop can't stall forever.
 	ingest_timeout_seconds: float
 	recall_timeout_seconds: float
+
+@dataclass(frozen=True)
+class AdvisorTodoConfig:
+	"""Configuration for the local TodoAgent integration (no MCP, no LLM)."""
+
+	enabled: bool
+	# Path to agent/todo/config.yaml (absolute).
+	config_path: str
+
+	# If true, always provide todo status to the brain prompt.
+	include_in_prompt: bool
+
+	# If true, instruct the brain to always mention the next open task.
+	# (Keeps the human aware of what happens next.)
+	mention_next_in_response: bool
 
 
 @dataclass(frozen=True)
@@ -61,6 +78,13 @@ class AdvisorLedger:
 
 
 @dataclass(frozen=True)
+class AdvisorDecision:
+	response_text: str | None
+	need_observe: bool | None
+	actions: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
 class AdvisorSettings:
 	name: str
 	persona_instructions: str
@@ -75,6 +99,11 @@ class AdvisorSettings:
 	listen_mcp_url: str
 	speak_mcp_url: str
 	observe_mcp_url: str
+	move_mcp_url: str
+	head_mcp_url: str
+	proximity_mcp_url: str
+	perception_mcp_url: str
+	safety_mcp_url: str
 
 	# interaction
 	min_transcript_chars: int
@@ -98,6 +127,9 @@ class AdvisorSettings:
 	# sound activity
 	sound_enabled: bool
 	sound_threshold_rms: int
+	# Require this many consecutive "active" sound windows before entering interaction mode.
+	# Helps avoid false triggers from brief ambient noise spikes.
+	sound_active_windows_required: int
 	sound_sample_rate_hz: int
 	sound_window_seconds: float
 	sound_poll_interval_seconds: float
@@ -106,6 +138,15 @@ class AdvisorSettings:
 
 	memory: AdvisorMemoryConfig
 	memorizer: AdvisorMemorizerConfig
+	todo: AdvisorTodoConfig
+
+	# alone (optional exploration/motion)
+	alone_explore_enabled: bool = False
+	alone_explore_speed: int = 20
+	alone_explore_threshold_cm: float = 35.0
+	alone_explore_duration_s: float = 0.6
+	alone_explore_far_duration_s: float = 1.2
+	alone_explore_speak: bool = False
 
 
 class AdvisorBrain(BaseWorkbenchChatAgent):
@@ -131,13 +172,31 @@ class AdvisorAgent:
 		self._summary: str | None = None
 		self._brain: AdvisorBrain | None = None
 		self._memorizer: Any | None = None
+		self._todo: TodoAgent | None = None
 		self._memorizer_task: asyncio.Task[None] | None = None
 		self._last_alone_think_ts = 0.0
 		self._force_interaction_until_ts = 0.0
+		self._sound_active_streak = 0
 		self._protocol = ProtocolLogger(enabled=bool(settings.debug), log_path=settings.debug_log_path)
 		self._protocol.open()
+		self._init_todo_agent()
 		# Best-effort persistent memory: load newest summary file (if any) to seed this run.
 		self._load_latest_persisted_summary()
+    
+	def _init_todo_agent(self) -> None:
+		"""Initialize local TodoAgent (best-effort; must never crash startup)."""
+		try:
+			cfg = self.settings.todo
+			if not bool(cfg.enabled):
+				return
+			# The TodoAgent manages its own persistence.
+			agent = TodoAgent.from_config_yaml(cfg.config_path)
+			agent.load()
+			self._todo = agent
+			self._emit("todo_init", component="advisor.todo", enabled=True, state_path=agent.settings.state_path)
+		except Exception as exc:
+			self._emit("todo_init_warning", component="advisor.todo", error=str(exc))
+			self._todo = None
 
 	def _load_latest_persisted_summary(self) -> None:
 		"""Load the newest persisted summary into `_summary`.
@@ -232,7 +291,12 @@ class AdvisorAgent:
 		return summary or "Ich konnte gerade keine sinnvolle Zusammenfassung erzeugen."
 
 	@classmethod
-	def from_config_yaml(cls, path: str) -> "AdvisorAgent":
+	def settings_from_config_yaml(cls, path: str) -> AdvisorSettings:
+		"""Load AdvisorSettings from YAML without constructing an AdvisorAgent.
+
+		This keeps config parsing side-effect free (no protocol/todo init) so callers
+		can decide how/when to instantiate the agent (e.g. dry-run).
+		"""
 		cfg = load_yaml(path)
 		here = os.path.dirname(os.path.abspath(path))
 		repo_root = resolve_repo_root(here)
@@ -246,6 +310,7 @@ class AdvisorAgent:
 		sound_cfg = cfg.get("sound_activity", {}) if isinstance(cfg, dict) else {}
 		memory_cfg = cfg.get("memory", {}) if isinstance(cfg, dict) else {}
 		memorizer_cfg = cfg.get("memorizer", {}) if isinstance(cfg, dict) else {}
+		todo_cfg = cfg.get("todo", {}) if isinstance(cfg, dict) else {}
 
 		name = str((advisor_cfg or {}).get("name") or "AdvisorAgent")
 		persona_instructions = str((advisor_cfg or {}).get("persona_instructions") or "").strip() or "You are an always-on robot advisor."
@@ -261,6 +326,11 @@ class AdvisorAgent:
 		listen_mcp_url = str((mcp_cfg or {}).get("listen_mcp_url") or "http://127.0.0.1:8602/mcp").strip()
 		speak_mcp_url = str((mcp_cfg or {}).get("speak_mcp_url") or "http://127.0.0.1:8601/mcp").strip()
 		observe_mcp_url = str((mcp_cfg or {}).get("observe_mcp_url") or "http://127.0.0.1:8603/mcp").strip()
+		move_mcp_url = str((mcp_cfg or {}).get("move_mcp_url") or "http://127.0.0.1:8605/mcp").strip()
+		head_mcp_url = str((mcp_cfg or {}).get("head_mcp_url") or "http://127.0.0.1:8606/mcp").strip()
+		proximity_mcp_url = str((mcp_cfg or {}).get("proximity_mcp_url") or "http://127.0.0.1:8607/mcp").strip()
+		perception_mcp_url = str((mcp_cfg or {}).get("perception_mcp_url") or "http://127.0.0.1:8608/mcp").strip()
+		safety_mcp_url = str((mcp_cfg or {}).get("safety_mcp_url") or "http://127.0.0.1:8609/mcp").strip()
 
 		# Memorizer (optional, separate agent that uses services/memory MCP)
 		memorizer_enabled = bool((memorizer_cfg or {}).get("enabled") if "enabled" in (memorizer_cfg or {}) else True)
@@ -285,6 +355,27 @@ class AdvisorAgent:
 		if not os.path.isabs(memorizer_config_path):
 			memorizer_config_path = os.path.join(repo_root, memorizer_config_path)
 		memorizer_config_path = os.path.abspath(memorizer_config_path)
+        
+		# TodoAgent (local-only)
+		todo_enabled = bool((todo_cfg or {}).get("enabled") if "enabled" in (todo_cfg or {}) else True)
+		todo_config_path_raw = str((todo_cfg or {}).get("config_path") or "agent/todo/config.yaml").strip()
+		todo_config_path = todo_config_path_raw
+		if not os.path.isabs(todo_config_path):
+			todo_config_path = os.path.join(repo_root, todo_config_path)
+		todo_config_path = os.path.abspath(todo_config_path)
+		include_in_prompt = bool((todo_cfg or {}).get("include_in_prompt") if "include_in_prompt" in (todo_cfg or {}) else True)
+		mention_next_in_response = bool(
+			(todo_cfg or {}).get("mention_next_in_response")
+			if "mention_next_in_response" in (todo_cfg or {})
+			else True
+		)
+
+		todo = AdvisorTodoConfig(
+			enabled=bool(todo_enabled),
+			config_path=todo_config_path,
+			include_in_prompt=bool(include_in_prompt),
+			mention_next_in_response=bool(mention_next_in_response),
+		)
 
 		min_transcript_chars = int((interaction_cfg or {}).get("min_transcript_chars") or 3)
 		max_listen_attempts = int((interaction_cfg or {}).get("max_listen_attempts") or 2)
@@ -330,8 +421,21 @@ class AdvisorAgent:
 		observation_question = str((alone_cfg or {}).get("observation_question") or "Briefly describe what you see.")
 		max_thought_chars = int((alone_cfg or {}).get("max_thought_chars") or 240)
 
+		alone_explore_enabled = bool((alone_cfg or {}).get("explore_enabled") if "explore_enabled" in (alone_cfg or {}) else False)
+		alone_explore_speed = int((alone_cfg or {}).get("explore_speed") or 20)
+		alone_explore_speed = max(-100, min(100, alone_explore_speed))
+		alone_explore_threshold_cm = float((alone_cfg or {}).get("explore_threshold_cm") or 35.0)
+		alone_explore_threshold_cm = max(5.0, min(300.0, alone_explore_threshold_cm))
+		alone_explore_duration_s = float((alone_cfg or {}).get("explore_duration_s") or 0.6)
+		alone_explore_duration_s = max(0.1, min(5.0, alone_explore_duration_s))
+		alone_explore_far_duration_s = float((alone_cfg or {}).get("explore_far_duration_s") or 1.2)
+		alone_explore_far_duration_s = max(0.1, min(8.0, alone_explore_far_duration_s))
+		alone_explore_speak = bool((alone_cfg or {}).get("explore_speak") if "explore_speak" in (alone_cfg or {}) else False)
+
 		sound_enabled = bool((sound_cfg or {}).get("enabled"))
 		sound_threshold_rms = int((sound_cfg or {}).get("threshold_rms") or 800)
+		sound_active_windows_required = int((sound_cfg or {}).get("active_windows_required") or 1)
+		sound_active_windows_required = max(1, min(10, sound_active_windows_required))
 		sound_sample_rate_hz = int((sound_cfg or {}).get("sample_rate_hz") or 16000)
 		sound_window_seconds = float((sound_cfg or {}).get("window_seconds") or 0.15)
 		sound_poll_interval_seconds = float((sound_cfg or {}).get("poll_interval_seconds") or 0.25)
@@ -360,44 +464,89 @@ class AdvisorAgent:
 			recall_timeout_seconds=float(recall_timeout_seconds),
 		)
 
-		return cls(
-			AdvisorSettings(
-				name=name,
-				persona_instructions=persona_instructions,
-				debug=debug,
-				debug_log_path=debug_log_path,
-				response_language=response_language,
-				openai_model=openai_model,
-				openai_base_url=openai_base_url,
-				env_file_path=env_file_path,
-				listen_mcp_url=listen_mcp_url,
-				speak_mcp_url=speak_mcp_url,
-				observe_mcp_url=observe_mcp_url,
-				min_transcript_chars=min_transcript_chars,
-				max_listen_attempts=max_listen_attempts,
-				reprompt_text=reprompt_text,
-				listen_stream=listen_stream,
-				interrupt_speech_on_sound=interrupt_speech_on_sound,
-				wait_for_speech_finish=wait_for_speech_finish,
-				speech_status_poll_interval_seconds=speech_status_poll_interval_seconds,
-				speech_max_wait_seconds=speech_max_wait_seconds,
-				suppress_alone_mode_while_speaking=suppress_alone_mode_while_speaking,
-				stop_speech_on_sound_while_waiting=stop_speech_on_sound_while_waiting,
-				post_speech_interaction_grace_seconds=post_speech_interaction_grace_seconds,
-				stop_words=stop_words,
-				think_interval_seconds=think_interval_seconds,
-				observation_question=observation_question,
-				max_thought_chars=max_thought_chars,
-				sound_enabled=sound_enabled,
-				sound_threshold_rms=sound_threshold_rms,
-				sound_sample_rate_hz=sound_sample_rate_hz,
-				sound_window_seconds=sound_window_seconds,
-				sound_poll_interval_seconds=sound_poll_interval_seconds,
-				sound_arecord_device=sound_arecord_device,
-				sound_fallback_to_interaction_on_error=sound_fallback_to_interaction_on_error,
-				memory=mem,
-				memorizer=memorizer,
-			)
+		return AdvisorSettings(
+			name=name,
+			persona_instructions=persona_instructions,
+			debug=debug,
+			debug_log_path=debug_log_path,
+			response_language=response_language,
+			openai_model=openai_model,
+			openai_base_url=openai_base_url,
+			env_file_path=env_file_path,
+			listen_mcp_url=listen_mcp_url,
+			speak_mcp_url=speak_mcp_url,
+			observe_mcp_url=observe_mcp_url,
+			move_mcp_url=move_mcp_url,
+			head_mcp_url=head_mcp_url,
+			proximity_mcp_url=proximity_mcp_url,
+			perception_mcp_url=perception_mcp_url,
+			safety_mcp_url=safety_mcp_url,
+			min_transcript_chars=min_transcript_chars,
+			max_listen_attempts=max_listen_attempts,
+			reprompt_text=reprompt_text,
+			listen_stream=listen_stream,
+			interrupt_speech_on_sound=interrupt_speech_on_sound,
+			wait_for_speech_finish=wait_for_speech_finish,
+			speech_status_poll_interval_seconds=speech_status_poll_interval_seconds,
+			speech_max_wait_seconds=speech_max_wait_seconds,
+			suppress_alone_mode_while_speaking=suppress_alone_mode_while_speaking,
+			stop_speech_on_sound_while_waiting=stop_speech_on_sound_while_waiting,
+			post_speech_interaction_grace_seconds=post_speech_interaction_grace_seconds,
+			stop_words=stop_words,
+			think_interval_seconds=think_interval_seconds,
+			observation_question=observation_question,
+			max_thought_chars=max_thought_chars,
+			alone_explore_enabled=alone_explore_enabled,
+			alone_explore_speed=alone_explore_speed,
+			alone_explore_threshold_cm=alone_explore_threshold_cm,
+			alone_explore_duration_s=alone_explore_duration_s,
+			alone_explore_far_duration_s=alone_explore_far_duration_s,
+			alone_explore_speak=alone_explore_speak,
+			sound_enabled=sound_enabled,
+			sound_threshold_rms=sound_threshold_rms,
+			sound_active_windows_required=sound_active_windows_required,
+			sound_sample_rate_hz=sound_sample_rate_hz,
+			sound_window_seconds=sound_window_seconds,
+			sound_poll_interval_seconds=sound_poll_interval_seconds,
+			sound_arecord_device=sound_arecord_device,
+			sound_fallback_to_interaction_on_error=sound_fallback_to_interaction_on_error,
+			memory=mem,
+			memorizer=memorizer,
+			todo=todo,
+		)
+
+	@classmethod
+	def from_config_yaml(cls, path: str) -> "AdvisorAgent":
+		settings = cls.settings_from_config_yaml(path)
+		return cls(settings)
+
+	def _todo_status_block(self) -> str:
+		cfg = self.settings.todo
+		if not bool(cfg.enabled) or not bool(cfg.include_in_prompt):
+			return ""
+		agent = self._todo
+		if agent is None:
+			return ""
+		try:
+			status = agent.status_text().strip()
+		except Exception:
+			return ""
+		if not status:
+			return ""
+		return "\n\nTodo status (local):\n" + status + "\n"
+
+	def _todo_policy_block(self) -> str:
+		cfg = self.settings.todo
+		if not bool(cfg.enabled) or not bool(cfg.include_in_prompt):
+			return ""
+		if not bool(cfg.mention_next_in_response):
+			return ""
+		return (
+			"\n\nTodo policy:\n"
+			"- Always keep the human aware of what happens next.\n"
+			"- After answering, include the next OPEN todo item in your spoken response.\n"
+			"- If there is no open task, explicitly say that there are no open tasks.\n"
+			"- If the human changes the plan, acknowledge and ask for a new short step list if needed.\n"
 		)
 
 	async def _ensure_memorizer(self) -> Any:
@@ -827,8 +976,349 @@ class AdvisorAgent:
 		)
 		return any(k in low for k in keywords)
 
-	def _parse_decision_json(self, raw: str) -> tuple[str | None, bool | None]:
-		"""Parse a brain JSON response. Returns (response_text, need_observe)."""
+	@staticmethod
+	def _parse_number_with_unit(text: str, *, unit_words: tuple[str, ...]) -> float | None:
+		"""Extract a floating point number with a unit (e.g. "0.7 sek")."""
+		low = (text or "").lower()
+		if not low:
+			return None
+		# Require an explicit unit word to reduce accidental matches (e.g., a speed value).
+		pat = r"(\d+(?:[\.,]\d+)?)\s*(?:" + "|".join([re.escape(u) for u in unit_words]) + r")\b"
+		m = re.search(pat, low)
+		if not m:
+			return None
+		try:
+			return float(m.group(1).replace(",", "."))
+		except Exception:
+			return None
+
+	@staticmethod
+	def _parse_speed(text: str) -> int | None:
+		low = (text or "").lower()
+		m = re.search(r"\b(?:speed|tempo|geschwindigkeit)\s*(?:ist\s*)?(\-?\d{1,3})\b", low)
+		if not m:
+			return None
+		try:
+			v = int(m.group(1))
+			return max(-100, min(100, v))
+		except Exception:
+			return None
+
+	async def _proximity_distance_cm(self) -> float | None:
+		if self._dry_run:
+			return 100.0
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="distance_cm", component="mcp.proximity", url=self.settings.proximity_mcp_url)
+		try:
+			res = await call_mcp_tool_json(url=self.settings.proximity_mcp_url, tool_name="distance_cm", timeout_seconds=5.0)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="distance_cm",
+				component="mcp.proximity",
+				url=self.settings.proximity_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return None
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit(
+			"tool_call_end",
+			tool="distance_cm",
+			component="mcp.proximity",
+			url=self.settings.proximity_mcp_url,
+			duration_ms=round(dur_ms, 2),
+			result_keys=sorted([str(k) for k in res.keys()]) if isinstance(res, dict) else None,
+		)
+		if isinstance(res, dict):
+			try:
+				v = res.get("distance_cm")
+				return float(v) if v is not None else None
+			except Exception:
+				return None
+		return None
+
+	async def _safety_stop(self) -> None:
+		if self._dry_run:
+			self._emit("tool_call", tool="stop", component="mcp.safety", dry_run=True)
+			return
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="stop", component="mcp.safety", url=self.settings.safety_mcp_url)
+		try:
+			await call_mcp_tool_json(url=self.settings.safety_mcp_url, tool_name="stop", timeout_seconds=10.0)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="stop",
+				component="mcp.safety",
+				url=self.settings.safety_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit("tool_call_end", tool="stop", component="mcp.safety", url=self.settings.safety_mcp_url, duration_ms=round(dur_ms, 2))
+
+	async def _safety_estop_on(self) -> None:
+		if self._dry_run:
+			self._emit("tool_call", tool="estop_on", component="mcp.safety", dry_run=True)
+			return
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="estop_on", component="mcp.safety", url=self.settings.safety_mcp_url)
+		try:
+			await call_mcp_tool_json(url=self.settings.safety_mcp_url, tool_name="estop_on", timeout_seconds=5.0)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="estop_on",
+				component="mcp.safety",
+				url=self.settings.safety_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit("tool_call_end", tool="estop_on", component="mcp.safety", url=self.settings.safety_mcp_url, duration_ms=round(dur_ms, 2))
+
+	async def _safety_estop_off(self) -> None:
+		if self._dry_run:
+			self._emit("tool_call", tool="estop_off", component="mcp.safety", dry_run=True)
+			return
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="estop_off", component="mcp.safety", url=self.settings.safety_mcp_url)
+		try:
+			await call_mcp_tool_json(url=self.settings.safety_mcp_url, tool_name="estop_off", timeout_seconds=5.0)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="estop_off",
+				component="mcp.safety",
+				url=self.settings.safety_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit("tool_call_end", tool="estop_off", component="mcp.safety", url=self.settings.safety_mcp_url, duration_ms=round(dur_ms, 2))
+
+	async def _safety_guarded_drive(self, *, speed: int, steer_deg: int = 0, duration_s: float | None = None, threshold_cm: float | None = None) -> dict[str, Any] | None:
+		if self._dry_run:
+			self._emit(
+				"tool_call",
+				tool="guarded_drive",
+				component="mcp.safety",
+				dry_run=True,
+				speed=int(speed),
+				steer_deg=int(steer_deg),
+				duration_s=duration_s,
+				threshold_cm=threshold_cm,
+			)
+			return {"ok": True, "dry_run": True}
+		payload: dict[str, Any] = {"speed": int(speed), "steer_deg": int(steer_deg)}
+		if duration_s is not None:
+			payload["duration_s"] = float(duration_s)
+		if threshold_cm is not None:
+			payload["threshold_cm"] = float(threshold_cm)
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="guarded_drive", component="mcp.safety", url=self.settings.safety_mcp_url, **payload)
+		try:
+			res = await call_mcp_tool_json(url=self.settings.safety_mcp_url, tool_name="guarded_drive", timeout_seconds=10.0, **payload)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="guarded_drive",
+				component="mcp.safety",
+				url=self.settings.safety_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return None
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit(
+			"tool_call_end",
+			tool="guarded_drive",
+			component="mcp.safety",
+			url=self.settings.safety_mcp_url,
+			duration_ms=round(dur_ms, 2),
+			result_keys=sorted([str(k) for k in res.keys()]) if isinstance(res, dict) else None,
+		)
+		return res if isinstance(res, dict) else {"ok": True, "value": res}
+
+	async def _head_set_angles(self, *, pan_deg: int | None = None, tilt_deg: int | None = None) -> None:
+		if self._dry_run:
+			self._emit("tool_call", tool="set_angles", component="mcp.head", dry_run=True, pan_deg=pan_deg, tilt_deg=tilt_deg)
+			return
+		payload: dict[str, Any] = {}
+		if pan_deg is not None:
+			payload["pan_deg"] = int(pan_deg)
+		if tilt_deg is not None:
+			payload["tilt_deg"] = int(tilt_deg)
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="set_angles", component="mcp.head", url=self.settings.head_mcp_url, **payload)
+		try:
+			await call_mcp_tool_json(url=self.settings.head_mcp_url, tool_name="set_angles", timeout_seconds=10.0, **payload)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="set_angles",
+				component="mcp.head",
+				url=self.settings.head_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit("tool_call_end", tool="set_angles", component="mcp.head", url=self.settings.head_mcp_url, duration_ms=round(dur_ms, 2))
+
+	async def _head_center(self) -> None:
+		if self._dry_run:
+			self._emit("tool_call", tool="center", component="mcp.head", dry_run=True)
+			return
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="center", component="mcp.head", url=self.settings.head_mcp_url)
+		try:
+			await call_mcp_tool_json(url=self.settings.head_mcp_url, tool_name="center", timeout_seconds=10.0)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="center",
+				component="mcp.head",
+				url=self.settings.head_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit("tool_call_end", tool="center", component="mcp.head", url=self.settings.head_mcp_url, duration_ms=round(dur_ms, 2))
+
+	async def _head_stop(self) -> None:
+		if self._dry_run:
+			self._emit("tool_call", tool="stop", component="mcp.head", dry_run=True)
+			return
+		try:
+			await call_mcp_tool_json(url=self.settings.head_mcp_url, tool_name="stop", timeout_seconds=5.0)
+		except Exception:
+			return
+
+	async def _try_handle_robot_command(self, text: str) -> str | None:
+		low = (text or "").strip().lower()
+		if not low:
+			return None
+
+		# Emergency stop.
+		if any(k in low for k in ("notaus", "not-aus", "emergency stop", "e-stop", "estop")):
+			await self._speaker_stop()
+			await self._safety_estop_on()
+			await self._safety_stop()
+			return "Not-Aus aktiviert. Ich stoppe sofort."
+
+		# Release estop.
+		if any(k in low for k in ("notaus aus", "not-aus aus", "estop aus", "e-stop aus", "release estop")):
+			await self._safety_estop_off()
+			return "Not-Aus deaktiviert."
+
+		# Distance query.
+		if any(k in low for k in ("abstand", "wie weit", "distance", "how far")):
+			d = await self._proximity_distance_cm()
+			if d is None:
+				return "Ich kann den Abstand gerade nicht messen."
+			return f"Der Abstand nach vorne ist ungefähr {int(round(d))} Zentimeter."
+
+		# Head/look commands.
+		if any(k in low for k in ("schau", "guck", "look")):
+			if any(k in low for k in ("scan", "umschau", "umsehen", "look around", "schau dich um")):
+				# Fire-and-forget scan job.
+				try:
+					await call_mcp_tool_json(
+						url=self.settings.head_mcp_url,
+						tool_name="scan",
+						timeout_seconds=5.0,
+						pattern="sweep",
+						duration_s=3.0,
+					)
+				except Exception:
+					return "Ich kann gerade keinen Scan starten."
+				return "Okay, ich schaue mich kurz um."
+			if any(k in low for k in ("mitte", "zentrum", "gerade", "center", "centre")):
+				await self._head_center()
+				return "Okay."
+			if "links" in low or "left" in low:
+				await self._head_set_angles(pan_deg=-30)
+				return "Okay, ich schaue nach links."
+			if "rechts" in low or "right" in low:
+				await self._head_set_angles(pan_deg=30)
+				return "Okay, ich schaue nach rechts."
+			if "hoch" in low or "up" in low:
+				await self._head_set_angles(tilt_deg=15)
+				return "Okay, ich schaue nach oben."
+			if "runter" in low or "down" in low:
+				await self._head_set_angles(tilt_deg=-15)
+				return "Okay, ich schaue nach unten."
+
+		# Motion commands (guarded through safety service).
+		if any(k in low for k in ("fahr", "fahre", "fahren", "drive", "move", "go")):
+			speed = self._parse_speed(low)
+			if speed is None:
+				speed = 25
+			duration_s = self._parse_number_with_unit(low, unit_words=("s", "sek", "sekunden", "second", "seconds"))
+			if duration_s is None:
+				# common vague words
+				if "kurz" in low:
+					duration_s = 0.5
+				elif "lang" in low or "länger" in low:
+					duration_s = 1.2
+				else:
+					duration_s = 0.7
+
+			steer = 0
+			# Direction words
+			if any(k in low for k in ("rück", "zurück", "back")):
+				speed = -abs(speed)
+			if any(k in low for k in ("vor", "vorwärts", "vorn", "forward")):
+				speed = abs(speed)
+			if "links" in low or "left" in low:
+				steer = -25
+			if "rechts" in low or "right" in low:
+				steer = 25
+
+			res = await self._safety_guarded_drive(speed=speed, steer_deg=steer, duration_s=duration_s, threshold_cm=35.0)
+			if res is None:
+				return "Ich konnte gerade nicht fahren (Service-Fehler)."
+			if bool(res.get("blocked")):
+				return "Ich kann gerade nicht fahren, weil es nicht sicher ist."
+			return "Okay."
+
+		# Perception quick checks.
+		if any(k in low for k in ("gesicht", "faces", "people", "person", "personen", "menschen")) and any(
+			k in low for k in ("siehst", "siehst du", "do you see", "see", "erkennst", "detect")
+		):
+			res = await self._perception_detect()
+			if not isinstance(res, dict) or not bool(res.get("ok")):
+				return "Ich kann gerade keine Erkennung durchführen."
+			faces = res.get("faces") if isinstance(res.get("faces"), list) else []
+			people = res.get("people") if isinstance(res.get("people"), list) else []
+			if faces:
+				return f"Ich sehe {len(faces)} Gesicht(er)."
+			if people:
+				return f"Ich sehe {len(people)} Person(en), aber keine klaren Gesichter."
+			return "Ich sehe keine Personen oder Gesichter."
+
+		return None
+
+	def _parse_decision_json(self, raw: str) -> AdvisorDecision | None:
+		"""Parse a brain JSON response.
+
+		Supported shapes:
+		- v1: {"response_text": str, "need_observe": bool}
+		- v2: {"response_text": str, "need_observe": bool, "actions": [ {"type": ..., ...}, ... ]}
+		"""
 		def _strip_code_fence(s: str) -> str:
 			s = (s or "").strip()
 			if not s.startswith("```"):
@@ -869,9 +1359,9 @@ class AdvisorAgent:
 			# One more try on the original (in case the JSON wasn't inside the code fence).
 			obj = _try_load_json(raw or "")
 		if obj is None:
-			return (None, None)
+			return None
 		if not isinstance(obj, dict):
-			return (None, None)
+			return None
 		resp = obj.get("response_text")
 		need = obj.get("need_observe")
 		resp_s = str(resp).strip() if resp is not None else None
@@ -884,7 +1374,104 @@ class AdvisorAgent:
 			need_b = need.strip().lower() in {"true", "1", "yes", "y"}
 		else:
 			need_b = None
-		return (resp_s if resp_s else None, need_b)
+
+		actions_raw = obj.get("actions")
+		actions: list[dict[str, Any]] = []
+		if isinstance(actions_raw, list):
+			for item in actions_raw:
+				if isinstance(item, dict):
+					actions.append({str(k): v for k, v in item.items()})
+		# Hard cap to avoid runaway behavior.
+		actions = actions[:3]
+		return AdvisorDecision(response_text=(resp_s if resp_s else None), need_observe=need_b, actions=actions)
+
+	async def _execute_planned_actions(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+		"""Execute a small, whitelisted set of actions suggested by the brain.
+
+		This is intentionally conservative: unknown actions are ignored.
+		"""
+		results: list[dict[str, Any]] = []
+		if not actions:
+			return results
+
+		for a in actions[:3]:
+			atype = str(a.get("type") or a.get("action") or "").strip().lower()
+			if not atype:
+				continue
+
+			res: dict[str, Any] = {"type": atype, "ok": True}
+			try:
+				# --- Head ---
+				if atype in {"head_center", "center_head", "look_center"}:
+					await self._head_center()
+				elif atype in {"head_set_angles", "set_head_angles", "look"}:
+					pan = a.get("pan_deg")
+					tilt = a.get("tilt_deg")
+					pan_i = int(pan) if pan is not None else None
+					tilt_i = int(tilt) if tilt is not None else None
+					if pan_i is not None:
+						pan_i = max(-90, min(90, pan_i))
+					if tilt_i is not None:
+						tilt_i = max(-35, min(35, tilt_i))
+					await self._head_set_angles(pan_deg=pan_i, tilt_deg=tilt_i)
+				elif atype in {"head_scan", "scan", "look_around"}:
+					pattern = str(a.get("pattern") or "sweep")
+					duration_s = float(a.get("duration_s") or 3.0)
+					duration_s = max(0.5, min(10.0, duration_s))
+					if self._dry_run:
+						self._emit(
+							"tool_call",
+							tool="scan",
+							component="mcp.head",
+							dry_run=True,
+							pattern=pattern,
+							duration_s=duration_s,
+						)
+					else:
+						await call_mcp_tool_json(
+							url=self.settings.head_mcp_url,
+							tool_name="scan",
+							timeout_seconds=5.0,
+							pattern=pattern,
+							duration_s=duration_s,
+						)
+
+				# --- Safety / Motion ---
+				elif atype in {"stop", "safety_stop", "halt"}:
+					await self._safety_stop()
+				elif atype in {"estop_on", "e_stop", "emergency_stop"}:
+					await self._speaker_stop()
+					await self._safety_estop_on()
+					await self._safety_stop()
+				elif atype in {"estop_off", "release_estop"}:
+					await self._safety_estop_off()
+				elif atype in {"guarded_drive", "drive", "move"}:
+					speed = int(a.get("speed") if a.get("speed") is not None else a.get("speed_pct") or 25)
+					steer = int(a.get("steer_deg") if a.get("steer_deg") is not None else 0)
+					duration_s = float(a.get("duration_s") or 0.7)
+					threshold_cm = float(a.get("threshold_cm") or 35.0)
+					speed = max(-100, min(100, speed))
+					steer = max(-45, min(45, steer))
+					duration_s = max(0.1, min(3.0, duration_s))
+					threshold_cm = max(5.0, min(150.0, threshold_cm))
+					drive_res = await self._safety_guarded_drive(
+						speed=speed,
+						steer_deg=steer,
+						duration_s=duration_s,
+						threshold_cm=threshold_cm,
+					)
+					res["drive_result"] = drive_res
+
+				# Unknown action type -> ignore (do not fail the interaction).
+				else:
+					res["ok"] = False
+					res["ignored"] = True
+					res["reason"] = "unknown_action"
+			except Exception as exc:
+				res["ok"] = False
+				res["error"] = str(exc)
+			results.append(res)
+		return results
 
 	async def _listen_once(self) -> str:
 		if self._dry_run:
@@ -1053,6 +1640,94 @@ class AdvisorAgent:
 		)
 		return str(res.get("text") or res.get("value") or res.get("raw") or "").strip()
 
+	async def _observe_direction(self, question: str | None = None) -> dict[str, Any]:
+		"""Ask the observe service to suggest a movement direction."""
+		if self._dry_run:
+			q = (question or "").strip() or "Where should the robot move next?"
+			self._emit("tool_call", tool="observe_direction", component="mcp.observe", dry_run=True, question=q)
+			return {"cell": {"row": 1, "col": 1}, "action": "forward", "why": "dry_run", "fit": "dry_run"}
+
+		q = (question or "").strip() or "Where should the robot move next to approach the most interesting object?"
+		start = time.perf_counter()
+		self._emit(
+			"tool_call_start",
+			tool="observe_direction",
+			component="mcp.observe",
+			url=self.settings.observe_mcp_url,
+			question=q,
+		)
+		try:
+			res = await call_mcp_tool_json(
+				url=self.settings.observe_mcp_url,
+				tool_name="observe_direction",
+				timeout_seconds=120.0,
+				question=q,
+			)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="observe_direction",
+				component="mcp.observe",
+				url=self.settings.observe_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return {"ok": False, "error": str(exc)}
+
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit(
+			"tool_call_end",
+			tool="observe_direction",
+			component="mcp.observe",
+			url=self.settings.observe_mcp_url,
+			duration_ms=round(dur_ms, 2),
+			result_keys=sorted([str(k) for k in res.keys()]) if isinstance(res, dict) else None,
+		)
+		return res if isinstance(res, dict) else {"ok": True, "value": res}
+
+	async def _perception_detect(self) -> dict[str, Any] | None:
+		"""Best-effort perception detection call."""
+		if self._dry_run:
+			return {"ok": True, "available": True, "dry_run": True, "faces": [], "people": []}
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="detect", component="mcp.perception", url=self.settings.perception_mcp_url)
+		try:
+			res = await call_mcp_tool_json(url=self.settings.perception_mcp_url, tool_name="detect", timeout_seconds=8.0)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="detect",
+				component="mcp.perception",
+				url=self.settings.perception_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return None
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit(
+			"tool_call_end",
+			tool="detect",
+			component="mcp.perception",
+			url=self.settings.perception_mcp_url,
+			duration_ms=round(dur_ms, 2),
+			result_keys=sorted([str(k) for k in res.keys()]) if isinstance(res, dict) else None,
+		)
+		return res if isinstance(res, dict) else {"ok": True, "value": res}
+
+	@staticmethod
+	def _drive_plan_from_observe_action(action: str | None, *, near_s: float, far_s: float) -> tuple[int, float]:
+		"""Map observe_direction 'action' -> (steer_deg, duration_s)."""
+		a = (action or "").strip().lower()
+		dur = float(far_s) if "far" in a else float(near_s)
+		steer = 0
+		if "left" in a:
+			steer = -25
+		elif "right" in a:
+			steer = 25
+		return (int(steer), max(0.1, float(dur)))
+
 	async def _maybe_summarize_and_reset(self) -> None:
 		if self._dry_run:
 			return
@@ -1116,12 +1791,12 @@ class AdvisorAgent:
 		human_text: str,
 		observation: str | None,
 		memory_hint: str | None,
-	) -> tuple[str, bool | None]:
+	) -> tuple[str, bool | None, list[dict[str, Any]]]:
 		if self._dry_run:
 			# Minimal, deterministic behavior for test runs.
 			if observation and observation.strip():
-				return (f"(dry_run) Based on what I see: {observation.strip()}", None)
-			return (f"(dry_run) I heard: {human_text.strip()}", None)
+				return (f"(dry_run) Based on what I see: {observation.strip()}", None, [])
+			return (f"(dry_run) I heard: {human_text.strip()}", None, [])
 
 		brain = await self._ensure_brain()
 
@@ -1143,18 +1818,22 @@ class AdvisorAgent:
 		if ctx:
 			ctx_block = "\n\nConversation so far (most recent last):\n" + ctx + "\n"
 
-		# Ask for a JSON decision so we can optionally trigger observation earlier later.
+		todo_block = self._todo_status_block()
+		todo_policy = self._todo_policy_block()
+
+		# Ask for a JSON decision so we can optionally trigger observation and/or
+		# execute a small set of safe robot actions.
 		lang = self.settings.response_language
 		few_shots = (
 			"Examples (decision JSON only):\n"
 			"Human: Was siehst du?\n"
-			"Assistant: {\"response_text\": \"Einen Moment, ich schaue nach.\", \"need_observe\": true}\n\n"
+			"Assistant: {\"response_text\": \"Einen Moment, ich schaue nach.\", \"need_observe\": true, \"actions\": []}\n\n"
 			"Human: Schau mich an.\n"
-			"Assistant: {\"response_text\": \"Okay, ich schaue dich an.\", \"need_observe\": true}\n\n"
+			"Assistant: {\"response_text\": \"Okay, ich schaue dich an.\", \"need_observe\": true, \"actions\": [{\"type\":\"head_center\"}]}\n\n"
 			"Human: Was ist vor dir?\n"
-			"Assistant: {\"response_text\": \"Einen Moment, ich beschreibe, was vor mir ist.\", \"need_observe\": true}\n\n"
+			"Assistant: {\"response_text\": \"Einen Moment, ich beschreibe, was vor mir ist.\", \"need_observe\": true, \"actions\": []}\n\n"
 			"Human: Wie spät ist es?\n"
-			"Assistant: {\"response_text\": \"Ich kann dir helfen, aber ich habe keine Uhrzeit-Sensorik.\", \"need_observe\": false}\n"
+			"Assistant: {\"response_text\": \"Ich kann dir helfen, aber ich habe keine Uhrzeit-Sensorik.\", \"need_observe\": false, \"actions\": []}\n"
 		)
 		prompt = (
 			"You are responding to a human speaking to the robot.\n"
@@ -1164,13 +1843,24 @@ class AdvisorAgent:
 			"You may think in English, but the returned response_text MUST be in that language.\n"
 			"Return ONLY a JSON object with keys:\n"
 			"- response_text: string (what the robot should say out loud)\n"
-			"- need_observe: boolean (true if you need camera info to answer well)\n\n"
+			"- need_observe: boolean (true if you need camera info to answer well)\n"
+			"- actions: array of small robot actions (optional; may be empty)\n\n"
+			"Allowed action types (use EXACT type strings):\n"
+			"- head_center\n"
+			"- head_set_angles (pan_deg?: int, tilt_deg?: int)\n"
+			"- head_scan (pattern?: string, duration_s?: number)\n"
+			"- guarded_drive (speed: int -100..100, steer_deg?: int, duration_s?: number, threshold_cm?: number)\n"
+			"- safety_stop\n"
+			"- estop_on\n"
+			"- estop_off\n\n"
 			+ few_shots
 			+ "\n"
 			+ ctx_block
 			+ f"Human said: {human_text.strip()}"
 			+ obs_block
 			+ mem_block
+			+ todo_block
+			+ todo_policy
 		)
 		start = time.perf_counter()
 		self._emit(
@@ -1188,19 +1878,19 @@ class AdvisorAgent:
 			duration_ms=round(dur_ms, 2),
 			raw_preview=raw,
 		)
-		resp, need_observe = self._parse_decision_json(raw)
+		decision = self._parse_decision_json(raw)
 		self._emit(
 			"decision",
 			component="advisor.brain",
-			need_observe=need_observe,
+			need_observe=(decision.need_observe if decision else None),
 			has_observation=bool(observation and observation.strip()),
-			response_preview=resp or raw,
+			response_preview=(decision.response_text if decision and decision.response_text else raw),
 		)
-		if resp is not None:
-			return (resp, need_observe)
+		if decision is not None and decision.response_text is not None:
+			return (decision.response_text, decision.need_observe, decision.actions)
 
 		# Fallback: treat model output as plain speech.
-		return (raw, None)
+		return (raw, None, [])
 
 	async def _interaction_step(self) -> None:
 		self._emit("state", component="advisor", state="interaction_start")
@@ -1231,9 +1921,38 @@ class AdvisorAgent:
 		if self._matches_stop_word(text):
 			self._emit("interrupt", component="advisor", kind="stop_word", transcript=text)
 			await self._speaker_stop()
+			# Best-effort: also stop robot motion and head scan jobs.
+			try:
+				await self._safety_stop()
+			except Exception:
+				pass
+			try:
+				await self._head_stop()
+			except Exception:
+				pass
 			return
 
 		self._ledger.append(f"Human: {text}")
+
+		# Fast path: local todo commands.
+		todo_response = await self._try_handle_todo_command(text)
+		if todo_response is not None:
+			self._emit("state", component="advisor", state="interaction_todo")
+			await self._speak(todo_response)
+			self._ledger.append(f"Assistant: {todo_response}")
+			await self._maybe_summarize_and_reset()
+			self._emit("state", component="advisor", state="interaction_end")
+			return
+
+		# Fast path: handle simple robot commands without involving the LLM.
+		cmd_response = await self._try_handle_robot_command(text)
+		if cmd_response is not None:
+			self._emit("state", component="advisor", state="interaction_command")
+			await self._speak(cmd_response)
+			self._ledger.append(f"Assistant: {cmd_response}")
+			await self._maybe_summarize_and_reset()
+			self._emit("state", component="advisor", state="interaction_end")
+			return
 		# If user explicitly asks for a conversation summary, do it directly.
 		if self._wants_conversation_summary(text):
 			summary = await self._summarize_conversation_for_user()
@@ -1259,17 +1978,35 @@ class AdvisorAgent:
 		mem_hint = await self._memorizer_recall(text)
 		if mem_hint:
 			self._ledger.append(f"[recall] {mem_hint}")
-		response, need_observe = await self._decide_and_respond(human_text=text, observation=obs, memory_hint=mem_hint)
+		response, need_observe, actions = await self._decide_and_respond(human_text=text, observation=obs, memory_hint=mem_hint)
+
+		# If the brain proposed safe actions, execute them before speaking.
+		if actions:
+			self._emit("planned_actions", component="advisor", count=len(actions), actions=actions)
+			action_results = await self._execute_planned_actions(actions)
+			self._ledger.append(f"[actions] {action_results}")
 
 		# If the brain asked for an observation and we haven't taken one yet, do it once.
 		if need_observe is True and not (obs and obs.strip()):
 			self._emit("state", component="advisor", state="interaction_observe_assist")
 			obs = await self._observe(f"Help answer the human request: {text}")
-			response, _ = await self._decide_and_respond(human_text=text, observation=obs, memory_hint=mem_hint)
+			response, _, _ = await self._decide_and_respond(human_text=text, observation=obs, memory_hint=mem_hint)
 
 		response = response.strip()
 		if not response:
 			response = "I heard you, but I didn't get enough to answer. Could you say that again?"
+
+		# Optional: always speak the next todo task (keeps the human aligned).
+		if self.settings.todo.enabled and self.settings.todo.mention_next_in_response and self._todo is not None:
+			try:
+				nxt = self._todo.next_task()
+			except Exception:
+				nxt = None
+			if nxt is not None and str(nxt.get("title") or "").strip():
+				prefix = "Nächster Schritt:" if str(self.settings.response_language).lower().startswith("de") else "Next:"
+				hint = f"{prefix} {str(nxt.get('title')).strip()}"
+				if hint.lower() not in response.lower():
+					response = response.rstrip() + "\n\n" + hint
 
 		self._emit("state", component="advisor", state="interaction_speak")
 		await self._speak(response)
@@ -1284,6 +2021,80 @@ class AdvisorAgent:
 
 		await self._maybe_summarize_and_reset()
 		self._emit("state", component="advisor", state="interaction_end")
+
+	async def _try_handle_todo_command(self, text: str) -> str | None:
+		cfg = self.settings.todo
+		agent = self._todo
+		if not bool(cfg.enabled) or agent is None:
+			return None
+		low = (text or "").strip().lower()
+		if not low:
+			return None
+
+		# Status / next.
+		if low in {"todo", "todos", "todo status", "status", "tasks", "aufgaben", "aufgaben status", "liste"}:
+			return agent.status_text()
+		if low in {"next", "next task", "nächste", "nächste aufgabe", "was als nächstes", "was kommt als nächstes"}:
+			nxt = agent.next_task()
+			if nxt is None:
+				return "Keine offenen Aufgaben." if str(self.settings.response_language).lower().startswith("de") else "No open tasks."
+			return f"Nächster Schritt: {nxt.get('title')}" if str(self.settings.response_language).lower().startswith("de") else f"Next: {nxt.get('title')}"
+
+		# Mark done (optionally with an id).
+		done_m = re.search(r"\b(done|erledigt|fertig|abgehakt)\b(?:\s+#?(\d+))?", low)
+		if done_m:
+			tid_s = done_m.group(2)
+			updated = None
+			if tid_s:
+				updated = agent.complete_task(int(tid_s), note=None)
+			else:
+				updated = agent.complete_current_or_next(note=None)
+			if updated is None:
+				return "Ich habe gerade keine offene Aufgabe zum Abhaken." if str(self.settings.response_language).lower().startswith("de") else "I don't have an open task to mark done."
+			nxt = agent.next_task()
+			if nxt is None:
+				return "Erledigt. Keine offenen Aufgaben mehr." if str(self.settings.response_language).lower().startswith("de") else "Done. No open tasks left."
+			return (
+				f"Erledigt. Nächster Schritt: {nxt.get('title')}"
+				if str(self.settings.response_language).lower().startswith("de")
+				else f"Done. Next: {nxt.get('title')}"
+			)
+
+		# Clear.
+		if any(k in low for k in ("clear todo", "clear todos", "todos löschen", "liste leeren", "aufgaben löschen", "clear tasks")):
+			agent.clear()
+			return "Okay, ich habe die Todo-Liste geleert." if str(self.settings.response_language).lower().startswith("de") else "Okay, I cleared the todo list."
+
+		# Add task.
+		add_m = re.match(r"^(?:todo\s+)?(?:add|hinzufügen|füge hinzu|aufgabe hinzufügen)\s*[:\-]?\s*(.+)$", low)
+		if add_m:
+			title = (add_m.group(1) or "").strip()
+			if not title:
+				return None
+			agent.add_task(title)
+			nxt = agent.next_task()
+			if nxt is not None:
+				return (
+					f"Okay. Nächster Schritt: {nxt.get('title')}"
+					if str(self.settings.response_language).lower().startswith("de")
+					else f"Okay. Next: {nxt.get('title')}"
+				)
+			return "Okay." 
+
+		# Replan from a freeform list (if the user speaks a list).
+		if any(x in text for x in ("\n", "- ", "* ")) or re.search(r"\b\d+\s*[\.)]", text):
+			if any(k in low for k in ("plan", "replan", "neuer plan", "todo")):
+				agent.set_from_freeform_text(text)
+				nxt = agent.next_task()
+				if nxt is None:
+					return "Plan aktualisiert. Keine offenen Aufgaben." if str(self.settings.response_language).lower().startswith("de") else "Plan updated. No open tasks."
+				return (
+					f"Plan aktualisiert. Nächster Schritt: {nxt.get('title')}"
+					if str(self.settings.response_language).lower().startswith("de")
+					else f"Plan updated. Next: {nxt.get('title')}"
+				)
+
+		return None
 
 	async def _alone_step(self) -> None:
 		now = time.time()
@@ -1326,6 +2137,37 @@ class AdvisorAgent:
 			await self._speak(thought)
 			self._ledger.append(f"[alone] thought: {thought}")
 			await self._maybe_summarize_and_reset()
+
+		# Optional: a small, safety-guarded exploration step.
+		if bool(self.settings.alone_explore_enabled):
+			try:
+				st = await self._speaker_status()
+				if bool(isinstance(st, dict) and st.get("speaking")):
+					self._emit("state", component="advisor", state="alone_explore_skip_speaking")
+				else:
+					self._emit("state", component="advisor", state="alone_explore")
+					dir_res = await self._observe_direction("Pick a safe direction to move a little. Avoid obstacles.")
+					action = str((dir_res or {}).get("action") or "") if isinstance(dir_res, dict) else ""
+					steer_deg, duration_s = self._drive_plan_from_observe_action(
+						action,
+						near_s=float(self.settings.alone_explore_duration_s),
+						far_s=float(self.settings.alone_explore_far_duration_s),
+					)
+					res = await self._safety_guarded_drive(
+						speed=int(self.settings.alone_explore_speed),
+						steer_deg=int(steer_deg),
+						duration_s=float(duration_s),
+						threshold_cm=float(self.settings.alone_explore_threshold_cm),
+					)
+					self._ledger.append(f"[alone] explore action={action!r} steer={steer_deg} dur={duration_s} res={res}")
+					await self._maybe_summarize_and_reset()
+					if self.settings.alone_explore_speak:
+						if res is None:
+							await self._speak("Ich kann mich gerade nicht bewegen.")
+						elif bool(isinstance(res, dict) and res.get("blocked")):
+							await self._speak("Ich bleibe stehen, weil es nicht sicher ist.")
+			except Exception as exc:
+				self._emit("alone_explore_error", component="advisor", error=str(exc))
 		self._emit("state", component="advisor", state="alone_end")
 
 	async def run_forever(self, *, max_iterations: int | None = None) -> None:
@@ -1350,13 +2192,14 @@ class AdvisorAgent:
 
 				try:
 					self._emit("iteration", component="advisor", iteration=iters)
-					active = False
+					raw_active = False
 					rms = 0
 					backend = None
 					if self._dry_run:
-						active = False
+						raw_active = False
 					elif time.time() < float(self._force_interaction_until_ts or 0.0):
-						active = True
+						raw_active = True
+						self._sound_active_streak = int(self.settings.sound_active_windows_required or 1)
 						self._emit(
 							"mode_hint",
 							component="advisor",
@@ -1370,11 +2213,11 @@ class AdvisorAgent:
 							window_seconds=self.settings.sound_window_seconds,
 							arecord_device=self.settings.sound_arecord_device,
 						)
-						active = bool(res.active)
+						raw_active = bool(res.active)
 						rms = int(res.rms)
 						backend = str(res.backend)
 						reason = getattr(res, "reason", None)
-						self._emit("sound", component="advisor.sound", backend=backend, rms=rms, active=active, reason=reason)
+						self._emit("sound", component="advisor.sound", backend=backend, rms=rms, active=raw_active, reason=reason)
 						if (reason or backend == "none") and self.settings.sound_fallback_to_interaction_on_error:
 							self._emit(
 								"sound_fallback",
@@ -1383,11 +2226,30 @@ class AdvisorAgent:
 								backend=backend,
 								reason=reason,
 							)
-							active = True
+							raw_active = True
+							self._sound_active_streak = int(self.settings.sound_active_windows_required or 1)
 					else:
 						# If sound detection is disabled, default to interaction mode.
-						active = True
+						raw_active = True
+						self._sound_active_streak = int(self.settings.sound_active_windows_required or 1)
 						self._emit("sound", component="advisor.sound", backend=None, rms=None, active=True, disabled=True)
+
+					# Require N consecutive active windows before interacting.
+					req = int(self.settings.sound_active_windows_required or 1)
+					req = max(1, req)
+					if raw_active:
+						self._sound_active_streak = min(self._sound_active_streak + 1, req)
+					else:
+						self._sound_active_streak = 0
+					active = bool(raw_active and (self._sound_active_streak >= req))
+					if raw_active and not active and req > 1:
+						self._emit(
+							"sound_gate",
+							component="advisor.sound",
+							gate="streak",
+							required=req,
+							streak=self._sound_active_streak,
+						)
 
 					if active:
 						# If someone interrupts while the robot is speaking, stop playback before listening.

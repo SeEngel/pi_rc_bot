@@ -1,0 +1,19 @@
+# Todo Agent configuration
+#
+# This agent is intentionally local-only:
+# - no MCP
+# - no LLM
+# - persists state to a JSON file (optional but recommended)
+
+todo:
+  enabled: true
+
+  # Where to persist the todo state.
+  # Relative paths are resolved from repo root.
+  state_path: "memory/todo/state.json"
+
+  # If true, every mutation writes to state_path immediately.
+  autosave: true
+
+  # Max tasks to show in status summaries.
+  max_status_tasks: 6

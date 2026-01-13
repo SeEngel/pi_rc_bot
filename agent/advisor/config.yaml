@@ -41,6 +41,13 @@ mcp:
   speak_mcp_url: "http://127.0.0.1:8601/mcp"
   observe_mcp_url: "http://127.0.0.1:8603/mcp"
 
+  # Optional robot control services (enable by running the services).
+  move_mcp_url: "http://127.0.0.1:8605/mcp"
+  head_mcp_url: "http://127.0.0.1:8606/mcp"
+  proximity_mcp_url: "http://127.0.0.1:8607/mcp"
+  perception_mcp_url: "http://127.0.0.1:8608/mcp"
+  safety_mcp_url: "http://127.0.0.1:8609/mcp"
+
 memorizer:
   # If enabled, the advisor will:
   # - ask the MemorizerAgent to decide whether to store user utterances
@@ -63,6 +70,23 @@ memorizer:
   # Safety timeouts (seconds) so the advisor loop can't stall forever.
   ingest_timeout_seconds: 12.0
   recall_timeout_seconds: 12.0
+
+todo:
+  # Local-only todo list (no MCP, no LLM).
+  # The advisor will:
+  # - inject todo status into its reasoning prompt (optional)
+  # - optionally always mention the next open task out loud
+  enabled: true
+
+  # Path to the todo agent config.
+  # Relative paths are resolved from repo root.
+  config_path: "agent/todo/config.yaml"
+
+  # If true, always include the todo status block in the brain prompt.
+  include_in_prompt: true
+
+  # If true, the advisor will try to mention the next open task in its response.
+  mention_next_in_response: true
 
 interaction:
   # When sound is detected, we attempt STT.
@@ -122,6 +146,26 @@ alone:
   observation_question: "Briefly describe what you see in front of the robot."
   max_thought_chars: 240
 
+  # Optional: enable a tiny, safety-guarded exploration move in alone mode.
+  # Uses `services/observe` tool `observe_direction` + `services/safety` tool `guarded_drive`.
+  # Kept off by default for safety.
+  explore_enabled: false
+
+  # Signed speed (-100..100). Positive drives forward.
+  explore_speed: 20
+
+  # Safety threshold for obstacle blocking.
+  explore_threshold_cm: 35.0
+
+  # Duration for "near" actions (e.g., forward/left/right).
+  explore_duration_s: 0.6
+
+  # Duration for "far" actions (e.g., go far forward/go far left/go far right).
+  explore_far_duration_s: 1.2
+
+  # If true, speak brief messages when movement is blocked/unavailable.
+  explore_speak: false
+
 sound_activity:
   # Sound activity detection.
   # The detector tries:
@@ -131,7 +175,10 @@ sound_activity:
   enabled: true
   # Tune this using the debug protocol's "sound" events.
   # Start around 250-400 for typical USB mics; increase if it triggers too easily.
-  threshold_rms: 700
+  threshold_rms: 1200
+  # Require N consecutive windows above threshold before entering interaction mode.
+  # This reduces false triggers from brief ambient noise spikes.
+  active_windows_required: 2
   sample_rate_hz: 16000
   window_seconds: 0.15
   poll_interval_seconds: 0.25

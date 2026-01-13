@@ -1,0 +1,18 @@
+## Perception service configuration
+
+perception:
+  dry_run: false
+
+  # camera settings (if picamera2 is available)
+  camera_backend: picamera2
+  camera_width: 640
+  camera_height: 480
+  camera_warmup_seconds: 1.0
+
+  # detectors
+  enable_faces: true
+  enable_people: true
+
+service:
+  host: 0.0.0.0
+  port: 8008

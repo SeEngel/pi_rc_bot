@@ -33,11 +33,8 @@ async def _amain() -> int:
 		sys.path.insert(0, repo_root)
 
 	from agent.advisor.src.advisor_agent import AdvisorAgent
-
-	agent = AdvisorAgent.from_config_yaml(args.config)
-	if args.dry_run:
-		# Recreate with dry_run enabled.
-		agent = AdvisorAgent(agent.settings, dry_run=True)
+	settings = AdvisorAgent.settings_from_config_yaml(args.config)
+	agent = AdvisorAgent(settings, dry_run=bool(args.dry_run))
 	await agent.run_forever(max_iterations=args.max_iterations)
 	return 0
 

@@ -1,0 +1,13 @@
+agent:
+  name: MoverAgent
+  instructions: ""
+  default_speed: 20
+  default_steer_deg: 0
+  default_duration_s: 0.6
+
+openai:
+  model: gpt-4o-mini
+  base_url: ""
+
+mcp:
+  move_mcp_url: http://127.0.0.1:8605/mcp

@@ -1,0 +1,12 @@
+agent:
+  name: HeadAgent
+  instructions: ""
+  default_pan_deg: 0
+  default_tilt_deg: 0
+
+openai:
+  model: gpt-4o-mini
+  base_url: ""
+
+mcp:
+  head_mcp_url: http://127.0.0.1:8606/mcp

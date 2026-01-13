@@ -1,0 +1,10 @@
+agent:
+  name: PerceptionAgent
+  instructions: ""
+
+openai:
+  model: gpt-4o-mini
+  base_url: ""
+
+mcp:
+  perception_mcp_url: http://127.0.0.1:8608/mcp
