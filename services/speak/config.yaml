@@ -74,7 +74,7 @@ tts:
     # Stream audio while downloading (low latency)
     # Note: some robot_hat/OpenAI streaming setups produce artifacts on long texts.
     # If you hear crackling/noise, set stream=false and enable chunking.
-    stream: false
+    stream: true
     # Playback gain (1.0 = unchanged). Higher values can clip/distort ("crackling").
     gain: 1.0
 

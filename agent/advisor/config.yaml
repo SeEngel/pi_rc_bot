@@ -32,7 +32,7 @@ advisor:
 
 openai:
   # Model used for the advisor's reasoning (NOT the vision/STT/TTS backends).
-  model: gpt-4o
+  model: gpt-4o-mini
   base_url: ""
 
 mcp:
@@ -131,7 +131,7 @@ sound_activity:
   enabled: true
   # Tune this using the debug protocol's "sound" events.
   # Start around 250-400 for typical USB mics; increase if it triggers too easily.
-  threshold_rms: 350
+  threshold_rms: 700
   sample_rate_hz: 16000
   window_seconds: 0.15
   poll_interval_seconds: 0.25

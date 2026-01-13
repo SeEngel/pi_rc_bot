@@ -57,16 +57,16 @@ stt:
     prompt: ""
 
     # Maximum recording length for microphone capture (seconds).
-    # The service may stop earlier after sustained silence (see stop_silence_seconds).
-    record_seconds: 60.0
+    # Keeping this low avoids long stalls if background noise prevents silence detection.
+    record_seconds: 15.0
 
     # Stop recording after this much continuous silence *after speech has started*.
-    # Increase this to allow short pauses/breathing between sentences.
-    stop_silence_seconds: 2.0
+    # Lower = more responsive; increase if it cuts off mid-sentence.
+    stop_silence_seconds: 1.0
 
     # Simple voice activity threshold (RMS). If recording stops too early, lower it.
     # If it keeps recording background noise, raise it.
-    energy_threshold: 300.0
+    energy_threshold: 900.0
 
     # Streaming capture chunk size (ms). Smaller = more responsive, bigger = less overhead.
     chunk_ms: 50
