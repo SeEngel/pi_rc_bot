@@ -1,0 +1,16 @@
+[Unit]
+Description=pi_rc_bot MCP services (listen/speak/observe/etc.)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Desktop/pi_rc_bot/services
+ExecStartPre=%h/Desktop/pi_rc_bot/scripts/wait_for_network.sh
+ExecStart=%h/Desktop/pi_rc_bot/services/main.sh
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
