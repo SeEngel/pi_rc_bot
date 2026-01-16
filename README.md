@@ -415,3 +415,266 @@ flowchart LR
 | proximity | 8007 | 8607 | Ultrasonic distance |
 | perception | 8008 | 8608 | Face/people detection |
 | safety | 8009 | 8609 | Safe motion guard |
+
+---
+
+## External AI/ML Models
+
+The system uses external OpenAI APIs and optional local models for various capabilities. Below is a complete map of where models are consumed.
+
+### Model Usage Overview
+
+```mermaid
+flowchart TB
+    subgraph OPENAI["☁️ OpenAI API"]
+        GPT4O["gpt-4o<br/><i>Vision LLM</i>"]
+        GPT4OMINI["gpt-4o-mini<br/><i>Agent reasoning</i>"]
+        WHISPER["gpt-4o-mini-transcribe<br/><i>Whisper STT</i>"]
+        TTS["gpt-4o-mini-tts<br/><i>Text-to-Speech</i>"]
+        EMB["text-embedding-3-small<br/><i>Memory embeddings</i>"]
+    end
+
+    subgraph LOCAL["🏠 Local Models (optional)"]
+        VOSK["Vosk<br/><i>Offline STT</i>"]
+        PIPER["Piper<br/><i>Offline TTS</i>"]
+        HAAR["OpenCV Haar<br/><i>Face detection</i>"]
+    end
+
+    subgraph AGENTS["Agent Layer"]
+        ADVISOR["AdvisorBrain"]
+        SUBAGENTS["Sub-Agents<br/><i>(via MCP)</i>"]
+    end
+
+    subgraph SERVICES["Service Layer"]
+        SVC_SPEAK["speak"]
+        SVC_LISTEN["listening"]
+        SVC_OBSERVE["observe"]
+        SVC_MEMORY["memory"]
+        SVC_PERCEP["perception"]
+    end
+
+    %% Agent → OpenAI (reasoning)
+    ADVISOR -->|chat completions| GPT4OMINI
+    SUBAGENTS -->|chat completions| GPT4OMINI
+
+    %% Services → OpenAI
+    SVC_SPEAK -->|audio.speech| TTS
+    SVC_LISTEN -->|audio.transcriptions| WHISPER
+    SVC_OBSERVE -->|chat.completions + image| GPT4O
+    SVC_MEMORY -->|embeddings.create| EMB
+
+    %% Local alternatives
+    SVC_SPEAK -.->|fallback| PIPER
+    SVC_LISTEN -.->|fallback| VOSK
+    SVC_PERCEP -->|Haar cascades| HAAR
+```
+
+---
+
+### LLM (Language Models)
+
+| Model | Used By | Purpose | Input | Output |
+|-------|---------|---------|-------|--------|
+| **gpt-4o-mini** | All Agents (via `OpenAIChatClient`) | Reasoning, tool selection, response generation | System prompt + user message + tool results | Text response or tool calls |
+| **gpt-4o** | `observe` service | Vision understanding | JPEG image + question | Scene description / grid selection |
+
+**Agent LLM Flow:**
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant LLM as OpenAI gpt-4o-mini
+    participant MCP as MCP Service
+
+    A->>LLM: Instructions + User request
+    LLM->>A: Tool call (e.g., drive, speak)
+    A->>MCP: Execute tool via HTTP
+    MCP->>A: Tool result JSON
+    A->>LLM: Tool result
+    LLM->>A: Final response text
+```
+
+---
+
+### STT (Speech-to-Text)
+
+| Engine | Model | Used By | Input | Output |
+|--------|-------|---------|-------|--------|
+| **openai** | `gpt-4o-mini-transcribe` (Whisper) | `listening` service | WAV audio (16-bit PCM) | Transcript text |
+| **vosk** | Local Vosk model | `listening` service | Audio stream | Transcript text |
+
+**STT Flow (OpenAI):**
+```mermaid
+sequenceDiagram
+    participant MIC as Microphone
+    participant L as Listener
+    participant API as OpenAI audio.transcriptions
+
+    MIC->>L: Raw PCM audio
+    Note over L: Detect speech start/end<br/>(energy threshold)
+    L->>L: Write temp WAV file
+    L->>API: POST /audio/transcriptions<br/>model: gpt-4o-mini-transcribe<br/>file: audio.wav
+    API->>L: {"text": "transcribed text"}
+```
+
+**Configuration:**
+```yaml
+# services/listening/config.yaml
+stt:
+  engine: openai  # or "vosk"
+  openai:
+    model: gpt-4o-mini-transcribe
+    language: de  # ISO-639-1
+    record_seconds: 6.0
+    stop_silence_seconds: 2.0
+    energy_threshold: 300.0
+```
+
+---
+
+### TTS (Text-to-Speech)
+
+| Engine | Model | Used By | Input | Output |
+|--------|-------|---------|-------|--------|
+| **openai** | `gpt-4o-mini-tts` | `speak` service | Text + voice + instructions | Streaming audio |
+| **piper** | Local Piper model | `speak` service | Text | WAV audio |
+| **pico2wave** | System binary | `speak` service | Text | WAV audio |
+| **espeak** | System binary | `speak` service | Text | Audio output |
+
+**TTS Flow (OpenAI):**
+```mermaid
+sequenceDiagram
+    participant S as Speaker
+    participant API as OpenAI audio.speech
+    participant OUT as Audio Output
+
+    S->>S: Chunk text (max 600 chars)
+    loop For each chunk
+        S->>API: POST /audio/speech<br/>model: gpt-4o-mini-tts<br/>voice: alloy<br/>input: text chunk
+        API-->>S: Streaming audio bytes
+        S->>OUT: Play audio
+    end
+```
+
+**Configuration:**
+```yaml
+# services/speak/config.yaml
+tts:
+  engine: openai  # or "piper", "pico2wave", "espeak"
+  openai:
+    model: gpt-4o-mini-tts
+    voice: alloy  # alloy, echo, fable, onyx, nova, shimmer
+    instructions: "Speak warmly and clearly"
+    stream: true
+    gain: 1.5
+    chunking: true
+    max_chars: 600
+```
+
+---
+
+### Vision LLM
+
+| Model | Used By | Purpose | Input | Output |
+|-------|---------|---------|-------|--------|
+| **gpt-4o** | `observe` service | Scene understanding | Base64 JPEG + question | Text description |
+| **gpt-4o** | `observe` service | Navigation suggestion | Base64 JPEG with 2×3 grid overlay | JSON: `{row, col, why, fit}` |
+
+**Vision Flow:**
+```mermaid
+sequenceDiagram
+    participant CAM as Camera
+    participant O as Observer
+    participant API as OpenAI chat.completions
+
+    CAM->>O: Capture JPEG
+    O->>O: Base64 encode image
+    O->>API: POST /chat/completions<br/>model: gpt-4o<br/>messages: [system, {text + image_url}]
+    API->>O: {"choices": [{"message": {"content": "..."}}]}
+```
+
+**Configuration:**
+```yaml
+# services/observe/config.yaml
+vision:
+  engine: openai
+  openai:
+    model: gpt-4o
+    temperature: 0.2
+    max_tokens: 200
+```
+
+---
+
+### Embeddings
+
+| Model | Used By | Purpose | Input | Output |
+|-------|---------|---------|-------|--------|
+| **text-embedding-3-small** | `memory` service | Semantic memory storage/retrieval | Text content | 1536-dim float vector |
+
+**Embedding Flow:**
+```mermaid
+sequenceDiagram
+    participant M as MemoryStore
+    participant API as OpenAI embeddings.create
+    participant IDX as Vector Index
+
+    M->>API: POST /embeddings<br/>model: text-embedding-3-small<br/>input: "memory content"
+    API->>M: {"data": [{"embedding": [...]}]}
+    M->>IDX: Store normalized vector
+    
+    Note over M,IDX: Retrieval (cosine similarity)
+    M->>API: Embed query text
+    API->>M: Query vector
+    M->>IDX: top_n nearest neighbors
+    IDX->>M: Matching memories
+```
+
+**Configuration:**
+```yaml
+# services/memory/config.yaml
+embedding:
+  model: text-embedding-3-small
+  # base_url: optional override
+```
+
+---
+
+### Local Detection (No API)
+
+| Model | Used By | Purpose | Input | Output |
+|-------|---------|---------|-------|--------|
+| **Haar cascades** | `perception` service | Face/people detection | Camera frame (OpenCV) | Bounding boxes |
+
+**Detection Flow:**
+```mermaid
+flowchart LR
+    CAM["📷 Camera"] --> CV["OpenCV<br/>cvtColor(GRAY)"]
+    CV --> HAAR["Haar Cascade<br/>detectMultiScale"]
+    HAAR --> BOXES["[{x,y,w,h}, ...]"]
+```
+
+---
+
+### Environment Variables
+
+All OpenAI calls require an API key. Set in `.env`:
+
+```bash
+OPENAI_API_KEY=sk-...
+# Optional: custom endpoint for Azure/local
+OPENAI_BASE_URL=https://your-endpoint/v1
+```
+
+---
+
+### Cost Considerations
+
+| Operation | Model | ~Tokens/Call | Frequency |
+|-----------|-------|--------------|-----------|
+| Agent reasoning | gpt-4o-mini | 500-2000 | Every user interaction |
+| Vision observe | gpt-4o | 1000-2000 + image | Alone mode + on-demand |
+| STT transcribe | Whisper | ~1-10s audio | Every speech input |
+| TTS speak | gpt-4o-mini-tts | ~50-600 chars | Every robot response |
+| Memory embed | text-embedding-3-small | ~50-500 | Store + recall |
+
+**Tip:** Use `dry_run: true` in config files to test without API calls
