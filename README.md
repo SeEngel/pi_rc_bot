@@ -38,6 +38,54 @@ source .venv/bin/activate
 ```bash
 uv sync
 ```
+
+## Autostart on Linux boot (systemd)
+
+This project ships systemd *user* units. The recommended way to enable/disable autostart is via the helper scripts.
+
+### Install (enable autostart)
+
+```bash
+cd ~/Desktop/pi_rc_bot
+bash ./scripts/install.sh
+```
+
+If you want it to start on boot even without GUI/login, enable lingering:
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+### Uninstall (disable autostart)
+
+```bash
+cd ~/Desktop/pi_rc_bot
+bash ./scripts/uninstall.sh
+```
+
+Optional (undo lingering):
+
+```bash
+sudo loginctl disable-linger $USER
+```
+
+### Status / Logs
+
+```bash
+systemctl --user status pi_rc_services.service pi_rc_advisor.service
+journalctl --user -u pi_rc_services.service -u pi_rc_advisor.service -f
+```
+
+### Network wait (optional)
+
+On boot, the services can start before Wi‑Fi/DNS is ready. The network wait prevents that race-condition by waiting (up to a timeout) until the network is online, so the first API calls don’t fail.
+
+You can control the network wait behavior via environment variables:
+
+- `NETWORK_TIMEOUT_SECONDS` (default: `120`)
+- `REQUIRE_INTERNET` (`0`/`1`, default: `0`)
+- `PING_HOST` (default: `1.1.1.1`)
+
 ---
 
 ## Architecture
