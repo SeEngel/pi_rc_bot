@@ -1,0 +1,25 @@
+{
+  "mission": "fahr zehn sekunden im kreis nach rechts und dann erzähl ein gedicht.",
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Fahre 10 Sekunden im Kreis nach rechts",
+      "status": "done",
+      "notes": null
+    },
+    {
+      "id": 2,
+      "title": "Stoppe sicher nach der Fahrt",
+      "status": "done",
+      "notes": null
+    },
+    {
+      "id": 3,
+      "title": "Erzähle ein Gedicht",
+      "status": "done",
+      "notes": null
+    }
+  ],
+  "version": 25,
+  "updated_ts": 1769356433.8419666
+}

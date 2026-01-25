@@ -223,6 +223,7 @@ class SplitBrainAdvisorAgent(LegacyAdvisorAgent):
 		steer_deg: int = 0,
 		duration_s: float | None = None,
 		threshold_cm: float | None = None,
+		await_completion: bool = False,
 	) -> dict[str, Any] | None:
 		if self._dry_run:
 			self._emit(
@@ -253,4 +254,11 @@ class SplitBrainAdvisorAgent(LegacyAdvisorAgent):
 		# but keep legacy command handling in mind (it treats None as service error).
 		if "ok" in inner and not bool(inner.get("ok")):
 			return inner
+
+		# Wait for motion to actually complete if requested
+		# The move service spawns a subprocess and returns immediately,
+		# so we need to explicitly wait for the duration here.
+		if await_completion and duration_s is not None and duration_s > 0:
+			await asyncio.sleep(duration_s + 0.1)
+
 		return inner

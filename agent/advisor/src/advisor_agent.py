@@ -11,7 +11,7 @@ from typing import Any
 
 from agent.src.base_agent import BaseAgentConfig, BaseWorkbenchChatAgent
 from agent.src.config import OpenAIClientConfig, load_yaml, resolve_repo_root
-from agent.todo.src import TodoAgent
+from agent.todo.src import TodoAgent, TaskPlanner, TaskPlannerSettings
 
 from .mcp_client import call_mcp_tool_json
 from .sound_activity import detect_sound_activity
@@ -39,7 +39,7 @@ class AdvisorMemorizerConfig:
 
 @dataclass(frozen=True)
 class AdvisorTodoConfig:
-	"""Configuration for the local TodoAgent integration (no MCP, no LLM)."""
+	"""Configuration for the local TodoAgent integration with optional LLM task planning."""
 
 	enabled: bool
 	# Path to agent/todo/config.yaml (absolute).
@@ -51,6 +51,12 @@ class AdvisorTodoConfig:
 	# If true, instruct the brain to always mention the next open task.
 	# (Keeps the human aware of what happens next.)
 	mention_next_in_response: bool
+
+	# If true, use LLM-based TaskPlanner to decompose multi-step requests.
+	use_task_planner: bool = True
+
+	# Minimum words to trigger task planning (avoid planning for simple commands).
+	task_planner_min_words: int = 6
 
 
 @dataclass(frozen=True)
@@ -173,6 +179,7 @@ class AdvisorAgent:
 		self._brain: AdvisorBrain | None = None
 		self._memorizer: Any | None = None
 		self._todo: TodoAgent | None = None
+		self._task_planner: TaskPlanner | None = None
 		self._memorizer_task: asyncio.Task[None] | None = None
 		self._last_alone_think_ts = 0.0
 		self._force_interaction_until_ts = 0.0
@@ -180,6 +187,7 @@ class AdvisorAgent:
 		self._protocol = ProtocolLogger(enabled=bool(settings.debug), log_path=settings.debug_log_path)
 		self._protocol.open()
 		self._init_todo_agent()
+		self._init_task_planner()
 		# Best-effort persistent memory: load newest summary file (if any) to seed this run.
 		self._load_latest_persisted_summary()
     
@@ -197,6 +205,29 @@ class AdvisorAgent:
 		except Exception as exc:
 			self._emit("todo_init_warning", component="advisor.todo", error=str(exc))
 			self._todo = None
+
+	def _init_task_planner(self) -> None:
+		"""Initialize the LLM-based TaskPlanner (best-effort; must never crash startup)."""
+		try:
+			cfg = self.settings.todo
+			if not bool(cfg.enabled) or not bool(cfg.use_task_planner):
+				return
+			if self._dry_run:
+				return
+
+			# TaskPlanner uses the same OpenAI settings as the advisor brain.
+			planner_settings = TaskPlannerSettings(
+				enabled=True,
+				model=self.settings.openai_model,
+				base_url=self.settings.openai_base_url,
+				env_file_path=self.settings.env_file_path,
+				min_words_for_planning=cfg.task_planner_min_words,
+			)
+			self._task_planner = TaskPlanner(planner_settings)
+			self._emit("task_planner_init", component="advisor.task_planner", enabled=True)
+		except Exception as exc:
+			self._emit("task_planner_init_warning", component="advisor.task_planner", error=str(exc))
+			self._task_planner = None
 
 	def _load_latest_persisted_summary(self) -> None:
 		"""Load the newest persisted summary into `_summary`.
@@ -369,12 +400,20 @@ class AdvisorAgent:
 			if "mention_next_in_response" in (todo_cfg or {})
 			else True
 		)
+		use_task_planner = bool(
+			(todo_cfg or {}).get("use_task_planner")
+			if "use_task_planner" in (todo_cfg or {})
+			else True
+		)
+		task_planner_min_words = int((todo_cfg or {}).get("task_planner_min_words") or 6)
 
 		todo = AdvisorTodoConfig(
 			enabled=bool(todo_enabled),
 			config_path=todo_config_path,
 			include_in_prompt=bool(include_in_prompt),
 			mention_next_in_response=bool(mention_next_in_response),
+			use_task_planner=bool(use_task_planner),
+			task_planner_min_words=int(task_planner_min_words),
 		)
 
 		min_transcript_chars = int((interaction_cfg or {}).get("min_transcript_chars") or 3)
@@ -711,6 +750,14 @@ class AdvisorAgent:
 		if memorizer is not None:
 			try:
 				await memorizer.__aexit__(None, None, None)
+			except Exception:
+				pass
+		# Clean up TaskPlanner
+		task_planner = self._task_planner
+		self._task_planner = None
+		if task_planner is not None:
+			try:
+				await task_planner.close()
 			except Exception:
 				pass
 		self._protocol.close()
@@ -1105,7 +1152,26 @@ class AdvisorAgent:
 		dur_ms = (time.perf_counter() - start) * 1000.0
 		self._emit("tool_call_end", tool="estop_off", component="mcp.safety", url=self.settings.safety_mcp_url, duration_ms=round(dur_ms, 2))
 
-	async def _safety_guarded_drive(self, *, speed: int, steer_deg: int = 0, duration_s: float | None = None, threshold_cm: float | None = None) -> dict[str, Any] | None:
+	async def _safety_guarded_drive(
+		self,
+		*,
+		speed: int,
+		steer_deg: int = 0,
+		duration_s: float | None = None,
+		threshold_cm: float | None = None,
+		await_completion: bool = False,
+	) -> dict[str, Any] | None:
+		"""Execute a guarded drive command.
+
+		Args:
+			speed: Signed speed percentage (-100 to 100).
+			steer_deg: Steering angle in degrees (-35 to 35).
+			duration_s: Duration in seconds. If provided, the motion runs for this long.
+			threshold_cm: Obstacle detection threshold in cm.
+			await_completion: If True, wait for the motion duration to complete before returning.
+				This is useful for sequential task execution where the next task should
+				only start after this motion is done.
+		"""
 		if self._dry_run:
 			self._emit(
 				"tool_call",
@@ -1116,7 +1182,11 @@ class AdvisorAgent:
 				steer_deg=int(steer_deg),
 				duration_s=duration_s,
 				threshold_cm=threshold_cm,
+				await_completion=await_completion,
 			)
+			# In dry-run mode, still simulate the wait if requested
+			if await_completion and duration_s is not None and duration_s > 0:
+				await asyncio.sleep(float(duration_s))
 			return {"ok": True, "dry_run": True}
 		payload: dict[str, Any] = {"speed": int(speed), "steer_deg": int(steer_deg)}
 		if duration_s is not None:
@@ -1124,7 +1194,7 @@ class AdvisorAgent:
 		if threshold_cm is not None:
 			payload["threshold_cm"] = float(threshold_cm)
 		start = time.perf_counter()
-		self._emit("tool_call_start", tool="guarded_drive", component="mcp.safety", url=self.settings.safety_mcp_url, **payload)
+		self._emit("tool_call_start", tool="guarded_drive", component="mcp.safety", url=self.settings.safety_mcp_url, await_completion=await_completion, **payload)
 		try:
 			res = await call_mcp_tool_json(url=self.settings.safety_mcp_url, tool_name="guarded_drive", timeout_seconds=10.0, **payload)
 		except Exception as exc:
@@ -1138,6 +1208,21 @@ class AdvisorAgent:
 				error=str(exc),
 			)
 			return None
+
+		# If await_completion is requested and the motion was started successfully,
+		# wait for the duration to elapse. The move service spawns a subprocess that
+		# runs for duration_s, but returns immediately. We need to wait here.
+		if await_completion and duration_s is not None and duration_s > 0:
+			if isinstance(res, dict) and res.get("ok") and not res.get("blocked"):
+				self._emit(
+					"tool_call_wait",
+					tool="guarded_drive",
+					component="mcp.safety",
+					wait_seconds=duration_s,
+				)
+				# Add a small buffer (0.1s) to ensure the motion subprocess completes
+				await asyncio.sleep(float(duration_s) + 0.1)
+
 		dur_ms = (time.perf_counter() - start) * 1000.0
 		self._emit(
 			"tool_call_end",
@@ -1322,20 +1407,30 @@ class AdvisorAgent:
 			for item in actions_raw:
 				if isinstance(item, dict):
 					actions.append({str(k): v for k, v in item.items()})
-		# Hard cap to avoid runaway behavior.
-		actions = actions[:3]
+		# Cap to avoid runaway behavior (increased from 3 to 10 for multi-step tasks).
+		actions = actions[:10]
 		return AdvisorDecision(response_text=(resp_s if resp_s else None), need_observe=need_b, actions=actions)
 
-	async def _execute_planned_actions(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+	async def _execute_planned_actions(
+		self,
+		actions: list[dict[str, Any]],
+		*,
+		await_completion: bool = False,
+	) -> list[dict[str, Any]]:
 		"""Execute a small, whitelisted set of actions suggested by the brain.
 
 		This is intentionally conservative: unknown actions are ignored.
+
+		Args:
+			actions: List of action dicts with 'type' and parameters.
+			await_completion: If True, wait for time-based actions (like drive) to complete
+				before returning. This is essential for sequential task execution.
 		"""
 		results: list[dict[str, Any]] = []
 		if not actions:
 			return results
 
-		for a in actions[:3]:
+		for a in actions[:10]:
 			atype = str(a.get("type") or a.get("action") or "").strip().lower()
 			if not atype:
 				continue
@@ -1368,6 +1463,9 @@ class AdvisorAgent:
 							pattern=pattern,
 							duration_s=duration_s,
 						)
+						# Simulate wait in dry-run mode if await_completion
+						if await_completion:
+							await asyncio.sleep(duration_s)
 					else:
 						await call_mcp_tool_json(
 							url=self.settings.head_mcp_url,
@@ -1376,6 +1474,10 @@ class AdvisorAgent:
 							pattern=pattern,
 							duration_s=duration_s,
 						)
+						# Head scan is typically blocking on the service side,
+						# but wait anyway if requested
+						if await_completion:
+							await asyncio.sleep(duration_s)
 
 				# --- Safety / Motion ---
 				elif atype in {"stop", "safety_stop", "halt"}:
@@ -1400,6 +1502,7 @@ class AdvisorAgent:
 						steer_deg=steer,
 						duration_s=duration_s,
 						threshold_cm=threshold_cm,
+						await_completion=True,  # Wait for motion to complete before next action
 					)
 					res["drive_result"] = drive_res
 
@@ -1852,6 +1955,172 @@ class AdvisorAgent:
 		# Fallback: treat model output as plain speech.
 		return (raw, None, [])
 
+	def _is_multi_step_request(self, text: str) -> bool:
+		"""Check if a user request might need multi-step task planning."""
+		if self._task_planner is None:
+			return False
+		return self._task_planner.is_multi_step_request(text)
+
+	async def _plan_and_execute_tasks(self, user_request: str) -> str | None:
+		"""Plan tasks from a multi-step request and execute them sequentially.
+
+		Returns the final response to speak, or None if planning failed.
+		"""
+		if self._task_planner is None or self._todo is None:
+			return None
+
+		self._emit("state", component="advisor", state="task_planning_start")
+
+		# Step 1: Plan tasks using LLM
+		try:
+			planned_tasks = await self._task_planner.plan_tasks(
+				user_request,
+				language=self.settings.response_language,
+			)
+		except Exception as exc:
+			self._emit("task_planning_error", component="advisor.task_planner", error=str(exc))
+			return None
+
+		if not planned_tasks:
+			self._emit("task_planning_empty", component="advisor.task_planner")
+			return None
+
+		self._emit(
+			"task_planning_done",
+			component="advisor.task_planner",
+			task_count=len(planned_tasks),
+			tasks=[t.get("title") for t in planned_tasks],
+		)
+
+		# Step 2: Set up todo list with the planned tasks
+		task_titles = [t.get("title", "") for t in planned_tasks if t.get("title")]
+		mission = user_request[:100] + ("..." if len(user_request) > 100 else "")
+		self._todo.set_mission(mission, tasks=task_titles)
+
+		# Store action hints for each task (by title)
+		action_hints: dict[str, dict[str, Any]] = {}
+		for t in planned_tasks:
+			title = t.get("title", "")
+			hint = t.get("action_hint")
+			if title and hint:
+				action_hints[title] = hint
+
+		# Announce the plan
+		lang = self.settings.response_language
+		is_german = str(lang).lower().startswith("de")
+		plan_announcement = (
+			f"Okay, ich habe {len(task_titles)} Schritte geplant. Los geht's!"
+			if is_german
+			else f"Okay, I've planned {len(task_titles)} steps. Let's go!"
+		)
+		await self._speak(plan_announcement)
+		self._ledger.append(f"Assistant: {plan_announcement}")
+
+		# Step 3: Execute tasks one by one
+		completed_count = 0
+		task_results: list[dict[str, Any]] = []
+
+		while self._todo.has_open_tasks():
+			current_task = self._todo.next_task()
+			if current_task is None:
+				break
+
+			task_id = current_task.get("id")
+			task_title = str(current_task.get("title") or "")
+
+			self._emit(
+				"task_execution_start",
+				component="advisor",
+				task_id=task_id,
+				task_title=task_title,
+			)
+
+			# Get the action hint for this task
+			action_hint = action_hints.get(task_title)
+			task_result: dict[str, Any] = {"task_id": task_id, "title": task_title, "ok": True}
+
+			try:
+				if action_hint:
+					# Execute the pre-planned action
+					action_type = str(action_hint.get("type") or "").lower()
+
+					if action_type == "observe":
+						# Special case: observe and describe
+						question = str(action_hint.get("question") or "Beschreibe was du siehst.")
+						obs = await self._observe(question)
+						if obs:
+							await self._speak(obs)
+							self._ledger.append(f"Assistant: {obs}")
+						task_result["observation"] = obs
+					else:
+						# Regular action - execute via _execute_planned_actions
+						action_results = await self._execute_planned_actions([action_hint])
+						task_result["action_results"] = action_results
+
+						# Brief status update (optional, can be removed for silent execution)
+						# await self._speak(f"Erledigt: {task_title}" if is_german else f"Done: {task_title}")
+				else:
+					# No action hint - ask the brain what to do for this task
+					response, need_observe, actions = await self._decide_and_respond(
+						human_text=f"Führe diese Aufgabe aus: {task_title}",
+						observation=None,
+						memory_hint=None,
+					)
+					if actions:
+						action_results = await self._execute_planned_actions(actions)
+						task_result["action_results"] = action_results
+					if need_observe:
+						obs = await self._observe(f"Für die Aufgabe: {task_title}")
+						if obs:
+							await self._speak(obs)
+							self._ledger.append(f"Assistant: {obs}")
+						task_result["observation"] = obs
+					elif response:
+						await self._speak(response)
+						self._ledger.append(f"Assistant: {response}")
+						task_result["response"] = response
+
+				# Mark task as done
+				self._todo.complete_task(task_id)
+				completed_count += 1
+				self._emit(
+					"task_execution_done",
+					component="advisor",
+					task_id=task_id,
+					task_title=task_title,
+				)
+
+			except Exception as exc:
+				task_result["ok"] = False
+				task_result["error"] = str(exc)
+				self._emit(
+					"task_execution_error",
+					component="advisor",
+					task_id=task_id,
+					task_title=task_title,
+					error=str(exc),
+				)
+				# Mark as done anyway to avoid infinite loop
+				self._todo.complete_task(task_id)
+
+			task_results.append(task_result)
+			self._ledger.append(f"[task] {task_result}")
+
+		# Step 4: Final summary
+		self._emit(
+			"task_execution_complete",
+			component="advisor",
+			total_tasks=len(task_titles),
+			completed=completed_count,
+		)
+
+		final_response = (
+			f"Fertig! Ich habe alle {completed_count} Schritte abgeschlossen."
+			if is_german
+			else f"Done! I completed all {completed_count} steps."
+		)
+		return final_response
+
 	async def _interaction_step(self) -> None:
 		self._emit("state", component="advisor", state="interaction_start")
 		# Listen (maybe retry once with reprompt)
@@ -1922,6 +2191,19 @@ class AdvisorAgent:
 			await self._maybe_summarize_and_reset()
 			self._emit("state", component="advisor", state="interaction_end")
 			return
+
+		# NEW: Check if this is a multi-step request that needs task planning
+		if self._is_multi_step_request(text):
+			self._emit("state", component="advisor", state="interaction_multi_step")
+			final_response = await self._plan_and_execute_tasks(text)
+			if final_response is not None:
+				await self._speak(final_response)
+				self._ledger.append(f"Assistant: {final_response}")
+				await self._maybe_summarize_and_reset()
+				self._emit("state", component="advisor", state="interaction_end")
+				return
+			# If planning failed, fall through to normal flow
+
 		await self._maybe_summarize_and_reset()
 
 		wants_vision = self._wants_vision(text)

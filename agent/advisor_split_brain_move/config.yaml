@@ -50,6 +50,9 @@ todo:
   config_path: "agent/todo/config.yaml"
   include_in_prompt: true
   mention_next_in_response: true
+  # LLM-based task planning for multi-step requests
+  use_task_planner: true
+  task_planner_min_words: 6
 
 interaction:
   min_transcript_chars: 3
