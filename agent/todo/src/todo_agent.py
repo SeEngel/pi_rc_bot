@@ -164,6 +164,76 @@ class TodoAgent:
 		self._touch()
 		return obj
 
+	def remove_task(self, task_id: int) -> bool:
+		"""Remove a task by ID. Returns True if task was found and removed."""
+		tasks = self._tasks()
+		for i, t in enumerate(tasks):
+			if int(t.get("id") or 0) == int(task_id):
+				tasks.pop(i)
+				self._touch()
+				return True
+		return False
+
+	def modify_task(self, task_id: int, *, title: str | None = None, notes: str | None = None, status: str | None = None) -> dict[str, Any] | None:
+		"""Modify an existing task. Returns the modified task or None if not found."""
+		tasks = self._tasks()
+		for t in tasks:
+			if int(t.get("id") or 0) == int(task_id):
+				if title is not None:
+					t["title"] = str(title).strip()
+				if notes is not None:
+					t["notes"] = str(notes).strip() if notes.strip() else None
+				if status is not None and status in ("open", "done", "blocked", "skipped"):
+					t["status"] = status
+				self._touch()
+				return t
+		return None
+
+	def insert_task_after(self, after_task_id: int, title: str, *, notes: str | None = None) -> dict[str, Any] | None:
+		"""Insert a new task after the specified task. Returns the new task or None."""
+		t = (title or "").strip()
+		if not t:
+			return None
+		tasks = self._tasks()
+		insert_idx = None
+		for i, task in enumerate(tasks):
+			if int(task.get("id") or 0) == int(after_task_id):
+				insert_idx = i + 1
+				break
+		if insert_idx is None:
+			return None
+		# Get next available ID
+		next_id = max((int(x.get("id") or 0) for x in tasks), default=0) + 1
+		obj = {"id": int(next_id), "title": t, "status": "open", "notes": (notes.strip() if isinstance(notes, str) and notes.strip() else None)}
+		tasks.insert(insert_idx, obj)
+		self._touch()
+		return obj
+
+	def extend_tasks(self, titles: list[str]) -> list[dict[str, Any]]:
+		"""Add multiple tasks at once. Returns the list of added tasks."""
+		added = []
+		for title in titles:
+			task = self.add_task(title)
+			if task:
+				added.append(task)
+		return added
+
+	def reorder_tasks(self, task_ids: list[int]) -> None:
+		"""Reorder tasks according to the provided list of IDs."""
+		tasks = self._tasks()
+		id_to_task = {int(t.get("id") or 0): t for t in tasks}
+		new_order = []
+		for tid in task_ids:
+			if tid in id_to_task:
+				new_order.append(id_to_task[tid])
+		# Add any tasks not in the provided list at the end
+		seen_ids = set(task_ids)
+		for t in tasks:
+			if int(t.get("id") or 0) not in seen_ids:
+				new_order.append(t)
+		self._state["tasks"] = new_order
+		self._touch()
+
 	def complete_task(self, task_id: int, *, note: str | None = None) -> dict[str, Any] | None:
 		tasks = self._tasks()
 		for t in tasks:

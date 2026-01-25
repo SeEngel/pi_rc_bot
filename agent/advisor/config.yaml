@@ -77,6 +77,8 @@ todo:
   # - inject todo status into its reasoning prompt (optional)
   # - optionally always mention the next open task out loud
   # - use LLM to decompose multi-step requests into sequential tasks
+  # - review plans before execution and after completion
+  # - generate autonomous todos in alone mode
   enabled: true
 
   # Path to the todo agent config.
@@ -96,6 +98,34 @@ todo:
 
   # Minimum words to trigger task planning (avoid planning for simple commands).
   task_planner_min_words: 6
+
+  # If true, after creating a plan, ask the LLM if the plan is sufficient
+  # or if changes are needed. This enables interactive plan refinement.
+  review_after_planning: true
+
+  # If true, after completing all tasks, ask the LLM if the mission is truly
+  # complete or if additional tasks should be suggested.
+  review_after_completion: true
+
+  # If true, in alone mode (no human interaction), the advisor will generate
+  # random/autonomous todos like: look around, drive forward, tell a joke, etc.
+  # This makes the robot more "alive" when no one is talking to it.
+  autonomous_mode_enabled: true
+
+  # --- Review Settings ---
+  # If true, after planning tasks, the LLM will review and suggest changes if needed.
+  # This helps ensure the plan is complete and makes sense.
+  review_after_planning: true
+
+  # If true, after all tasks are done, the LLM will check if the mission is truly complete
+  # or if additional tasks should be suggested.
+  review_after_completion: true
+
+  # --- Autonomous Mode Settings ---
+  # If true, in alone mode the robot will generate its own random todos instead of
+  # just observing and thinking out loud.
+  # Examples: "schau nach links", "fahr ein Stück vorwärts", "erzähl einen Witz"
+  autonomous_mode_enabled: true
 
 interaction:
   # When sound is detected, we attempt STT.

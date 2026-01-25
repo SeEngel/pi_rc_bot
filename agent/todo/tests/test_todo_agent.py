@@ -45,6 +45,79 @@ class TestTodoAgent(unittest.TestCase):
 			agent.load()
 			self.assertIsNone(agent.mission())
 
+	def test_remove_task(self):
+		"""Test removing a task by ID."""
+		agent = TodoAgent(TodoAgentSettings(enabled=True, state_path="/dev/null", autosave=False))
+		agent.set_mission("Test", tasks=["a", "b", "c"])
+		
+		# Remove the second task
+		result = agent.remove_task(2)
+		self.assertTrue(result)
+		open_titles = [t.get("title") for t in agent.open_tasks()]
+		self.assertEqual(open_titles, ["a", "c"])
+		
+		# Try to remove non-existent task
+		result = agent.remove_task(999)
+		self.assertFalse(result)
+
+	def test_modify_task(self):
+		"""Test modifying an existing task."""
+		agent = TodoAgent(TodoAgentSettings(enabled=True, state_path="/dev/null", autosave=False))
+		agent.set_mission("Test", tasks=["original title"])
+		
+		# Modify the task
+		modified = agent.modify_task(1, title="new title", notes="some notes")
+		self.assertIsNotNone(modified)
+		self.assertEqual(modified["title"], "new title")
+		self.assertEqual(modified["notes"], "some notes")
+		
+		# Modify status
+		modified = agent.modify_task(1, status="blocked")
+		self.assertEqual(modified["status"], "blocked")
+		
+		# Modify non-existent task
+		result = agent.modify_task(999, title="foo")
+		self.assertIsNone(result)
+
+	def test_insert_task_after(self):
+		"""Test inserting a task after a specific task."""
+		agent = TodoAgent(TodoAgentSettings(enabled=True, state_path="/dev/null", autosave=False))
+		agent.set_mission("Test", tasks=["first", "second", "third"])
+		
+		# Insert after the first task
+		new_task = agent.insert_task_after(1, "inserted")
+		self.assertIsNotNone(new_task)
+		self.assertEqual(new_task["title"], "inserted")
+		
+		# Check order
+		open_titles = [t.get("title") for t in agent.open_tasks()]
+		self.assertEqual(open_titles, ["first", "inserted", "second", "third"])
+		
+		# Insert after non-existent task
+		result = agent.insert_task_after(999, "should fail")
+		self.assertIsNone(result)
+
+	def test_extend_tasks(self):
+		"""Test adding multiple tasks at once."""
+		agent = TodoAgent(TodoAgentSettings(enabled=True, state_path="/dev/null", autosave=False))
+		agent.set_mission("Test", tasks=["existing"])
+		
+		added = agent.extend_tasks(["new1", "new2", "new3"])
+		self.assertEqual(len(added), 3)
+		
+		open_titles = [t.get("title") for t in agent.open_tasks()]
+		self.assertEqual(open_titles, ["existing", "new1", "new2", "new3"])
+
+	def test_reorder_tasks(self):
+		"""Test reordering tasks."""
+		agent = TodoAgent(TodoAgentSettings(enabled=True, state_path="/dev/null", autosave=False))
+		agent.set_mission("Test", tasks=["a", "b", "c"])
+		
+		# Reverse the order
+		agent.reorder_tasks([3, 2, 1])
+		open_titles = [t.get("title") for t in agent.open_tasks()]
+		self.assertEqual(open_titles, ["c", "b", "a"])
+
 
 if __name__ == "__main__":
 	unittest.main()

@@ -54,6 +54,13 @@ todo:
   use_task_planner: true
   task_planner_min_words: 6
 
+  # Review settings: ask LLM to verify/improve the plan
+  review_after_planning: true
+  review_after_completion: true
+
+  # Autonomous mode: generate random todos in alone mode
+  autonomous_mode_enabled: true
+
 interaction:
   min_transcript_chars: 3
   max_listen_attempts: 2

@@ -58,6 +58,15 @@ class AdvisorTodoConfig:
 	# Minimum words to trigger task planning (avoid planning for simple commands).
 	task_planner_min_words: int = 6
 
+	# If true, review the plan after creation and ask if changes are needed.
+	review_after_planning: bool = True
+
+	# If true, review after all tasks are done to check if mission is complete.
+	review_after_completion: bool = True
+
+	# If true, enable autonomous todo generation in alone mode.
+	autonomous_mode_enabled: bool = True
+
 
 @dataclass(frozen=True)
 class AdvisorMemoryConfig:
@@ -226,6 +235,9 @@ class AdvisorAgent:
 				base_url=self.settings.openai_base_url,
 				env_file_path=self.settings.env_file_path,
 				language=self.settings.response_language,
+				review_after_planning=bool(cfg.review_after_planning),
+				review_after_completion=bool(cfg.review_after_completion),
+				autonomous_mode_enabled=bool(cfg.autonomous_mode_enabled),
 			)
 			self._llm_todo = LLMTodoAgent(llm_todo_settings)
 			is_enabled = self._llm_todo.is_enabled()
@@ -235,6 +247,9 @@ class AdvisorAgent:
 				enabled=True,
 				is_enabled=is_enabled,
 				model=self.settings.openai_model,
+				review_after_planning=bool(cfg.review_after_planning),
+				review_after_completion=bool(cfg.review_after_completion),
+				autonomous_mode_enabled=bool(cfg.autonomous_mode_enabled),
 			)
 		except Exception as exc:
 			self._emit("llm_todo_init_warning", component="advisor.llm_todo", error=str(exc))
@@ -440,6 +455,21 @@ class AdvisorAgent:
 			else True
 		)
 		task_planner_min_words = int((todo_cfg or {}).get("task_planner_min_words") or 6)
+		review_after_planning = bool(
+			(todo_cfg or {}).get("review_after_planning")
+			if "review_after_planning" in (todo_cfg or {})
+			else True
+		)
+		review_after_completion = bool(
+			(todo_cfg or {}).get("review_after_completion")
+			if "review_after_completion" in (todo_cfg or {})
+			else True
+		)
+		autonomous_mode_enabled = bool(
+			(todo_cfg or {}).get("autonomous_mode_enabled")
+			if "autonomous_mode_enabled" in (todo_cfg or {})
+			else True
+		)
 
 		todo = AdvisorTodoConfig(
 			enabled=bool(todo_enabled),
@@ -448,6 +478,9 @@ class AdvisorAgent:
 			mention_next_in_response=bool(mention_next_in_response),
 			use_task_planner=bool(use_task_planner),
 			task_planner_min_words=int(task_planner_min_words),
+			review_after_planning=bool(review_after_planning),
+			review_after_completion=bool(review_after_completion),
+			autonomous_mode_enabled=bool(autonomous_mode_enabled),
 		)
 
 		min_transcript_chars = int((interaction_cfg or {}).get("min_transcript_chars") or 3)
@@ -751,6 +784,15 @@ class AdvisorAgent:
 			+ str(lang)
 			+ ".\n"
 			"Keep responses short unless the user asks for detail.\n"
+			"\n"
+			"IMPORTANT about audio errors:\n"
+			"If you receive error messages about audio recording (e.g. 'recording too short', "
+			"'no speech detected', 'audio duration less than X seconds'), these are NORMAL technical "
+			"occurrences that happen when the user didn't speak long enough or there was background noise.\n"
+			"DO NOT try to 'fix' or 'solve' these errors. DO NOT discuss the technical details.\n"
+			"Simply ask the user briefly if they said something, e.g. 'Did you say something?' or "
+			"'I didn't catch that, could you repeat?'\n"
+			"Never mention specific error messages or technical audio parameters to the user.\n"
 			+ seed
 		)
 
@@ -1149,6 +1191,21 @@ class AdvisorAgent:
 		low = t.lower()
 		if low in {"(dry_run)", "[unk]", "unk", "", "..."}:
 			return True
+		# Audio error messages from listen service - these are not real transcripts
+		audio_error_markers = (
+			"recording too short",
+			"audio duration",
+			"less than",
+			"no speech detected",
+			"speech not detected",
+			"audio error",
+			"microphone error",
+			"aufnahme zu kurz",
+			"keine sprache erkannt",
+		)
+		for marker in audio_error_markers:
+			if marker in low:
+				return True
 		return False
 
 	def _matches_stop_word(self, text: str) -> bool:
@@ -2281,6 +2338,9 @@ class AdvisorAgent:
 
 		self._emit("state", component="advisor", state="llm_task_planning_start")
 
+		lang = self.settings.response_language
+		is_german = str(lang).lower().startswith("de")
+
 		# Step 1: Ask LLMTodoAgent to plan tasks
 		try:
 			tasks = await self._llm_todo.plan_tasks(user_request)
@@ -2299,13 +2359,43 @@ class AdvisorAgent:
 			tasks=[t.get("title") for t in tasks],
 		)
 
+		# Step 1b: Review the plan (optional) - ask LLM if it's sufficient
+		if self.settings.todo.review_after_planning:
+			review_result = await self._llm_todo.review_plan()
+			self._emit(
+				"llm_task_plan_review",
+				component="advisor.llm_todo",
+				approved=review_result.get("approved", True),
+				suggestion=review_result.get("suggestion"),
+				reason=review_result.get("reason"),
+			)
+
+			if not review_result.get("approved", True):
+				suggestion = review_result.get("suggestion")
+				if suggestion:
+					# Modify the plan based on the suggestion
+					ask_modify = (
+						f"Ich habe {len(tasks)} Schritte geplant, aber vielleicht sollte ich: {suggestion}. Soll ich den Plan anpassen?"
+						if is_german
+						else f"I planned {len(tasks)} steps, but maybe I should: {suggestion}. Should I adjust the plan?"
+					)
+					await self._speak(ask_modify)
+					self._ledger.append(f"Assistant: {ask_modify}")
+
+					# Auto-modify the plan based on the suggestion
+					self._emit("llm_task_plan_modify", component="advisor.llm_todo", suggestion=suggestion)
+					await self._llm_todo.modify_plan(suggestion)
+					tasks = await self._llm_todo.get_next_task()  # Refresh tasks
+					if tasks is None:
+						tasks = []
+					else:
+						tasks = [tasks]  # Just get the list from the agent
+
 		# Announce the plan
-		lang = self.settings.response_language
-		is_german = str(lang).lower().startswith("de")
 		plan_announcement = (
-			f"Okay, ich habe {len(tasks)} Schritte geplant. Los geht's!"
+			f"Okay, ich habe {len(self._llm_todo._tasks)} Schritte geplant. Los geht's!"
 			if is_german
-			else f"Okay, I've planned {len(tasks)} steps. Let's go!"
+			else f"Okay, I've planned {len(self._llm_todo._tasks)} steps. Let's go!"
 		)
 		await self._speak(plan_announcement)
 		self._ledger.append(f"Assistant: {plan_announcement}")
@@ -2530,6 +2620,43 @@ class AdvisorAgent:
 			component="advisor.llm_todo",
 			completed=completed_count,
 		)
+
+		# Step 4: Review if mission is complete (optional)
+		if self.settings.todo.review_after_completion:
+			review_result = await self._llm_todo.review_completion()
+			self._emit(
+				"llm_task_completion_review",
+				component="advisor.llm_todo",
+				complete=review_result.get("complete", True),
+				reason=review_result.get("reason"),
+			)
+
+			if not review_result.get("complete", True):
+				additional_tasks = review_result.get("additional_tasks")
+				if additional_tasks:
+					# Ask the user if they want to continue
+					ask_continue = (
+						f"Ich habe {completed_count} Schritte erledigt. Aber vielleicht sollte ich noch mehr tun: "
+						f"{', '.join(t.get('title', '?') for t in additional_tasks[:3])}. Soll ich weitermachen?"
+						if is_german
+						else f"I completed {completed_count} steps. But maybe I should do more: "
+						f"{', '.join(t.get('title', '?') for t in additional_tasks[:3])}. Should I continue?"
+					)
+					await self._speak(ask_continue)
+					self._ledger.append(f"Assistant: {ask_continue}")
+
+					# Add the tasks for potential future execution
+					# The user can say "ja" in the next interaction to trigger them
+					await self._llm_todo.add_tasks(additional_tasks)
+
+					self._emit(
+						"llm_task_additional_suggested",
+						component="advisor.llm_todo",
+						additional_count=len(additional_tasks),
+					)
+
+					# Don't clear the todo list - keep it for potential continuation
+					return ask_continue
 
 		final_response = (
 			f"Fertig! Ich habe alle {completed_count} Schritte abgeschlossen."
@@ -3003,6 +3130,24 @@ class AdvisorAgent:
 		self._last_alone_think_ts = now
 		self._emit("state", component="advisor", state="alone_start")
 
+		# Check if we should use autonomous todo generation
+		use_autonomous_todo = (
+			self.settings.todo.autonomous_mode_enabled
+			and self._llm_todo is not None
+			and self._llm_todo.is_enabled()
+		)
+
+		if use_autonomous_todo:
+			# Use autonomous todo generation instead of simple observe + think
+			await self._alone_step_autonomous()
+		else:
+			# Original behavior: observe and think out loud
+			await self._alone_step_simple()
+
+		self._emit("state", component="advisor", state="alone_end")
+
+	async def _alone_step_simple(self) -> None:
+		"""Original alone mode: observe and think out loud."""
 		obs = await self._observe(self.settings.observation_question)
 		self._ledger.append(f"[alone] observation: {obs}")
 		await self._maybe_summarize_and_reset()
@@ -3063,7 +3208,162 @@ class AdvisorAgent:
 							await self._speak("Ich bleibe stehen, weil es nicht sicher ist.")
 			except Exception as exc:
 				self._emit("alone_explore_error", component="advisor", error=str(exc))
-		self._emit("state", component="advisor", state="alone_end")
+
+	async def _alone_step_autonomous(self) -> None:
+		"""Autonomous alone mode: generate and execute random todos."""
+		self._emit("state", component="advisor", state="alone_autonomous_start")
+
+		# First, observe the environment to provide context
+		obs = await self._observe(self.settings.observation_question)
+		self._ledger.append(f"[alone] observation: {obs}")
+
+		# Generate autonomous tasks based on the observation
+		try:
+			context = f"Aktuelle Beobachtung: {obs}" if obs else None
+			tasks = await self._llm_todo.generate_autonomous_tasks(context)
+
+			if not tasks:
+				self._emit("state", component="advisor", state="alone_autonomous_no_tasks")
+				# Fallback to simple mode
+				await self._alone_step_simple()
+				return
+
+			self._emit(
+				"alone_autonomous_tasks_generated",
+				component="advisor.llm_todo",
+				task_count=len(tasks),
+				tasks=[t.get("title") for t in tasks],
+			)
+
+			# Execute the autonomous tasks (usually just 1-3)
+			lang = self.settings.response_language
+			is_german = str(lang).lower().startswith("de")
+
+			for task in tasks[:3]:  # Limit to 3 tasks per alone step
+				if not self._llm_todo.has_pending_tasks():
+					break
+
+				next_task = await self._llm_todo.get_next_task()
+				if next_task is None:
+					break
+
+				task_id = next_task.get("id")
+				task_title = str(next_task.get("title") or "")
+				action = next_task.get("action", {})
+
+				self._emit(
+					"alone_autonomous_task_start",
+					component="advisor.llm_todo",
+					task_id=task_id,
+					task_title=task_title,
+				)
+
+				# Execute the action
+				task_result = await self._execute_autonomous_action(action)
+
+				# Mark task as done
+				await self._llm_todo.mark_task_done(task_id, task_result)
+
+				self._emit(
+					"alone_autonomous_task_done",
+					component="advisor.llm_todo",
+					task_id=task_id,
+					task_title=task_title,
+					result=task_result[:100] if task_result else None,
+				)
+
+				# Small pause between tasks
+				await asyncio.sleep(0.5)
+
+			# Clear the autonomous todo list
+			self._llm_todo.clear()
+
+			self._emit("state", component="advisor", state="alone_autonomous_complete")
+
+		except Exception as exc:
+			self._emit("alone_autonomous_error", component="advisor", error=str(exc))
+			# Fallback to simple mode on error
+			await self._alone_step_simple()
+
+	async def _execute_autonomous_action(self, action: dict[str, Any]) -> str:
+		"""Execute a single autonomous action and return the result."""
+		action_type = str(action.get("type") or "").lower()
+		task_result = ""
+
+		try:
+			if action_type == "observe":
+				question = str(action.get("question") or "Beschreibe was du siehst.")
+				obs = await self._observe(question)
+				if obs:
+					await self._speak(obs)
+					self._ledger.append(f"[alone] autonomous observe: {obs}")
+				task_result = obs or "Keine Beobachtung"
+
+			elif action_type in {"head_set_angles", "set_head_angles", "look"}:
+				pan = action.get("pan_deg")
+				tilt = action.get("tilt_deg")
+				observe_after = bool(action.get("observe_after", False))
+
+				pan_i = int(pan) if pan is not None else None
+				tilt_i = int(tilt) if tilt is not None else None
+				if pan_i is not None:
+					pan_i = max(-90, min(90, pan_i))
+				if tilt_i is not None:
+					tilt_i = max(-35, min(35, tilt_i))
+
+				await self._head_set_angles(pan_deg=pan_i, tilt_deg=tilt_i)
+				await asyncio.sleep(1.0)
+
+				if observe_after:
+					question = str(action.get("observe_question") or action.get("question") or "Was siehst du?")
+					obs = await self._observe(question)
+					if obs:
+						await self._speak(obs)
+						self._ledger.append(f"[alone] autonomous observe: {obs}")
+					task_result = obs or "Keine Beobachtung"
+				else:
+					task_result = f"Kopf bewegt: pan={pan_i}, tilt={tilt_i}"
+
+			elif action_type in {"guarded_drive", "drive", "move"}:
+				speed = int(action.get("speed") or 20)
+				steer_deg = int(action.get("steer_deg") or 0)
+				duration_s = float(action.get("duration_s") or 0.5)
+
+				speed = max(-100, min(100, speed))
+				steer_deg = max(-45, min(45, steer_deg))
+				duration_s = max(0.1, min(3.0, duration_s))  # Shorter limit for autonomous
+
+				res = await self._safety_guarded_drive(
+					speed=speed,
+					steer_deg=steer_deg,
+					duration_s=duration_s,
+					threshold_cm=float(self.settings.alone_explore_threshold_cm),
+					await_completion=True,
+				)
+
+				if res is None:
+					task_result = "Konnte nicht fahren"
+				elif isinstance(res, dict) and res.get("blocked"):
+					task_result = "Fahrt blockiert (Hindernis)"
+				else:
+					task_result = f"Gefahren: speed={speed}, steer={steer_deg}, {duration_s}s"
+
+				self._ledger.append(f"[alone] autonomous drive: {task_result}")
+
+			elif action_type == "speak":
+				text = str(action.get("text") or "")
+				if text:
+					await self._speak(text)
+					self._ledger.append(f"[alone] autonomous speak: {text}")
+				task_result = text
+
+			else:
+				task_result = f"Unbekannte autonome Aktion: {action_type}"
+
+		except Exception as exc:
+			task_result = f"Fehler: {exc}"
+
+		return task_result
 
 	async def run_forever(self, *, max_iterations: int | None = None) -> None:
 		"""Run the advisor loop.
