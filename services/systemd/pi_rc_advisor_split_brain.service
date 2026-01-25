@@ -1,8 +1,8 @@
 [Unit]
 Description=pi_rc_bot Split-Brain Move Advisor agent
-Requires=pi_rc_services.service
+Requires=pi_rc_brain_services.service pi_rc_move_services.service
 Wants=network-online.target
-After=network-online.target pi_rc_services.service
+After=network-online.target pi_rc_brain_services.service pi_rc_move_services.service
 
 [Service]
 Type=simple

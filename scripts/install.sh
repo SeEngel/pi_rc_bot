@@ -54,6 +54,8 @@ need_cmd sed
 # --- Ensure scripts are executable
 chmod +x "${ROOT_DIR}/scripts/wait_for_network.sh" || true
 chmod +x "${ROOT_DIR}/services/main.sh" || true
+chmod +x "${ROOT_DIR}/services/brain.sh" || true
+chmod +x "${ROOT_DIR}/services/move_cluster.sh" || true
 chmod +x "${ROOT_DIR}/scripts/install_systemd_user_units.sh" || true
 
 # --- Ensure .env exists (OpenAI services require OPENAI_API_KEY)
@@ -104,22 +106,25 @@ log "Repo path in unit files will be: ${UNIT_REPO_PREFIX}"
 WORKFLOW_MODE="$(get_workflow_mode)"
 log "Workflow mode: ${WORKFLOW_MODE}"
 
-# Always install the base services unit.
-render_unit_file "${UNIT_SRC_DIR}/pi_rc_services.service" "${UNIT_DST_DIR}/pi_rc_services.service" "${UNIT_REPO_PREFIX}"
-
-# Install the appropriate advisor based on workflow mode.
+# Install units based on workflow mode.
 case "${WORKFLOW_MODE}" in
 	legacy)
-		log "Installing legacy advisor (agent/advisor)."
+		log "Installing legacy mode units (monolithic services + legacy advisor)."
+		render_unit_file "${UNIT_SRC_DIR}/pi_rc_services.service" "${UNIT_DST_DIR}/pi_rc_services.service" "${UNIT_REPO_PREFIX}"
 		render_unit_file "${UNIT_SRC_DIR}/pi_rc_advisor.service" "${UNIT_DST_DIR}/pi_rc_advisor.service" "${UNIT_REPO_PREFIX}"
-		# Remove split-brain advisor if present from a previous install.
+		# Remove split-brain units if present from a previous install.
 		rm -f "${UNIT_DST_DIR}/pi_rc_advisor_split_brain.service" 2>/dev/null || true
+		rm -f "${UNIT_DST_DIR}/pi_rc_brain_services.service" 2>/dev/null || true
+		rm -f "${UNIT_DST_DIR}/pi_rc_move_services.service" 2>/dev/null || true
 		;;
 	split_brain_move)
-		log "Installing split-brain move advisor (agent/advisor_split_brain_move)."
+		log "Installing split_brain_move units (brain services + move cluster + split-brain advisor)."
+		render_unit_file "${UNIT_SRC_DIR}/pi_rc_brain_services.service" "${UNIT_DST_DIR}/pi_rc_brain_services.service" "${UNIT_REPO_PREFIX}"
+		render_unit_file "${UNIT_SRC_DIR}/pi_rc_move_services.service" "${UNIT_DST_DIR}/pi_rc_move_services.service" "${UNIT_REPO_PREFIX}"
 		render_unit_file "${UNIT_SRC_DIR}/pi_rc_advisor_split_brain.service" "${UNIT_DST_DIR}/pi_rc_advisor_split_brain.service" "${UNIT_REPO_PREFIX}"
-		# Remove legacy advisor if present from a previous install.
+		# Remove legacy/monolithic units if present from a previous install.
 		rm -f "${UNIT_DST_DIR}/pi_rc_advisor.service" 2>/dev/null || true
+		rm -f "${UNIT_DST_DIR}/pi_rc_services.service" 2>/dev/null || true
 		;;
 	*)
 		die "Unknown workflow_mode in services/config.yaml: '${WORKFLOW_MODE}' (expected legacy|split_brain_move)"
@@ -128,20 +133,32 @@ esac
 
 # Reload, enable and start
 systemctl --user daemon-reload
-systemctl --user enable --now pi_rc_services.service
+
+# Clear any previous start-limit hits (e.g., after a failed install run).
+systemctl --user reset-failed pi_rc_services.service 2>/dev/null || true
+systemctl --user reset-failed pi_rc_brain_services.service 2>/dev/null || true
+systemctl --user reset-failed pi_rc_move_services.service 2>/dev/null || true
+systemctl --user reset-failed pi_rc_advisor.service 2>/dev/null || true
+systemctl --user reset-failed pi_rc_advisor_split_brain.service 2>/dev/null || true
 
 case "${WORKFLOW_MODE}" in
 	legacy)
+		systemctl --user enable --now pi_rc_services.service
 		systemctl --user enable --now pi_rc_advisor.service
-		# Ensure split-brain advisor is stopped/disabled if it was running.
+		# Ensure split-brain units are stopped/disabled if they were running.
+		systemctl --user disable --now pi_rc_brain_services.service 2>/dev/null || true
+		systemctl --user disable --now pi_rc_move_services.service 2>/dev/null || true
 		systemctl --user disable --now pi_rc_advisor_split_brain.service 2>/dev/null || true
 		log "Installed + started: pi_rc_services.service, pi_rc_advisor.service"
 		;;
 	split_brain_move)
+		systemctl --user enable --now pi_rc_brain_services.service
+		systemctl --user enable --now pi_rc_move_services.service
 		systemctl --user enable --now pi_rc_advisor_split_brain.service
-		# Ensure legacy advisor is stopped/disabled if it was running.
+		# Ensure legacy/monolithic units are stopped/disabled if they were running.
 		systemctl --user disable --now pi_rc_advisor.service 2>/dev/null || true
-		log "Installed + started: pi_rc_services.service, pi_rc_advisor_split_brain.service"
+		systemctl --user disable --now pi_rc_services.service 2>/dev/null || true
+		log "Installed + started: pi_rc_brain_services.service, pi_rc_move_services.service, pi_rc_advisor_split_brain.service"
 		;;
 esac
 
@@ -181,6 +198,6 @@ case "${WORKFLOW_MODE}" in
 		log "Done. Check status with: systemctl --user status pi_rc_services.service pi_rc_advisor.service"
 		;;
 	split_brain_move)
-		log "Done. Check status with: systemctl --user status pi_rc_services.service pi_rc_advisor_split_brain.service"
+		log "Done. Check status with: systemctl --user status pi_rc_brain_services.service pi_rc_move_services.service pi_rc_advisor_split_brain.service"
 		;;
 esac 

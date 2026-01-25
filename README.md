@@ -48,6 +48,11 @@ uv sync
 
 This project ships systemd *user* units. The recommended way to enable/disable autostart is via the helper scripts.
 
+The autostart behavior depends on `services/config.yaml` (`workflow_mode`). To switch modes, update the config and re-run the install script (it will stop/disable the previous advisor unit and enable the correct one).
+
+- **legacy**: enables `pi_rc_services.service` + `pi_rc_advisor.service`
+- **split_brain_move**: enables `pi_rc_brain_services.service` + `pi_rc_move_services.service` + `pi_rc_advisor_split_brain.service`
+
 ### Install (enable autostart)
 
 ```bash
@@ -84,8 +89,8 @@ journalctl --user -u pi_rc_services.service -u pi_rc_advisor.service -f
 
 **Split-brain move mode:**
 ```bash
-systemctl --user status pi_rc_services.service pi_rc_advisor_split_brain.service
-journalctl --user -u pi_rc_services.service -u pi_rc_advisor_split_brain.service -f
+systemctl --user status pi_rc_brain_services.service pi_rc_move_services.service pi_rc_advisor_split_brain.service
+journalctl --user -u pi_rc_brain_services.service -u pi_rc_move_services.service -u pi_rc_advisor_split_brain.service -f
 ```
 
 ### Workflow Modes
@@ -104,6 +109,8 @@ workflow_mode: legacy  # or split_brain_move
 
 The install/uninstall scripts automatically read this config and install the appropriate systemd units.
 
+In **split_brain_move** mode, motion/safety/proximity/perception actions are delegated through the `services/move_advisor` MCP service (default MCP endpoint: `http://127.0.0.1:8611/mcp`).
+
 ### Network wait (optional)
 
 On boot, the services can start before Wi‑Fi/DNS is ready. The network wait prevents that race-condition by waiting (up to a timeout) until the network is online, so the first API calls don’t fail.
@@ -117,6 +124,53 @@ You can control the network wait behavior via environment variables:
 ---
 
 ## Architecture
+
+### Runtime topology (by workflow mode)
+
+#### Legacy (direct MCP calls)
+
+In legacy mode, the advisor calls the lower-level motion stack directly via MCP.
+
+```mermaid
+flowchart LR
+    A[agent/advisor] <-- MCP --> L[services/listening]
+    A <-- MCP --> S[services/speak]
+    A <-- MCP --> O[services/observe]
+
+    A <-- MCP --> SA[services/safety]
+    A <-- MCP --> PX[services/proximity]
+    A <-- MCP --> PC[services/perception]
+    A <-- MCP --> MV[services/move]
+    A <-- MCP --> H[services/head]
+
+    SA --> R[services/robot]
+    PX --> R
+    MV --> R
+    H --> R
+    O --> CAM[(Camera)]
+```
+
+#### Split-brain move (via move_advisor)
+
+In split-brain mode, the advisor delegates *motion-related* actions to `services/move_advisor` (the “move cluster” entry point). This reduces sequential tool-calls in the advisor loop and lets the move cluster execute actions (optionally as background jobs) while the advisor keeps listening/speaking.
+
+```mermaid
+flowchart LR
+    A[agent/advisor_split_brain_move] <-- MCP --> L[services/listening]
+    A <-- MCP --> S[services/speak]
+    A <-- MCP --> O[services/observe]
+    A <-- MCP --> MA[services/move_advisor]
+
+    MA <-- MCP --> SA[services/safety]
+    MA <-- MCP --> PX[services/proximity]
+    MA <-- MCP --> PC[services/perception]
+    MA <-- MCP --> MV[services/move]
+
+    SA --> R[services/robot]
+    PX --> R
+    MV --> R
+    O --> CAM[(Camera)]
+```
 
 ### Design Philosophy: Context Isolation
 
@@ -134,6 +188,8 @@ flowchart TB
 ---
 
 ### Agentic Framework Overview
+
+This repository also contains **Agent Framework-based** domain agents under `agent/*` (listener/speaker/observer/mover/etc.). They are useful for experiments and isolation, but the default autostart workflow runs a single advisor process (either `agent/advisor` or `agent/advisor_split_brain_move`, depending on `workflow_mode`) plus the MCP services.
 
 ```mermaid
 flowchart TB
@@ -258,6 +314,8 @@ Each sub-agent extends `BaseWorkbenchChatAgent` and connects to exactly one MCP 
 | **SafetyAgent** | Safe motion control | `safety:8609` | `check`, `estop_on/off`, `guarded_drive` |
 | **MemorizerAgent** | Long-term memory | `memory:8604` | `store_memory`, `get_top_n_memory` |
 | **TodoAgent** | Task management | *local (no MCP)* | `add`, `complete`, `list` |
+
+In **split_brain_move** mode, motion/safety/proximity/perception actions are typically executed via `services/move_advisor` instead of calling `move`/`safety`/`proximity`/`perception` directly.
 
 ---
 
@@ -439,6 +497,24 @@ flowchart LR
 
 ---
 
+### Move Advisor Service (split-brain move)
+
+The **move_advisor** service is the entry point of the “move cluster”. It accepts high-level action dicts from the advisor and executes them by calling lower-level MCP services (safety/proximity/perception/move). It can also run actions as background jobs.
+
+Default ports:
+
+- HTTP: `8011`
+- MCP: `8611`
+
+**MCP Tools (implemented):**
+
+- `execute_action {action, background?, request_id?}`
+- `job_status {job_id}`
+- `job_cancel {job_id}`
+- `healthz_healthz_get {}`
+
+---
+
 ### Memory Service
 
 ```mermaid
@@ -491,6 +567,7 @@ flowchart LR
 | proximity | 8007 | 8607 | Ultrasonic distance |
 | perception | 8008 | 8608 | Face/people detection |
 | safety | 8009 | 8609 | Safe motion guard |
+| move_advisor | 8011 | 8611 | Split-brain move cluster entry point |
 
 ---
 
