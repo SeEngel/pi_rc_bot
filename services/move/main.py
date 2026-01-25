@@ -34,31 +34,52 @@ except Exception:  # pragma: no cover
 
 if FASTAPI_AVAILABLE:
 	class DriveRequest(BaseModel):
-		speed: int = Field(description="Signed speed (-100..100). Negative = backward.")
-		steer_deg: int = Field(default=0, description="Steering angle in degrees (-35..35).")
+		"""Request payload to drive the robot.
+
+		Use this to make the robot move forward, backward, and/or turn.
+		For safer motion with obstacle detection, prefer using the safety service's /guarded_drive endpoint.
+		"""
+		speed: int = Field(
+			description="Signed speed percentage (-100 to 100). Positive = forward, negative = backward. 0 = stop.",
+			examples=[30, -25, 50, 0],
+			ge=-100,
+			le=100,
+		)
+		steer_deg: int = Field(
+			default=0,
+			description="Steering angle in degrees (-35 to 35). Negative = turn left, positive = turn right. 0 = straight.",
+			examples=[0, -15, 15, -35, 35],
+			ge=-35,
+			le=35,
+		)
 		duration_s: float | None = Field(
 			default=None,
-			description="If provided: run for this duration then stop. If omitted: uses service default.",
+			description="If provided: run for this duration (seconds) then stop automatically. If omitted: uses service default duration. If <= 0: enters continuous mode (call /stop to halt).",
+			examples=[0.5, 1.0, 2.0],
+			ge=0.0,
+			le=10.0,
 		)
 
 	class DriveResponse(BaseModel):
-		"""Drive call result.
+		"""Response from /drive indicating whether a motion job was started.
 
 		If duration_s > 0: a short-lived subprocess job is started (interruptible via /stop).
 		If duration_s <= 0: the controller enters continuous drive mode.
 		"""
-		ok: bool = True
-		started: bool = Field(description="True if a subprocess job was started.")
-		pid: int | None = Field(default=None, description="PID of the subprocess job (if started).")
-		stopped_previous: bool = Field(default=False, description="True if a previous job was stopped first.")
-		continuous: bool | None = Field(default=None, description="True if this call entered continuous drive mode.")
+		ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+		started: bool = Field(description="True if a subprocess job was started for timed motion.")
+		pid: int | None = Field(default=None, description="PID of the subprocess job (if started).", examples=[12345])
+		stopped_previous: bool = Field(default=False, description="True if a previously running job was stopped first.")
+		continuous: bool | None = Field(default=None, description="True if this call entered continuous drive mode (no auto-stop).")
 
 	class StopResponse(BaseModel):
-		ok: bool = True
-		stopped: bool = True
-		stopped_job: bool = False
+		"""Response from /stop indicating motion was halted."""
+		ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+		stopped: bool = Field(default=True, description="True if the motion controller was commanded to stop.")
+		stopped_job: bool = Field(default=False, description="True if a running subprocess job was also terminated.")
 
 	class StatusResponse(BaseModel):
+		"""Current motion controller status."""
 		model_config = {"extra": "allow"}
 
 
@@ -219,7 +240,12 @@ def main() -> int:
 
 	app = FastAPI(title="pi_rc_bot Move Service", version="1.0.0", lifespan=lifespan)
 
-	@app.get("/healthz", operation_id="healthz_healthz_get")
+	@app.get(
+		"/healthz",
+		operation_id="healthz_healthz_get",
+		summary="Health check",
+		description="Returns service health and motor controller availability. Use this to verify the move service is running and hardware is accessible.",
+	)
 	async def healthz() -> dict[str, Any]:
 		mc = controller
 		available = bool(mc and mc.is_available)

@@ -68,36 +68,68 @@ class HealthzResponse(StatusResponse):
 
 
 class EstopResponse(BaseModel):
-	ok: bool = True
-	estop: bool = Field(description="Whether emergency stop is currently active.")
+	"""Response from emergency stop operations."""
+	ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+	estop: bool = Field(description="Whether emergency stop is currently active. When True, all motion commands are blocked.")
 	model_config = {"extra": "allow"}
 
 
 class CheckResponse(BaseModel):
-	ok: bool = True
-	safe: bool | None = Field(default=None, description="Whether it is safe to drive forward under current conditions.")
-	blocked: bool | None = Field(default=None, description="Whether driving is blocked (e.g. obstacle detected or estop).")
-	threshold_cm: float | None = None
-	distance_cm: float | None = None
+	"""Response from /check indicating whether it's safe to drive."""
+	ok: bool = Field(default=True, description="Whether the check completed without errors.")
+	safe: bool | None = Field(default=None, description="True if it's safe to drive forward (no obstacle within threshold, no estop).")
+	blocked: bool | None = Field(default=None, description="True if driving is blocked (obstacle detected OR estop engaged).")
+	threshold_cm: float | None = Field(default=None, description="The distance threshold used for this check.", examples=[35.0])
+	distance_cm: float | None = Field(default=None, description="Current measured distance to obstacle in cm.", examples=[45.5])
 	model_config = {"extra": "allow"}
 
 
 class GuardedDriveRequest(BaseModel):
-	speed: int = Field(description="Signed speed (-100..100). Negative = backward.")
-	steer_deg: int = Field(default=0, description="Steering degrees (-35..35).")
-	duration_s: float | None = Field(default=None, description="If provided, run for this duration then stop.")
-	threshold_cm: float | None = Field(default=None, description="Obstacle threshold override (cm).")
+	"""Request payload for safe/guarded driving.
+
+	This is the RECOMMENDED way to drive the robot from higher-level agents.
+	It will check obstacle distance before moving and refuse to drive if unsafe.
+	"""
+	speed: int = Field(
+		description="Signed speed percentage (-100 to 100). Positive = forward, negative = backward.",
+		examples=[30, -25, 50],
+		ge=-100,
+		le=100,
+	)
+	steer_deg: int = Field(
+		default=0,
+		description="Steering angle in degrees (-35 to 35). Negative = left, positive = right.",
+		examples=[0, -15, 15],
+		ge=-35,
+		le=35,
+	)
+	duration_s: float | None = Field(
+		default=None,
+		description="Drive duration in seconds. If omitted, uses config default.",
+		examples=[0.5, 1.0, 2.0],
+		ge=0.1,
+		le=10.0,
+	)
+	threshold_cm: float | None = Field(
+		default=None,
+		description="Obstacle detection threshold override in cm. If distance < threshold, motion is blocked.",
+		examples=[35.0, 20.0, 50.0],
+		ge=5.0,
+		le=150.0,
+	)
 
 
 class GuardedDriveResponse(BaseModel):
-	ok: bool = True
-	blocked: bool | None = None
+	"""Response from /guarded_drive."""
+	ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+	blocked: bool | None = Field(default=None, description="True if motion was blocked due to safety (obstacle or estop).")
 	model_config = {"extra": "allow"}
 
 
 class StopResponse(BaseModel):
-	ok: bool = True
-	stopped: bool | None = None
+	"""Response from /stop."""
+	ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+	stopped: bool | None = Field(default=None, description="True if the stop command was processed.")
 	model_config = {"extra": "allow"}
 
 

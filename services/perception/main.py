@@ -77,11 +77,15 @@ class HealthzResponse(StatusResponse):
 class DetectResponse(BaseModel):
 	"""Single detection result.
 
-	This endpoint is intentionally flexible because the perception backend can change.
-	Typical keys include lists such as `faces` and `people`.
+	This endpoint returns detected entities from the perception backend.
+	Typical keys include `faces` (list of detected faces) and `people` (list of detected people).
+	The exact structure depends on the configured perception backend.
 	"""
-	ok: bool = True
-	available: bool | None = Field(default=None, description="Whether the perception backend reports as available.")
+	ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+	available: bool | None = Field(
+		default=None,
+		description="Whether the perception backend reports as available.",
+	)
 	model_config = {"extra": "allow"}
 
 

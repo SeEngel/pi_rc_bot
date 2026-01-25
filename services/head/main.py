@@ -34,20 +34,58 @@ except Exception:  # pragma: no cover
 
 if FASTAPI_AVAILABLE:
 	class SetAnglesRequest(BaseModel):
-		pan_deg: int | None = Field(default=None, description="Pan angle in degrees.")
-		tilt_deg: int | None = Field(default=None, description="Tilt angle in degrees.")
+		"""Request payload to set head pan/tilt servo positions.
+
+		Use this to point the robot's head (camera) in a specific direction.
+		Both angles are optional - if omitted, that axis is not changed.
+		"""
+		pan_deg: int | None = Field(
+			default=None,
+			description="Pan (horizontal) angle in degrees. 0 = center, negative = left, positive = right. Typical range: -90 to 90.",
+			examples=[0, -45, 45],
+		)
+		tilt_deg: int | None = Field(
+			default=None,
+			description="Tilt (vertical) angle in degrees. 0 = level, negative = down, positive = up. Typical range: -35 to 35.",
+			examples=[0, -20, 15],
+		)
 
 	class ScanRequest(BaseModel):
-		pattern: str = Field(default="sweep", description="Scan pattern.")
-		duration_s: float = Field(default=3.0, description="Total scan duration in seconds.")
-		step_deg: int | None = Field(default=None, description="Optional step size override (degrees).")
-		interval_s: float | None = Field(default=None, description="Optional interval override between steps (seconds).")
+		"""Request payload to start a head scanning pattern.
+
+		A scan moves the head through a sequence of positions, useful for surveying
+		the environment or looking around. The scan runs in a subprocess so it can
+		be interrupted via /stop.
+		"""
+		pattern: str = Field(
+			default="sweep",
+			description="Scan pattern name. 'sweep' = horizontal left-to-right sweep. 'nod' = vertical up-down nod.",
+			examples=["sweep", "nod"],
+		)
+		duration_s: float = Field(
+			default=3.0,
+			description="Total scan duration in seconds. After this time, the scan stops automatically.",
+			examples=[3.0, 5.0, 10.0],
+			ge=0.5,
+			le=30.0,
+		)
+		step_deg: int | None = Field(
+			default=None,
+			description="Optional step size override in degrees per movement. If omitted, uses config default.",
+			examples=[5, 10, 15],
+		)
+		interval_s: float | None = Field(
+			default=None,
+			description="Optional interval override between steps in seconds. If omitted, uses config default.",
+			examples=[0.1, 0.2, 0.5],
+		)
 
 	class ScanResponse(BaseModel):
-		ok: bool = True
-		started: bool = True
-		pid: int | None = None
-		stopped_previous: bool = False
+		"""Response from starting a scan operation."""
+		ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+		started: bool = Field(default=True, description="Whether a scan subprocess was started.")
+		pid: int | None = Field(default=None, description="Process ID of the scan subprocess (for debugging).", examples=[12345])
+		stopped_previous: bool = Field(default=False, description="True if a previously running scan was stopped first.")
 
 
 def _load_dotenv(path: str) -> None:
@@ -200,7 +238,12 @@ def main() -> int:
 
 	app = FastAPI(title="pi_rc_bot Head Service", version="1.0.0", lifespan=lifespan)
 
-	@app.get("/healthz", operation_id="healthz_healthz_get")
+	@app.get(
+		"/healthz",
+		operation_id="healthz_healthz_get",
+		summary="Health check",
+		description="Returns service health and head servo availability. Use this to verify the head service is running and hardware is accessible.",
+	)
 	async def healthz() -> dict[str, Any]:
 		hc = controller
 		available = bool(hc and hc.is_available)
@@ -234,7 +277,12 @@ def main() -> int:
 				raise HTTPException(status_code=500, detail=str(exc)) from exc
 			return {"ok": True, **hc.status()}
 
-	@app.post("/center", operation_id="center")
+	@app.post(
+		"/center",
+		operation_id="center",
+		summary="Center head",
+		description="Resets the head to center position (pan=0, tilt=0). Stops any running scan first.",
+	)
 	async def center() -> dict[str, Any]:
 		hc = controller
 		if hc is None:
@@ -310,7 +358,12 @@ def main() -> int:
 			stopped = _stop_job_only()
 		return {"ok": True, "stopped": bool(stopped)}
 
-	@app.get("/status", operation_id="status")
+	@app.get(
+		"/status",
+		operation_id="status",
+		summary="Head status",
+		description="Returns current head position, availability, and whether a scan job is running.",
+	)
 	async def status() -> dict[str, Any]:
 		hc = controller
 		with controller_lock:

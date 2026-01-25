@@ -1232,68 +1232,9 @@ class AdvisorAgent:
 			return f"Der Abstand nach vorne ist ungefähr {int(round(d))} Zentimeter."
 
 		# Head/look commands.
-		if any(k in low for k in ("schau", "guck", "look")):
-			if any(k in low for k in ("scan", "umschau", "umsehen", "look around", "schau dich um")):
-				# Fire-and-forget scan job.
-				try:
-					await call_mcp_tool_json(
-						url=self.settings.head_mcp_url,
-						tool_name="scan",
-						timeout_seconds=5.0,
-						pattern="sweep",
-						duration_s=3.0,
-					)
-				except Exception:
-					return "Ich kann gerade keinen Scan starten."
-				return "Okay, ich schaue mich kurz um."
-			if any(k in low for k in ("mitte", "zentrum", "gerade", "center", "centre")):
-				await self._head_center()
-				return "Okay."
-			if "links" in low or "left" in low:
-				await self._head_set_angles(pan_deg=-30)
-				return "Okay, ich schaue nach links."
-			if "rechts" in low or "right" in low:
-				await self._head_set_angles(pan_deg=30)
-				return "Okay, ich schaue nach rechts."
-			if "hoch" in low or "up" in low:
-				await self._head_set_angles(tilt_deg=15)
-				return "Okay, ich schaue nach oben."
-			if "runter" in low or "down" in low:
-				await self._head_set_angles(tilt_deg=-15)
-				return "Okay, ich schaue nach unten."
-
-		# Motion commands (guarded through safety service).
-		if any(k in low for k in ("fahr", "fahre", "fahren", "drive", "move", "go")):
-			speed = self._parse_speed(low)
-			if speed is None:
-				speed = 25
-			duration_s = self._parse_number_with_unit(low, unit_words=("s", "sek", "sekunden", "second", "seconds"))
-			if duration_s is None:
-				# common vague words
-				if "kurz" in low:
-					duration_s = 0.5
-				elif "lang" in low or "länger" in low:
-					duration_s = 1.2
-				else:
-					duration_s = 0.7
-
-			steer = 0
-			# Direction words
-			if any(k in low for k in ("rück", "zurück", "back")):
-				speed = -abs(speed)
-			if any(k in low for k in ("vor", "vorwärts", "vorn", "forward")):
-				speed = abs(speed)
-			if "links" in low or "left" in low:
-				steer = -25
-			if "rechts" in low or "right" in low:
-				steer = 25
-
-			res = await self._safety_guarded_drive(speed=speed, steer_deg=steer, duration_s=duration_s, threshold_cm=35.0)
-			if res is None:
-				return "Ich konnte gerade nicht fahren (Service-Fehler)."
-			if bool(res.get("blocked")):
-				return "Ich kann gerade nicht fahren, weil es nicht sicher ist."
-			return "Okay."
+		# Head and motion commands are handled by the LLM to properly parse natural language.
+		# The LLM has access to head MCP tools (set_angles, scan, center) and will use them
+		# based on understanding the user's intent.
 
 		# Perception quick checks.
 		if any(k in low for k in ("gesicht", "faces", "people", "person", "personen", "menschen")) and any(
@@ -1452,7 +1393,7 @@ class AdvisorAgent:
 					threshold_cm = float(a.get("threshold_cm") or 35.0)
 					speed = max(-100, min(100, speed))
 					steer = max(-45, min(45, steer))
-					duration_s = max(0.1, min(3.0, duration_s))
+					duration_s = max(0.1, min(10.0, duration_s))
 					threshold_cm = max(5.0, min(150.0, threshold_cm))
 					drive_res = await self._safety_guarded_drive(
 						speed=speed,
@@ -1830,6 +1771,24 @@ class AdvisorAgent:
 			"Assistant: {\"response_text\": \"Einen Moment, ich schaue nach.\", \"need_observe\": true, \"actions\": []}\n\n"
 			"Human: Schau mich an.\n"
 			"Assistant: {\"response_text\": \"Okay, ich schaue dich an.\", \"need_observe\": true, \"actions\": [{\"type\":\"head_center\"}]}\n\n"
+			"Human: Schau nach oben.\n"
+			"Assistant: {\"response_text\": \"Okay, ich schaue nach oben.\", \"need_observe\": false, \"actions\": [{\"type\":\"head_set_angles\", \"tilt_deg\": 15}]}\n\n"
+			"Human: Guck mal hoch bitte.\n"
+			"Assistant: {\"response_text\": \"Okay.\", \"need_observe\": false, \"actions\": [{\"type\":\"head_set_angles\", \"tilt_deg\": 15}]}\n\n"
+			"Human: Look down.\n"
+			"Assistant: {\"response_text\": \"Okay, looking down.\", \"need_observe\": false, \"actions\": [{\"type\":\"head_set_angles\", \"tilt_deg\": -15}]}\n\n"
+			"Human: Schau nach links.\n"
+			"Assistant: {\"response_text\": \"Okay, ich schaue nach links.\", \"need_observe\": false, \"actions\": [{\"type\":\"head_set_angles\", \"pan_deg\": -30}]}\n\n"
+			"Human: Turn your head to the right.\n"
+			"Assistant: {\"response_text\": \"Okay.\", \"need_observe\": false, \"actions\": [{\"type\":\"head_set_angles\", \"pan_deg\": 30}]}\n\n"
+			"Human: Schau dich mal um.\n"
+			"Assistant: {\"response_text\": \"Okay, ich schaue mich um.\", \"need_observe\": false, \"actions\": [{\"type\":\"head_scan\", \"pattern\": \"sweep\", \"duration_s\": 3.0}]}\n\n"
+			"Human: Fahr drei Sekunden nach links.\n"
+			"Assistant: {\"response_text\": \"Okay, ich fahre drei Sekunden nach links.\", \"need_observe\": false, \"actions\": [{\"type\":\"guarded_drive\", \"speed\": 25, \"steer_deg\": -25, \"duration_s\": 3.0}]}\n\n"
+			"Human: Drive forward for 5 seconds.\n"
+			"Assistant: {\"response_text\": \"Okay, driving forward for 5 seconds.\", \"need_observe\": false, \"actions\": [{\"type\":\"guarded_drive\", \"speed\": 30, \"steer_deg\": 0, \"duration_s\": 5.0}]}\n\n"
+			"Human: Fahr mal kurz vorwärts.\n"
+			"Assistant: {\"response_text\": \"Okay.\", \"need_observe\": false, \"actions\": [{\"type\":\"guarded_drive\", \"speed\": 25, \"steer_deg\": 0, \"duration_s\": 0.7}]}\n\n"
 			"Human: Was ist vor dir?\n"
 			"Assistant: {\"response_text\": \"Einen Moment, ich beschreibe, was vor mir ist.\", \"need_observe\": true, \"actions\": []}\n\n"
 			"Human: Wie spät ist es?\n"
@@ -1849,7 +1808,8 @@ class AdvisorAgent:
 			"- head_center\n"
 			"- head_set_angles (pan_deg?: int, tilt_deg?: int)\n"
 			"- head_scan (pattern?: string, duration_s?: number)\n"
-			"- guarded_drive (speed: int -100..100, steer_deg?: int, duration_s?: number, threshold_cm?: number)\n"
+			"- guarded_drive (speed: int -100..100, steer_deg?: int, duration_s: number 0.1-10.0, threshold_cm?: number)\n"
+			"  IMPORTANT: When the user specifies a time duration (e.g. 'drive 3 seconds left'), you MUST include duration_s in the action!\n"
 			"- safety_stop\n"
 			"- estop_on\n"
 			"- estop_off\n\n"

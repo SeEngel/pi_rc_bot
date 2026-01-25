@@ -15,6 +15,10 @@ class RobotSettings:
 	dry_run: bool = False
 	max_steer_deg: int = 35
 	max_speed: int = 100
+	# Per-motor trim (software offset) to compensate mismatched motors.
+	# Applied to the *magnitude* of each motor command (preserves sign).
+	left_speed_offset: int = 0
+	right_speed_offset: int = 0
 	max_pan_deg: int = 35
 	max_tilt_deg: int = 35
 
@@ -74,6 +78,70 @@ class RobotController:
 		m = max(1, int(max_abs))
 		return max(-m, min(m, v))
 
+	def _apply_offset(self, cmd: int, *, offset: int) -> int:
+		"""Apply per-motor trim while preserving direction.
+
+		Examples:
+		- cmd=10, offset=5  -> 15
+		- cmd=-10, offset=5 -> -15
+		- cmd=0, offset=5   -> 0
+		"""
+		c = int(cmd)
+		o = int(offset)
+		if c == 0 or o == 0:
+			return c
+		return c + (o if c > 0 else -o)
+
+	def _compute_motor_commands(self, *, speed: int, steer_deg: int) -> tuple[int, int, int]:
+		"""Return (steer_used_deg, left_cmd, right_cmd).
+
+		Motor sign conventions follow the upstream `picarx.Picarx` implementation:
+		- forward(): left motor positive, right motor negative
+		- backward(): left motor negative, right motor positive
+		"""
+		# Picar-X constrains steering to +/-30 internally.
+		steer_used = self._clamp(int(steer_deg), max_abs=min(30, int(self.settings.max_steer_deg)))
+		max_spd = max(1, int(self.settings.max_speed))
+		spd = max(-max_spd, min(max_spd, int(speed)))
+		base = abs(spd)
+
+		if base == 0:
+			return steer_used, 0, 0
+
+		# Replicates `picarx.Picarx.forward/backward` power scaling based on steering.
+		abs_angle = abs(steer_used)
+		if abs_angle > 30:
+			abs_angle = 30
+		power_scale = (100 - abs_angle) / 100.0
+		scaled = int(base * power_scale)
+
+		if spd >= 0:
+			# forward
+			if steer_used != 0:
+				if steer_used > 0:
+					left_cmd, right_cmd = scaled, -base
+				else:
+					left_cmd, right_cmd = base, -scaled
+			else:
+				left_cmd, right_cmd = base, -base
+		else:
+			# backward
+			if steer_used != 0:
+				if steer_used > 0:
+					left_cmd, right_cmd = -base, scaled
+				else:
+					left_cmd, right_cmd = -scaled, base
+			else:
+				left_cmd, right_cmd = -base, base
+
+		# Apply trims and clamp to configured speed limits.
+		left_cmd = self._apply_offset(left_cmd, offset=self.settings.left_speed_offset)
+		right_cmd = self._apply_offset(right_cmd, offset=self.settings.right_speed_offset)
+		left_cmd = max(-max_spd, min(max_spd, int(left_cmd)))
+		right_cmd = max(-max_spd, min(max_spd, int(right_cmd)))
+
+		return steer_used, int(left_cmd), int(right_cmd)
+
 	def status(self) -> dict[str, Any]:
 		return {
 			"ok": True,
@@ -89,13 +157,19 @@ class RobotController:
 		}
 
 	def drive(self, *, speed: int, steer_deg: int = 0) -> None:
-		spd = int(speed)
+		steer_used, left_cmd, right_cmd = self._compute_motor_commands(speed=int(speed), steer_deg=int(steer_deg))
+		# Preserve the user-facing speed for observability.
 		max_spd = max(1, int(self.settings.max_speed))
-		spd = max(-max_spd, min(max_spd, spd))
-
-		steer = self._clamp(int(steer_deg), max_abs=self.settings.max_steer_deg)
-
-		self._last_cmd = {"cmd": "drive", "speed": spd, "steer_deg": steer}
+		spd = max(-max_spd, min(max_spd, int(speed)))
+		self._last_cmd = {
+			"cmd": "drive",
+			"speed": int(spd),
+			"steer_deg": int(steer_used),
+			"motor_left": int(left_cmd),
+			"motor_right": int(right_cmd),
+			"motor_trim_left": int(self.settings.left_speed_offset),
+			"motor_trim_right": int(self.settings.right_speed_offset),
+		}
 		self._last_cmd_ts = time.time()
 
 		if self.settings.dry_run:
@@ -104,11 +178,10 @@ class RobotController:
 			raise RobotError(self._available_reason or "Robot unavailable")
 
 		try:
-			self._px.set_dir_servo_angle(steer)
-			if spd >= 0:
-				self._px.forward(abs(spd))
-			else:
-				self._px.backward(abs(spd))
+			self._px.set_dir_servo_angle(int(steer_used))
+			# Set individual motor speeds so we can apply per-motor trim.
+			self._px.set_motor_speed(1, int(left_cmd))
+			self._px.set_motor_speed(2, int(right_cmd))
 		except Exception as exc:
 			raise RobotError(f"Drive failed: {exc}") from exc
 
@@ -202,6 +275,8 @@ class RobotController:
 			dry_run=dry_run_cfg,
 			max_steer_deg=max(5, min(45, _get_int("max_steer_deg", 35))),
 			max_speed=max(10, min(100, _get_int("max_speed", 100))),
+			left_speed_offset=max(-100, min(100, _get_int("left_speed_offset", 0))),
+			right_speed_offset=max(-100, min(100, _get_int("right_speed_offset", 0))),
 			max_pan_deg=max(5, min(45, _get_int("max_pan_deg", 35))),
 			max_tilt_deg=max(5, min(45, _get_int("max_tilt_deg", 35))),
 		)

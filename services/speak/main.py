@@ -14,6 +14,7 @@ FASTAPI_AVAILABLE = False
 
 try:
 	from fastapi import FastAPI, HTTPException, Request
+	from pydantic import BaseModel, Field
 	import uvicorn
 
 	FASTAPI_AVAILABLE = True
@@ -26,11 +27,54 @@ except Exception:  # pragma: no cover
 	class FastAPI:  # type: ignore[no-redef]
 		pass
 
+	class BaseModel:  # type: ignore[no-redef]
+		pass
+
+	def Field(*_args, **_kwargs):  # type: ignore[no-redef]
+		return None
+
 	class HTTPException(Exception):  # type: ignore[no-redef]
 		def __init__(self, status_code: int, detail: str):
 			super().__init__(f"{status_code}: {detail}")
 
 	uvicorn = None  # type: ignore[assignment]
+
+
+if FASTAPI_AVAILABLE:
+	class SpeakRequest(BaseModel):
+		"""Request payload for text-to-speech.
+
+		The text will be spoken aloud through the robot's speakers.
+		Speech is queued - if speech is already in progress, the previous
+		speech is stopped and the new text is spoken.
+		"""
+		text: str = Field(
+			description="The text to speak aloud. Supports plain text; punctuation affects pacing.",
+			examples=["Hello, I am your robot assistant.", "I see an obstacle ahead.", "Moving forward now."],
+			min_length=1,
+			max_length=5000,
+		)
+
+	class SpeakResponse(BaseModel):
+		"""Response from /speak indicating speech was started."""
+		ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+		started: bool = Field(default=True, description="Whether the speech subprocess was started.")
+		pid: int | None = Field(default=None, description="Process ID of the speech subprocess.", examples=[12345])
+		stopped_previous: bool = Field(default=False, description="True if previous speech was interrupted.")
+		tts_available: bool = Field(default=True, description="Whether TTS backend is available.")
+
+	class StopResponse(BaseModel):
+		"""Response from /stop."""
+		ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+		stopped: bool = Field(description="True if ongoing speech was interrupted.")
+
+	class StatusResponse(BaseModel):
+		"""Response from /status with current playback information."""
+		ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+		speaking: bool = Field(description="True if speech is currently playing.")
+		pid: int | None = Field(default=None, description="PID of the current speech process if speaking.")
+		age_ms: int | None = Field(default=None, description="How long the current speech has been playing in milliseconds.")
+		text_preview: str | None = Field(default=None, description="Preview of the text being spoken (truncated to 200 chars).", examples=["Hello, I am your robot..."])
 
 
 def _load_dotenv(path: str) -> None:
@@ -341,6 +385,7 @@ def main() -> int:
 
 	@app.get(
 		"/healthz",
+		operation_id="healthz_healthz_get",
 		summary="Health check",
 		description="Returns service health and TTS availability.",
 	)

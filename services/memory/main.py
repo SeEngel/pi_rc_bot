@@ -281,6 +281,7 @@ def main() -> int:
 
 	@app.get(
 		"/healthz",
+		operation_id="healthz_healthz_get",
 		summary="Health check",
 		description="Returns service health and basic memory store stats.",
 	)

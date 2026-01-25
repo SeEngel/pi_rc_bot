@@ -7,6 +7,14 @@ robot:
   # Limits for steering and head angles.
   max_steer_deg: 35
   max_speed: 100
+
+  # Per-motor software trim offsets (signed). These are added to the *motor*
+  # command after steering scaling is applied.
+  #
+  # Example: if `speed=10` and `left_speed_offset=5`, left motor will run
+  # as if it were `15` (right motor unchanged unless you set right offset).
+  left_speed_offset: 0
+  right_speed_offset: 0
   max_pan_deg: 35
   max_tilt_deg: 35
 

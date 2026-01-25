@@ -1,0 +1,8 @@
+# services/config.yaml
+#
+# Controls which set of services `services/main.sh` starts.
+#
+# - legacy: start the existing service set (no move_advisor)
+# - split_brain_move: start legacy services + move_advisor (move-cluster entry point)
+
+workflow_mode: split_brain_move

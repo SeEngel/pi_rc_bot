@@ -58,17 +58,31 @@ class HealthzResponse(StatusResponse):
 
 
 class DistanceResponse(BaseModel):
-	ok: bool = True
-	distance_cm: float | None = Field(default=None, description="Measured distance in centimeters. Null if unavailable.")
-	status: dict[str, Any]
+	"""Response from /distance with the current sensor reading."""
+	ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+	distance_cm: float | None = Field(
+		default=None,
+		description="Measured distance in centimeters. Null if sensor unavailable or read failed.",
+		examples=[25.5, 100.0, 150.0],
+	)
+	status: dict[str, Any] = Field(description="Additional sensor status information.")
 
 
 class ObstacleResponse(BaseModel):
-	ok: bool = True
-	obstacle: bool = Field(description="True if distance_cm <= threshold_cm (and distance is available).")
-	distance_cm: float | None
-	threshold_cm: float
-	status: dict[str, Any]
+	"""Response from /obstacle indicating whether an obstacle is detected."""
+	ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+	obstacle: bool = Field(
+		description="True if distance_cm <= threshold_cm (obstacle detected). False if clear or sensor unavailable.",
+	)
+	distance_cm: float | None = Field(
+		description="Measured distance in centimeters.",
+		examples=[25.5, 100.0],
+	)
+	threshold_cm: float = Field(
+		description="The threshold used for this obstacle check.",
+		examples=[35.0],
+	)
+	status: dict[str, Any] = Field(description="Additional sensor status information.")
 
 
 @app.get(

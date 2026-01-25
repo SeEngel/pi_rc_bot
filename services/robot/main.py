@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -35,6 +36,8 @@ MCP_PORT = PORT + 600
 _robot_lock = threading.Lock()
 robot: RobotController | None = None
 
+logger = logging.getLogger("robot")
+
 
 def _get_robot() -> RobotController:
 	global robot
@@ -47,7 +50,13 @@ def _get_robot() -> RobotController:
 async def lifespan(_: FastAPI):
 	# Init once on startup so GPIO ownership is explicit and stable.
 	with _robot_lock:
-		_get_robot()
+		r = _get_robot()
+		if r.settings.dry_run:
+			logger.warning(
+				"robot service is running with robot.dry_run=true; motors will NOT move (API calls will still return 200)."
+			)
+		elif not r.is_available:
+			logger.error("robot service hardware unavailable: %s", r.unavailable_reason)
 	yield
 	with _robot_lock:
 		try:
@@ -79,37 +88,66 @@ class HealthzResponse(StatusResponse):
 
 
 class DriveRequest(BaseModel):
-	speed: int = Field(description="Signed speed (-100..100). Negative = backward.")
-	steer_deg: int = Field(default=0, description="Steering degrees (-35..35).")
+	"""Request payload to drive the robot directly.
+
+	NOTE: For safer motion with obstacle detection, prefer using the safety service's /guarded_drive endpoint.
+	This endpoint bypasses safety checks.
+	"""
+	speed: int = Field(
+		description="Signed speed percentage (-100 to 100). Positive = forward, negative = backward. 0 = stop.",
+		examples=[30, -25, 50, 0],
+		ge=-100,
+		le=100,
+	)
+	steer_deg: int = Field(
+		default=0,
+		description="Steering angle in degrees (-35 to 35). Negative = turn left, positive = turn right.",
+		examples=[0, -15, 15],
+		ge=-35,
+		le=35,
+	)
 
 
 class DriveResponse(BaseModel):
-	ok: bool = True
-	speed: int
-	steer_deg: int
+	"""Response from /drive confirming the motion command."""
+	ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+	speed: int = Field(description="The speed that was applied.", examples=[30])
+	steer_deg: int = Field(description="The steering angle that was applied.", examples=[0])
 
 
 class StopResponse(BaseModel):
-	ok: bool = True
-	stopped: bool = True
+	"""Response from /stop."""
+	ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+	stopped: bool = Field(default=True, description="True if the stop command was sent.")
 
 
 class HeadSetAnglesRequest(BaseModel):
-	pan_deg: int | None = Field(default=None, description="Pan angle in degrees.")
-	tilt_deg: int | None = Field(default=None, description="Tilt angle in degrees.")
+	"""Request payload to set head servo positions."""
+	pan_deg: int | None = Field(
+		default=None,
+		description="Pan (horizontal) angle in degrees. 0 = center, negative = left, positive = right.",
+		examples=[0, -45, 45],
+	)
+	tilt_deg: int | None = Field(
+		default=None,
+		description="Tilt (vertical) angle in degrees. 0 = level, negative = down, positive = up.",
+		examples=[0, -20, 15],
+	)
 
 
 class HeadSetAnglesResponse(BaseModel):
-	ok: bool = True
-	pan_deg: int
-	tilt_deg: int
+	"""Response from /head/set_angles."""
+	ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+	pan_deg: int = Field(description="Current pan angle after the operation.", examples=[0])
+	tilt_deg: int = Field(description="Current tilt angle after the operation.", examples=[0])
 
 
 class UltrasonicDistanceResponse(BaseModel):
-	ok: bool
-	available: bool
-	distance_cm: float | None = None
-	reason: str | None = None
+	"""Response from /ultrasonic/distance with the sensor reading."""
+	ok: bool = Field(description="Whether the sensor read was successful.")
+	available: bool = Field(description="Whether the ultrasonic sensor is available.")
+	distance_cm: float | None = Field(default=None, description="Measured distance in centimeters. Null if unavailable.", examples=[25.5, 100.0])
+	reason: str | None = Field(default=None, description="Reason for unavailability if applicable.")
 
 
 @app.get(
