@@ -3,6 +3,18 @@
 set -euo pipefail
 
 SERVICES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_PATH="$SERVICES_DIR/config.yaml"
+
+# Parse workflow_mode from services/config.yaml (defaults to legacy).
+workflow_mode="legacy"
+if [[ -f "$CONFIG_PATH" ]]; then
+	val="$(grep -E '^[[:space:]]*workflow_mode[[:space:]]*:' "$CONFIG_PATH" | head -n 1 | sed -E 's/^[[:space:]]*workflow_mode[[:space:]]*:[[:space:]]*//')"
+	val="${val%%#*}"
+	val="$(echo "$val" | tr -d '"\r' | xargs)"
+	if [[ -n "$val" ]]; then
+		workflow_mode="$val"
+	fi
+fi
 
 # Use global python3 by default.
 # Override with: PI_RC_BOT_PYTHON=/path/to/python
@@ -83,6 +95,7 @@ start_service() {
 }
 
 # Move-cluster services (actuation + safety).
+# move_advisor is only included in split_brain_move mode.
 SERVICES=(
 	"robot"
 	"head"
@@ -90,8 +103,15 @@ SERVICES=(
 	"proximity"
 	"perception"
 	"safety"
-	"move_advisor"
 )
+
+# Add move_advisor only in split_brain_move mode.
+if [[ "$workflow_mode" == "split_brain_move" ]]; then
+	SERVICES+=("move_advisor")
+	echo "workflow_mode=split_brain_move: including move_advisor service"
+else
+	echo "workflow_mode=$workflow_mode: skipping move_advisor service"
+fi
 
 found_any=0
 for name in "${SERVICES[@]}"; do

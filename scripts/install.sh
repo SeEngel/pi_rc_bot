@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_SRC_DIR="${ROOT_DIR}/services/systemd"
 UNIT_DST_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+CONFIG_PATH="${ROOT_DIR}/services/config.yaml"
 
 log() {
 	echo "[install.sh] $*"
@@ -17,6 +18,21 @@ die() {
 
 need_cmd() {
 	command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+# Parse workflow_mode from services/config.yaml (defaults to legacy).
+get_workflow_mode() {
+	local mode="legacy"
+	if [[ -f "${CONFIG_PATH}" ]]; then
+		local val
+		val="$(grep -E '^[[:space:]]*workflow_mode[[:space:]]*:' "${CONFIG_PATH}" | head -n 1 | sed -E 's/^[[:space:]]*workflow_mode[[:space:]]*:[[:space:]]*//')"
+		val="${val%%#*}"
+		val="$(echo "$val" | tr -d '"\r' | xargs)"
+		if [[ -n "$val" ]]; then
+			mode="$val"
+		fi
+	fi
+	echo "$mode"
 }
 
 render_unit_file() {
@@ -84,15 +100,50 @@ fi
 log "Installing systemd user units to: ${UNIT_DST_DIR}"
 log "Repo path in unit files will be: ${UNIT_REPO_PREFIX}"
 
+# Determine workflow mode and install appropriate services.
+WORKFLOW_MODE="$(get_workflow_mode)"
+log "Workflow mode: ${WORKFLOW_MODE}"
+
+# Always install the base services unit.
 render_unit_file "${UNIT_SRC_DIR}/pi_rc_services.service" "${UNIT_DST_DIR}/pi_rc_services.service" "${UNIT_REPO_PREFIX}"
-render_unit_file "${UNIT_SRC_DIR}/pi_rc_advisor.service" "${UNIT_DST_DIR}/pi_rc_advisor.service" "${UNIT_REPO_PREFIX}"
+
+# Install the appropriate advisor based on workflow mode.
+case "${WORKFLOW_MODE}" in
+	legacy)
+		log "Installing legacy advisor (agent/advisor)."
+		render_unit_file "${UNIT_SRC_DIR}/pi_rc_advisor.service" "${UNIT_DST_DIR}/pi_rc_advisor.service" "${UNIT_REPO_PREFIX}"
+		# Remove split-brain advisor if present from a previous install.
+		rm -f "${UNIT_DST_DIR}/pi_rc_advisor_split_brain.service" 2>/dev/null || true
+		;;
+	split_brain_move)
+		log "Installing split-brain move advisor (agent/advisor_split_brain_move)."
+		render_unit_file "${UNIT_SRC_DIR}/pi_rc_advisor_split_brain.service" "${UNIT_DST_DIR}/pi_rc_advisor_split_brain.service" "${UNIT_REPO_PREFIX}"
+		# Remove legacy advisor if present from a previous install.
+		rm -f "${UNIT_DST_DIR}/pi_rc_advisor.service" 2>/dev/null || true
+		;;
+	*)
+		die "Unknown workflow_mode in services/config.yaml: '${WORKFLOW_MODE}' (expected legacy|split_brain_move)"
+		;;
+esac
 
 # Reload, enable and start
 systemctl --user daemon-reload
 systemctl --user enable --now pi_rc_services.service
-systemctl --user enable --now pi_rc_advisor.service
 
-log "Installed + started: pi_rc_services.service, pi_rc_advisor.service"
+case "${WORKFLOW_MODE}" in
+	legacy)
+		systemctl --user enable --now pi_rc_advisor.service
+		# Ensure split-brain advisor is stopped/disabled if it was running.
+		systemctl --user disable --now pi_rc_advisor_split_brain.service 2>/dev/null || true
+		log "Installed + started: pi_rc_services.service, pi_rc_advisor.service"
+		;;
+	split_brain_move)
+		systemctl --user enable --now pi_rc_advisor_split_brain.service
+		# Ensure legacy advisor is stopped/disabled if it was running.
+		systemctl --user disable --now pi_rc_advisor.service 2>/dev/null || true
+		log "Installed + started: pi_rc_services.service, pi_rc_advisor_split_brain.service"
+		;;
+esac
 
 # --- Optional: enable lingering so user services start at boot without GUI/login
 linger_mode="${ENABLE_LINGER:-auto}"
@@ -124,4 +175,12 @@ else
 	log "Lingering not enabled (ENABLE_LINGER=${ENABLE_LINGER:-auto})."
 fi
 
-log "Done. Check status with: systemctl --user status pi_rc_services.service pi_rc_advisor.service" 
+# Final status message based on workflow mode.
+case "${WORKFLOW_MODE}" in
+	legacy)
+		log "Done. Check status with: systemctl --user status pi_rc_services.service pi_rc_advisor.service"
+		;;
+	split_brain_move)
+		log "Done. Check status with: systemctl --user status pi_rc_services.service pi_rc_advisor_split_brain.service"
+		;;
+esac 

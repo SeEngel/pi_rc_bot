@@ -1,0 +1,19 @@
+[Unit]
+Description=pi_rc_bot Split-Brain Move Advisor agent
+Requires=pi_rc_services.service
+Wants=network-online.target
+After=network-online.target pi_rc_services.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Desktop/pi_rc_bot/agent/advisor_split_brain_move
+ExecStartPre=%h/Desktop/pi_rc_bot/scripts/wait_for_network.sh
+ExecStartPre=/usr/bin/sleep 5
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/env uv run main.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

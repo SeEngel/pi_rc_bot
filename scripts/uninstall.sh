@@ -21,11 +21,15 @@ need_cmd() {
 need_cmd systemctl
 
 log "Stopping and disabling systemd user units (ignore errors if not installed)."
+# Stop and disable both legacy and split-brain advisor services.
 systemctl --user disable --now pi_rc_advisor.service >/dev/null 2>&1 || true
+systemctl --user disable --now pi_rc_advisor_split_brain.service >/dev/null 2>&1 || true
 systemctl --user disable --now pi_rc_services.service >/dev/null 2>&1 || true
 
 log "Removing installed unit files from: ${UNIT_DST_DIR}"
-rm -f "${UNIT_DST_DIR}/pi_rc_advisor.service" "${UNIT_DST_DIR}/pi_rc_services.service" || true
+rm -f "${UNIT_DST_DIR}/pi_rc_advisor.service" \
+      "${UNIT_DST_DIR}/pi_rc_advisor_split_brain.service" \
+      "${UNIT_DST_DIR}/pi_rc_services.service" || true
 
 systemctl --user daemon-reload
 

@@ -76,10 +76,33 @@ sudo loginctl disable-linger $USER
 
 ### Status / Logs
 
+**Legacy mode:**
 ```bash
 systemctl --user status pi_rc_services.service pi_rc_advisor.service
 journalctl --user -u pi_rc_services.service -u pi_rc_advisor.service -f
 ```
+
+**Split-brain move mode:**
+```bash
+systemctl --user status pi_rc_services.service pi_rc_advisor_split_brain.service
+journalctl --user -u pi_rc_services.service -u pi_rc_advisor_split_brain.service -f
+```
+
+### Workflow Modes
+
+The system supports two workflow modes, configured in `services/config.yaml`:
+
+```yaml
+# services/config.yaml
+workflow_mode: legacy  # or split_brain_move
+```
+
+| Mode | Description | Advisor Agent | Services |
+|------|-------------|---------------|----------|
+| **legacy** | Original architecture | `agent/advisor` | All services except `move_advisor` |
+| **split_brain_move** | Split-brain movement | `agent/advisor_split_brain_move` | All services including `move_advisor` |
+
+The install/uninstall scripts automatically read this config and install the appropriate systemd units.
 
 ### Network wait (optional)
 
