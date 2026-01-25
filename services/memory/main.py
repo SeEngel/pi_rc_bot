@@ -204,6 +204,28 @@ class GetTopNMemoryRequest(BaseModel):
 	)
 
 
+class GetTopNMemoryByTagsRequest(BaseModel):
+	content: str = Field(
+		...,
+		description="Query string to embed and search for similar memories.",
+		examples=["Where did I park the robot?"],
+	)
+	top_n: int = Field(
+		default=2,
+		ge=1,
+		le=10,
+		description="Number of results to return from each tier (short + long).",
+		examples=[2],
+	)
+	top_k_tags: int = Field(
+		default=5,
+		ge=1,
+		le=20,
+		description="Number of most similar tags to use for pre-filtering memories.",
+		examples=[5],
+	)
+
+
 def main() -> int:
 	here = os.path.dirname(os.path.abspath(__file__))
 
@@ -342,6 +364,34 @@ def main() -> int:
 
 		with lock:
 			res = store.get_top_n_memory(content=content, top_n=body.top_n, query_vector=qvec)
+		return res
+
+	@app.post(
+		"/get_top_n_memory_by_tags",
+		operation_id="get_top_n_memory_by_tags",
+		summary="Retrieve top-N similar memories with tag-based pre-filtering",
+		description=(
+			"First finds the most similar tags to the query, then pre-filters memories "
+			"that have those tags before running content similarity. "
+			"This is more efficient for large memory stores with well-tagged content."
+		),
+	)
+	async def get_top_n_memory_by_tags(body: GetTopNMemoryByTagsRequest) -> dict[str, Any]:
+		content = (body.content or "").strip()
+		try:
+			qvec = store.embedder.embed(content)
+		except MemoryError as exc:
+			raise HTTPException(status_code=503, detail=str(exc)) from exc
+		except Exception as exc:
+			raise HTTPException(status_code=500, detail=f"Embedding failed: {exc}") from exc
+
+		with lock:
+			res = store.get_top_n_memory_by_tags(
+				content=content,
+				top_n=body.top_n,
+				top_k_tags=body.top_k_tags,
+				query_vector=qvec,
+			)
 		return res
 
 	# Start the HTTP API server + a proper MCP server (separate port).

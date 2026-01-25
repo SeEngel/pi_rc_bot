@@ -182,6 +182,14 @@ Der Roboter kann:
 - Fahren: speed (-100 bis 100), steer_deg (-45 bis 45), duration_s (Sekunden)
 - Beobachten: Ein Foto machen und beschreiben was er sieht
 - Sprechen: Etwas sagen
+- Memory abrufen: In der Erinnerungs-Datenbank nach Informationen suchen (Personen, Orte, Fakten, frühere Gespräche)
+- Memory speichern: Neue Informationen in der Erinnerungs-Datenbank speichern
+
+WICHTIG für Memory:
+- Wenn der Benutzer nach Informationen fragt die gespeichert sein könnten (Personen, Familie, Vorlieben, frühere Gespräche), IMMER zuerst memory_recall nutzen!
+- Bei indirekten Anfragen wie "ich will mein Lieblingsessen" oder "erzähl mir über X" → memory_recall nutzen
+- Bei "analysiere X in deiner Datenbank" → memory_recall nutzen
+- Speichere wichtige neue Informationen mit memory_store
 
 WICHTIG: Wenn der Benutzer "schau nach X UND beschreibe/erzähle" sagt, ist das EINE Aufgabe mit observe_after=true.
 Erstelle KEINE separaten Aufgaben für Schauen und Beschreiben der gleichen Richtung.
@@ -191,12 +199,21 @@ Regeln:
 2. Aufgabentitel kurz halten (3-7 Wörter)
 3. Aufgaben logisch ordnen
 4. JSON-Array mit Objekten zurückgeben
+5. Bei Wissensfragen IMMER zuerst memory_recall!
 
 Verfügbare Aktionstypen:
 - {"type": "head_set_angles", "pan_deg": <zahl>, "tilt_deg": <zahl>, "observe_after": true/false, "observe_question": "<was beschreiben>"}
 - {"type": "guarded_drive", "speed": <zahl>, "steer_deg": <zahl>, "duration_s": <zahl>}
 - {"type": "observe", "question": "<was beschreiben>"}
 - {"type": "speak", "text": "<was sagen>"}
+- {"type": "memory_recall", "query": "<wonach suchen>"}
+- {"type": "memory_store", "content": "<was speichern>", "tags": ["tag1", "tag2"]}
+
+Beispiel für "was weißt du über Sebastian Engel und dann erzähl mir davon":
+[
+  {"id": 1, "title": "Memory: Sebastian Engel suchen", "status": "pending", "action": {"type": "memory_recall", "query": "Sebastian Engel"}},
+  {"id": 2, "title": "Ergebnis vorlesen", "status": "pending", "action": {"type": "speak", "text": "{{MEMORY_RESULT}}"}}
+]
 
 Beispiel für "schau nach oben und erzähl was du siehst, dann nach links und erzähl":
 [

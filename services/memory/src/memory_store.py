@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -176,9 +177,58 @@ class OpenAIEmbedder:
         emb = res.data[0].embedding
         return np.asarray(emb, dtype=np.float32)
 
+    def embed_batch(self, texts: list[str]) -> list[np.ndarray]:
+        """Embed multiple texts in a single API call (more efficient)."""
+        texts = [t.strip() for t in texts if t and t.strip()]
+        if not texts:
+            return []
+
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise MemoryError("OPENAI_API_KEY is not set")
+
+        try:
+            from openai import OpenAI
+        except Exception as exc:
+            raise MemoryError("openai package not installed") from exc
+
+        kwargs: dict[str, Any] = {"api_key": api_key}
+        base_url = (self.settings.base_url or "").strip()
+        env_base_url = (os.environ.get("OPENAI_BASE_URL") or "").strip()
+        if env_base_url:
+            base_url = env_base_url
+        if base_url:
+            kwargs["base_url"] = base_url
+
+        client = OpenAI(**kwargs)
+        try:
+            res = client.embeddings.create(
+                model=self.settings.model,
+                input=texts,
+                timeout=float(self.settings.timeout_seconds or 30.0),
+            )
+        except TypeError:
+            res = client.embeddings.create(model=self.settings.model, input=texts)
+
+        if not res.data:
+            raise MemoryError("No embeddings returned")
+
+        # Sort by index to ensure correct order
+        sorted_data = sorted(res.data, key=lambda x: x.index)
+        return [np.asarray(d.embedding, dtype=np.float32) for d in sorted_data]
+
+    def model_id(self) -> str:
+        """Return a unique identifier for the current embedding model."""
+        return self.settings.model
+
+
+def _compute_model_hash(model_id: str) -> str:
+    """Compute a short hash for model identification."""
+    return hashlib.sha256(model_id.encode()).hexdigest()[:16]
+
 
 class MemoryStore:
-    """Persistent two-tier embedding store (short-term + long-term)."""
+    """Persistent two-tier embedding store (short-term + long-term) with tag-based filtering."""
 
     def __init__(
         self,
@@ -210,15 +260,120 @@ class MemoryStore:
         self._short_meta: list[dict[str, Any]] = []
         self._long_meta: list[dict[str, Any]] = []
 
-        # Matrices are shape (dim, n) where each column is a unit vector.
+        # Content vectors: shape (dim, n) where each column is a unit vector.
         self._short_mat: np.ndarray = np.zeros((0, 0), dtype=np.float32)
         self._long_mat: np.ndarray = np.zeros((0, 0), dtype=np.float32)
 
+        # Tag system: global tag registry with vectors
+        self._tag_to_idx: dict[str, int] = {}  # tag_name -> index in tag_vectors
+        self._tag_vectors: np.ndarray = np.zeros((0, 0), dtype=np.float32)  # shape (dim, n_tags)
+        self._stored_model_id: str | None = None  # Model ID when vectors were created
+
         self._load()
+        # Check if model changed - if so, rebuild all vectors
+        self._check_and_rebuild_vectors_if_needed()
         # Repartition on startup (short memories may have aged into long).
         self.repartition(now_epoch=_utc_now_epoch())
         self._enforce_limits(now_epoch=_utc_now_epoch())
         self._save()
+
+    def _check_and_rebuild_vectors_if_needed(self) -> None:
+        """Check if embedding model changed and rebuild vectors if necessary."""
+        current_model = self.embedder.model_id()
+        
+        if self._stored_model_id is None:
+            # First run or legacy data - need to build tag vectors
+            print(f"[MemoryStore] No stored model_id found, will build tag vectors")
+            self._stored_model_id = current_model
+            self._rebuild_tag_vectors()
+            return
+
+        if self._stored_model_id != current_model:
+            print(f"[MemoryStore] Model changed from '{self._stored_model_id}' to '{current_model}'")
+            print(f"[MemoryStore] Rebuilding ALL vectors...")
+            self._stored_model_id = current_model
+            self._rebuild_all_vectors()
+            return
+
+        # Model is same, but check if any tags are missing vectors
+        all_tags = self._collect_all_tags()
+        missing_tags = [t for t in all_tags if t not in self._tag_to_idx]
+        if missing_tags:
+            print(f"[MemoryStore] Found {len(missing_tags)} tags without vectors, adding them...")
+            self._add_tag_vectors(missing_tags)
+
+    def _collect_all_tags(self) -> set[str]:
+        """Collect all unique tags from all memories."""
+        tags: set[str] = set()
+        for m in self._short_meta:
+            for t in m.get("tags", []):
+                if t and isinstance(t, str):
+                    tags.add(t.strip().lower())
+        for m in self._long_meta:
+            for t in m.get("tags", []):
+                if t and isinstance(t, str):
+                    tags.add(t.strip().lower())
+        return tags
+
+    def _rebuild_tag_vectors(self) -> None:
+        """Build tag vectors for all existing tags."""
+        all_tags = sorted(self._collect_all_tags())
+        if not all_tags:
+            print("[MemoryStore] No tags to vectorize")
+            return
+        
+        print(f"[MemoryStore] Vectorizing {len(all_tags)} tags...")
+        self._tag_to_idx = {}
+        self._tag_vectors = np.zeros((0, 0), dtype=np.float32)
+        self._add_tag_vectors(all_tags)
+
+    def _rebuild_all_vectors(self) -> None:
+        """Rebuild ALL vectors (content + tags) - called when model changes."""
+        # Rebuild content vectors for short-term
+        if self._short_meta:
+            print(f"[MemoryStore] Rebuilding {len(self._short_meta)} short-term content vectors...")
+            contents = [m.get("content", "") for m in self._short_meta]
+            vectors = self.embedder.embed_batch(contents)
+            if vectors:
+                self._short_mat = np.stack([_normalize(v) for v in vectors], axis=1)
+            else:
+                self._short_mat = np.zeros((0, 0), dtype=np.float32)
+
+        # Rebuild content vectors for long-term
+        if self._long_meta:
+            print(f"[MemoryStore] Rebuilding {len(self._long_meta)} long-term content vectors...")
+            contents = [m.get("content", "") for m in self._long_meta]
+            vectors = self.embedder.embed_batch(contents)
+            if vectors:
+                self._long_mat = np.stack([_normalize(v) for v in vectors], axis=1)
+            else:
+                self._long_mat = np.zeros((0, 0), dtype=np.float32)
+
+        # Rebuild tag vectors
+        self._rebuild_tag_vectors()
+
+    def _add_tag_vectors(self, new_tags: list[str]) -> None:
+        """Add vectors for new tags (batch operation)."""
+        new_tags = [t.strip().lower() for t in new_tags if t and t.strip()]
+        new_tags = [t for t in new_tags if t not in self._tag_to_idx]
+        if not new_tags:
+            return
+
+        print(f"[MemoryStore] Embedding {len(new_tags)} new tags...")
+        try:
+            vectors = self.embedder.embed_batch(new_tags)
+        except Exception as e:
+            print(f"[MemoryStore] Warning: Failed to embed tags: {e}")
+            return
+
+        for tag, vec in zip(new_tags, vectors):
+            idx = len(self._tag_to_idx)
+            self._tag_to_idx[tag] = idx
+            vec_norm = _normalize(vec)
+            if self._tag_vectors.size == 0:
+                self._tag_vectors = vec_norm[:, None]
+            else:
+                self._tag_vectors = np.concatenate([self._tag_vectors, vec_norm[:, None]], axis=1)
 
     @property
     def dim(self) -> int:
@@ -226,6 +381,8 @@ class MemoryStore:
             return int(self._short_mat.shape[0])
         if self._long_mat.size:
             return int(self._long_mat.shape[0])
+        if self._tag_vectors.size:
+            return int(self._tag_vectors.shape[0])
         return 0
 
     def stats(self) -> dict[str, Any]:
@@ -235,6 +392,8 @@ class MemoryStore:
             "short_count": len(self._short_meta),
             "long_count": len(self._long_meta),
             "total_count": len(self._short_meta) + len(self._long_meta),
+            "tag_count": len(self._tag_to_idx),
+            "model_id": self._stored_model_id,
             "max_memory_strings": self.max_memory_strings,
             "max_short_memory_strings": self.max_short_memory_strings,
             "max_long_memory_strings": self.max_long_memory_strings,
@@ -255,6 +414,13 @@ class MemoryStore:
             raise MemoryError("content is required")
 
         tag_list = _as_str_list(list(tags) if tags is not None else [])
+        # Normalize tags to lowercase
+        tag_list = [t.strip().lower() for t in tag_list if t and t.strip()]
+
+        # Vectorize any new tags
+        new_tags = [t for t in tag_list if t not in self._tag_to_idx]
+        if new_tags:
+            self._add_tag_vectors(new_tags)
 
         # Timestamp is always set by the service at ingest time.
         now = _utc_now_epoch()
@@ -360,6 +526,152 @@ class MemoryStore:
 
         if updated:
             self._save()
+        return out
+
+    def get_top_n_memory_by_tags(
+        self,
+        *,
+        content: str,
+        top_n: int = 3,
+        top_k_tags: int = 5,
+        query_vector: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        """Get memories using tag-based pre-filtering for more relevant results.
+
+        Flow:
+        1. Vectorize the query
+        2. Find top_k_tags most similar tags
+        3. Filter memories to only those with matching tags
+        4. Run similarity search on filtered set
+        5. Return top_n results
+
+        This is more efficient and relevant when there are many memories across
+        diverse topics (people, cars, nature, math, etc.)
+        """
+        content = (content or "").strip()
+        if not content:
+            raise MemoryError("content is required")
+
+        if top_n is None:
+            top_n = 3
+        try:
+            top_n_i = int(top_n)
+        except Exception:
+            top_n_i = 3
+        top_n_i = max(1, min(10, top_n_i))
+
+        if top_k_tags is None:
+            top_k_tags = 5
+        try:
+            top_k_tags_i = int(top_k_tags)
+        except Exception:
+            top_k_tags_i = 5
+        top_k_tags_i = max(1, min(20, top_k_tags_i))
+
+        now = _utc_now_epoch()
+        self.repartition(now_epoch=now)
+        self._enforce_limits(now_epoch=now)
+
+        # Embed the query
+        if query_vector is None:
+            q = _normalize(self.embedder.embed(content))
+        else:
+            q = _normalize(np.asarray(query_vector, dtype=np.float32))
+
+        # Step 1: Find top_k most similar tags
+        matched_tags: list[str] = []
+        tag_scores: dict[str, float] = {}
+        
+        if self._tag_vectors.size > 0 and self._tag_to_idx:
+            # Compute similarity with all tag vectors
+            tag_sims = (self._tag_vectors.T @ q).astype(np.float32, copy=False)
+            
+            # Get top_k tag indices
+            k = min(top_k_tags_i, len(self._tag_to_idx))
+            top_tag_indices = np.argsort(-tag_sims)[:k]
+            
+            # Map indices back to tag names
+            idx_to_tag = {v: k for k, v in self._tag_to_idx.items()}
+            for idx in top_tag_indices.tolist():
+                tag_name = idx_to_tag.get(idx)
+                if tag_name:
+                    matched_tags.append(tag_name)
+                    tag_scores[tag_name] = float(tag_sims[idx])
+
+        # Step 2: Filter memories by matched tags
+        def _has_matching_tag(meta: dict[str, Any]) -> bool:
+            if not matched_tags:
+                return True  # No tag filtering if no tags found
+            mem_tags = [t.lower() for t in meta.get("tags", []) if t]
+            return any(t in matched_tags for t in mem_tags)
+
+        # Step 3: Run similarity search on filtered sets
+        short_hits = self._top_n_filtered(q, self._short_mat, self._short_meta, top_n_i, _has_matching_tag)
+        long_hits = self._top_n_filtered(q, self._long_mat, self._long_meta, top_n_i, _has_matching_tag)
+
+        # Increment usage counts
+        updated = False
+        for hit in short_hits:
+            idx = hit.get("_index")
+            if isinstance(idx, int) and 0 <= idx < len(self._short_meta):
+                self._short_meta[idx]["usage_count"] = int(self._short_meta[idx].get("usage_count", 0)) + 1
+                updated = True
+        for hit in long_hits:
+            idx = hit.get("_index")
+            if isinstance(idx, int) and 0 <= idx < len(self._long_meta):
+                self._long_meta[idx]["usage_count"] = int(self._long_meta[idx].get("usage_count", 0)) + 1
+                updated = True
+
+        def _clean(h: dict[str, Any]) -> dict[str, Any]:
+            h2 = dict(h)
+            h2.pop("_index", None)
+            return h2
+
+        out = {
+            "ok": True,
+            "top_n": top_n_i,
+            "matched_tags": matched_tags,
+            "tag_scores": tag_scores,
+            "short_term_memory": [_clean(h) for h in short_hits],
+            "long_term_memory": [_clean(h) for h in long_hits],
+        }
+
+        if updated:
+            self._save()
+        return out
+
+    def _top_n_filtered(
+        self,
+        q: np.ndarray,
+        mat: np.ndarray,
+        meta: list[dict[str, Any]],
+        n: int,
+        filter_fn: Any,
+    ) -> list[dict[str, Any]]:
+        """Get top N memories that pass the filter function."""
+        if n <= 0 or mat.size == 0 or not meta:
+            return []
+        q = np.asarray(q, dtype=np.float32).reshape(-1)
+        
+        # Find indices that pass filter
+        valid_indices = [i for i, m in enumerate(meta) if filter_fn(m)]
+        if not valid_indices:
+            return []
+        
+        # Extract only valid columns for similarity
+        valid_mat = mat[:, valid_indices]
+        sims = (valid_mat.T @ q).astype(np.float32, copy=False)
+        
+        k = min(int(n), len(valid_indices))
+        sorted_local_indices = np.argsort(-sims)[:k]
+        
+        out: list[dict[str, Any]] = []
+        for local_idx in sorted_local_indices.tolist():
+            original_idx = valid_indices[local_idx]
+            m = dict(meta[original_idx])
+            m["score"] = float(sims[local_idx])
+            m["_index"] = original_idx
+            out.append(m)
         return out
 
     def repartition(self, *, now_epoch: float) -> None:
@@ -590,6 +902,9 @@ class MemoryStore:
             "short_meta": os.path.join(self.data_dir, "short_meta.json"),
             "long_mat": os.path.join(self.data_dir, "long_vectors.npy"),
             "long_meta": os.path.join(self.data_dir, "long_meta.json"),
+            # Tag system files
+            "tag_vectors": os.path.join(self.data_dir, "tag_vectors.npy"),
+            "tag_meta": os.path.join(self.data_dir, "tag_meta.json"),
         }
 
     def _load(self) -> None:
@@ -609,6 +924,15 @@ class MemoryStore:
                     out.append(x)
             return out
 
+        def _load_json_dict(path: str) -> dict[str, Any]:
+            if not os.path.exists(path):
+                return {}
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            if not isinstance(obj, dict):
+                return {}
+            return obj
+
         def _load_mat(path: str) -> np.ndarray:
             if not os.path.exists(path):
                 return np.zeros((0, 0), dtype=np.float32)
@@ -623,6 +947,19 @@ class MemoryStore:
         self._long_meta = _load_json(p["long_meta"])
         self._short_mat = _load_mat(p["short_mat"])
         self._long_mat = _load_mat(p["long_mat"])
+
+        # Load tag system
+        tag_meta = _load_json_dict(p["tag_meta"])
+        self._tag_to_idx = {str(k): int(v) for k, v in tag_meta.get("tag_to_idx", {}).items()}
+        self._stored_model_id = tag_meta.get("model_id")
+        self._tag_vectors = _load_mat(p["tag_vectors"])
+
+        # Reconcile tag vector size
+        if self._tag_vectors.size and len(self._tag_to_idx) != self._tag_vectors.shape[1]:
+            print(f"[MemoryStore] Tag vector mismatch: {len(self._tag_to_idx)} tags vs {self._tag_vectors.shape[1]} vectors")
+            # Reset and rebuild
+            self._tag_to_idx = {}
+            self._tag_vectors = np.zeros((0, 0), dtype=np.float32)
 
         # Reconcile sizes.
         if self._short_mat.size and len(self._short_meta) != self._short_mat.shape[1]:
@@ -644,6 +981,8 @@ class MemoryStore:
                     m["content"] = ""
                 if "tags" not in m or not isinstance(m.get("tags"), list):
                     m["tags"] = _as_str_list(m.get("tags"))
+                # Normalize tags to lowercase
+                m["tags"] = [t.strip().lower() for t in m["tags"] if t and t.strip()]
                 if "usage_count" not in m:
                     m["usage_count"] = 0
                 if "timestamp_epoch" not in m:
@@ -665,6 +1004,8 @@ class MemoryStore:
             self._short_mat = self._renormalize_mat(self._short_mat)
         if self._long_mat.size:
             self._long_mat = self._renormalize_mat(self._long_mat)
+        if self._tag_vectors.size:
+            self._tag_vectors = self._renormalize_mat(self._tag_vectors)
 
     @staticmethod
     def _renormalize_mat(mat: np.ndarray) -> np.ndarray:
@@ -682,6 +1023,13 @@ class MemoryStore:
         _atomic_write_text(p["short_meta"], json.dumps(self._short_meta, ensure_ascii=False, indent=2))
         _atomic_write_text(p["long_meta"], json.dumps(self._long_meta, ensure_ascii=False, indent=2))
 
+        # Save tag metadata
+        tag_meta = {
+            "model_id": self._stored_model_id,
+            "tag_to_idx": self._tag_to_idx,
+        }
+        _atomic_write_text(p["tag_meta"], json.dumps(tag_meta, ensure_ascii=False, indent=2))
+
         # NPY atomic save: write to bytes then atomic write.
         def _save_mat(path: str, mat: np.ndarray) -> None:
             mat = np.asarray(mat, dtype=np.float32)
@@ -696,3 +1044,4 @@ class MemoryStore:
 
         _save_mat(p["short_mat"], self._short_mat)
         _save_mat(p["long_mat"], self._long_mat)
+        _save_mat(p["tag_vectors"], self._tag_vectors)

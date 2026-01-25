@@ -922,6 +922,150 @@ class AdvisorAgent:
 				return None
 			return out_s
 
+	async def _get_memory_mcp_url(self) -> str | None:
+		"""Get the memory MCP URL from the memorizer agent's settings."""
+		try:
+			memorizer = await self._ensure_memorizer()
+			return getattr(memorizer.settings, "memory_mcp_url", None)
+		except Exception:
+			return None
+
+	async def _memorizer_recall_direct(self, query: str) -> str | None:
+		"""Direct memory recall via MCP (LLM-triggered, bypasses heuristics).
+
+		This is called when the Brain decides to use memory_recall action.
+		Unlike _memorizer_recall, this doesn't use the MemorizerAgent LLM,
+		it calls the memory MCP directly.
+		"""
+		if self._dry_run:
+			return "(dry_run) Memory recall not available"
+		if not self.settings.memorizer.enabled:
+			return None
+
+		memory_url = await self._get_memory_mcp_url()
+		if not memory_url:
+			self._emit("memory_direct_error", component="advisor.memory", action="recall", error="no_memory_url")
+			return None
+
+		start = time.perf_counter()
+		self._emit(
+			"memory_direct_call_start",
+			component="advisor.memory",
+			action="recall",
+			query=query,
+			url=memory_url,
+		)
+		try:
+			result = await asyncio.wait_for(
+				call_mcp_tool_json(
+					url=memory_url,
+					tool_name="get_top_n_memory_by_tags",
+					timeout_seconds=15.0,
+					content=query,
+					top_n=self.settings.memorizer.recall_top_n,
+					top_k_tags=5,  # Pre-filter by top 5 matching tags
+				),
+				timeout=float(self.settings.memorizer.recall_timeout_seconds),
+			)
+			dur_ms = (time.perf_counter() - start) * 1000.0
+
+			# Extract memories from MCP response - format for natural speech
+			if isinstance(result, dict):
+				# Collect memory contents only (no technical details)
+				memory_contents = []
+				for mem in result.get("short_term_memory", []):
+					content = mem.get("content", "").strip()
+					if content:
+						memory_contents.append(content)
+				for mem in result.get("long_term_memory", []):
+					content = mem.get("content", "").strip()
+					if content:
+						memory_contents.append(content)
+				
+				if memory_contents:
+					# Join memories naturally for speech
+					if len(memory_contents) == 1:
+						text = memory_contents[0]
+					else:
+						# Multiple memories - join with natural connectors
+						text = " Außerdem: ".join(memory_contents)
+				else:
+					text = None  # No memories found
+			else:
+				text = str(result) if result else None
+
+			self._emit(
+				"memory_direct_call_end",
+				component="advisor.memory",
+				action="recall",
+				duration_ms=round(dur_ms, 2),
+				result_preview=str(text)[:300] if text else None,
+			)
+			return str(text).strip() if text else None
+
+		except asyncio.TimeoutError:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit("memory_direct_error", component="advisor.memory", action="recall", duration_ms=round(dur_ms, 2), error="timeout")
+			return None
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit("memory_direct_error", component="advisor.memory", action="recall", duration_ms=round(dur_ms, 2), error=str(exc))
+			return None
+
+	async def _memorizer_store_direct(self, content: str, tags: list[str] | None = None) -> bool:
+		"""Direct memory store via MCP (LLM-triggered).
+
+		This is called when the Brain decides to use memory_store action.
+		"""
+		if self._dry_run:
+			return True
+		if not self.settings.memorizer.enabled:
+			return False
+
+		memory_url = await self._get_memory_mcp_url()
+		if not memory_url:
+			self._emit("memory_direct_error", component="advisor.memory", action="store", error="no_memory_url")
+			return False
+
+		start = time.perf_counter()
+		self._emit(
+			"memory_direct_call_start",
+			component="advisor.memory",
+			action="store",
+			content_preview=content[:100],
+			tags=tags,
+			url=memory_url,
+		)
+		try:
+			await asyncio.wait_for(
+				call_mcp_tool_json(
+					url=memory_url,
+					tool_name="store_memory",
+					timeout_seconds=15.0,
+					content=content,
+					tags=tags or [],
+				),
+				timeout=float(self.settings.memorizer.ingest_timeout_seconds),
+			)
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"memory_direct_call_end",
+				component="advisor.memory",
+				action="store",
+				duration_ms=round(dur_ms, 2),
+				ok=True,
+			)
+			return True
+
+		except asyncio.TimeoutError:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit("memory_direct_error", component="advisor.memory", action="store", duration_ms=round(dur_ms, 2), error="timeout")
+			return False
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit("memory_direct_error", component="advisor.memory", action="store", duration_ms=round(dur_ms, 2), error=str(exc))
+			return False
+
 	async def _memorizer_ingest_background(self, text: str) -> None:
 		"""Ask memorizer to decide whether to store the user utterance.
 
@@ -1548,6 +1692,32 @@ class AdvisorAgent:
 					)
 					res["drive_result"] = drive_res
 
+				# --- Memory Actions (LLM-triggered) ---
+				elif atype == "memory_recall":
+					query = str(a.get("query") or "").strip()
+					if query:
+						self._emit("memory_action_start", component="advisor.memory", action="recall", query=query)
+						recall_result = await self._memorizer_recall_direct(query)
+						res["recall_result"] = recall_result
+						self._emit("memory_action_end", component="advisor.memory", action="recall", result_preview=str(recall_result)[:200] if recall_result else None)
+					else:
+						res["ok"] = False
+						res["reason"] = "empty_query"
+
+				elif atype == "memory_store":
+					content = str(a.get("content") or "").strip()
+					tags = a.get("tags") or []
+					if isinstance(tags, str):
+						tags = [t.strip() for t in tags.split(",") if t.strip()]
+					if content:
+						self._emit("memory_action_start", component="advisor.memory", action="store", content_preview=content[:100])
+						store_result = await self._memorizer_store_direct(content, tags)
+						res["store_result"] = store_result
+						self._emit("memory_action_end", component="advisor.memory", action="store", ok=store_result)
+					else:
+						res["ok"] = False
+						res["reason"] = "empty_content"
+
 				# Unknown action type -> ignore (do not fail the interaction).
 				else:
 					res["ok"] = False
@@ -1871,6 +2041,31 @@ class AdvisorAgent:
 		self._protocol.open()
 		self._emit("memory_summarize_end", component="advisor.memory", path=path)
 
+	async def _ask_brain_simple(self, prompt: str) -> str | None:
+		"""Ask the brain LLM a simple question and get a plain text response.
+		
+		This is used for things like formatting memory results into natural speech.
+		No JSON parsing, no action handling - just text in, text out.
+		"""
+		if self._dry_run:
+			return f"(dry_run) {prompt[:50]}"
+		
+		try:
+			brain = await self._ensure_brain()
+			thread = brain.get_new_thread()
+			response = await brain._agent.run(prompt, thread=thread)
+			
+			# Extract text from response
+			if hasattr(response, "text"):
+				return str(response.text).strip()
+			elif hasattr(response, "content"):
+				return str(response.content).strip()
+			else:
+				return str(response).strip()
+		except Exception as exc:
+			self._emit("brain_simple_error", component="advisor.brain", error=str(exc))
+			return None
+
 	async def _decide_and_respond(
 		self,
 		*,
@@ -1937,7 +2132,18 @@ class AdvisorAgent:
 			"Human: Was ist vor dir?\n"
 			"Assistant: {\"response_text\": \"Einen Moment, ich beschreibe, was vor mir ist.\", \"need_observe\": true, \"actions\": []}\n\n"
 			"Human: Wie spät ist es?\n"
-			"Assistant: {\"response_text\": \"Ich kann dir helfen, aber ich habe keine Uhrzeit-Sensorik.\", \"need_observe\": false, \"actions\": []}\n"
+			"Assistant: {\"response_text\": \"Ich kann dir helfen, aber ich habe keine Uhrzeit-Sensorik.\", \"need_observe\": false, \"actions\": []}\n\n"
+			# Memory examples - LLM decides when to use memory
+			"Human: Wer ist Sebastian?\n"
+			"Assistant: {\"response_text\": \"Moment, ich schaue in meinem Gedächtnis nach.\", \"need_observe\": false, \"actions\": [{\"type\":\"memory_recall\", \"query\": \"Sebastian\"}]}\n\n"
+			"Human: Erinnerst du dich an Katharina?\n"
+			"Assistant: {\"response_text\": \"Lass mich nachdenken...\", \"need_observe\": false, \"actions\": [{\"type\":\"memory_recall\", \"query\": \"Katharina\"}]}\n\n"
+			"Human: Suche in deiner Erinnerung nach meiner Familie.\n"
+			"Assistant: {\"response_text\": \"Ich schaue mal, was ich über deine Familie weiß.\", \"need_observe\": false, \"actions\": [{\"type\":\"memory_recall\", \"query\": \"Familie\"}]}\n\n"
+			"Human: Merk dir, dass ich Pizza mag.\n"
+			"Assistant: {\"response_text\": \"Okay, ich merke mir, dass du Pizza magst.\", \"need_observe\": false, \"actions\": [{\"type\":\"memory_store\", \"content\": \"Der Benutzer mag Pizza.\", \"tags\": [\"vorlieben\", \"essen\"]}]}\n\n"
+			"Human: Was weißt du über mich?\n"
+			"Assistant: {\"response_text\": \"Lass mich schauen, was ich über dich weiß.\", \"need_observe\": false, \"actions\": [{\"type\":\"memory_recall\", \"query\": \"Benutzer Informationen Vorlieben\"}]}\n"
 		)
 		prompt = (
 			"You are responding to a human speaking to the robot.\n"
@@ -1957,7 +2163,14 @@ class AdvisorAgent:
 			"  IMPORTANT: When the user specifies a time duration (e.g. 'drive 3 seconds left'), you MUST include duration_s in the action!\n"
 			"- safety_stop\n"
 			"- estop_on\n"
-			"- estop_off\n\n"
+			"- estop_off\n"
+			"- memory_recall (query: string) - Search robot's memory for information about a person, topic, or fact\n"
+			"- memory_store (content: string, tags?: string[]) - Store important information in robot's memory\n"
+			"\nIMPORTANT: Use memory_recall whenever the user asks about:\n"
+			"- People (names, family, friends)\n"
+			"- Past conversations or things they told you\n"
+			"- User preferences or personal information\n"
+			"- Anything that requires remembering previous interactions\n\n"
 			+ few_shots
 			+ "\n"
 			+ ctx_block
@@ -2210,6 +2423,70 @@ class AdvisorAgent:
 						await self._speak(text)
 						self._ledger.append(f"Assistant: {text}")
 					task_result = text
+
+				elif action_type == "memory_recall":
+					# Search memory database and let LLM formulate response
+					query = str(action.get("query") or "")
+					if query:
+						self._emit(
+							"llm_task_memory_recall",
+							component="advisor.llm_todo",
+							task_id=task_id,
+							query=query,
+						)
+						recall_result = await self._memorizer_recall_direct(query)
+						if recall_result:
+							# Let the Brain LLM formulate a natural response based on memory
+							llm_prompt = (
+								f"Der Benutzer hat nach '{query}' gefragt. "
+								f"Hier sind relevante Informationen aus deinem Gedächtnis:\n\n{recall_result}\n\n"
+								f"Formuliere eine kurze, natürliche Antwort auf Deutsch basierend auf diesen Informationen. "
+								f"Antworte direkt ohne Einleitung wie 'Basierend auf meinem Gedächtnis'."
+							)
+							natural_response = await self._ask_brain_simple(llm_prompt)
+							if natural_response:
+								await self._speak(natural_response)
+								self._ledger.append(f"Assistant: {natural_response}")
+								task_result = natural_response
+							else:
+								# Fallback: speak raw result
+								await self._speak(recall_result)
+								self._ledger.append(f"Assistant: {recall_result}")
+								task_result = recall_result
+						else:
+							no_memory_msg = "Dazu habe ich leider nichts in meinem Gedächtnis gefunden."
+							await self._speak(no_memory_msg)
+							self._ledger.append(f"Assistant: {no_memory_msg}")
+							task_result = no_memory_msg
+					else:
+						task_result = "Keine Query angegeben"
+
+				elif action_type == "memory_store":
+					# Store information in memory
+					content = str(action.get("content") or "")
+					tags = action.get("tags", [])
+					if isinstance(tags, str):
+						tags = [tags]
+					if content:
+						self._emit(
+							"llm_task_memory_store",
+							component="advisor.llm_todo",
+							task_id=task_id,
+							content=content[:100],
+							tags=tags,
+						)
+						success = await self._memorizer_store_direct(content, tags)
+						if success:
+							confirm_msg = "Ich habe mir das gemerkt."
+							await self._speak(confirm_msg)
+							self._ledger.append(f"Assistant: {confirm_msg}")
+							task_result = f"Gespeichert: {content[:50]}"
+						else:
+							fail_msg = "Speichern fehlgeschlagen."
+							await self._speak(fail_msg)
+							task_result = fail_msg
+					else:
+						task_result = "Kein Inhalt zum Speichern"
 
 				else:
 					# Unknown action type - try to execute via brain
@@ -2565,10 +2842,44 @@ class AdvisorAgent:
 		response, need_observe, actions = await self._decide_and_respond(human_text=text, observation=obs, memory_hint=mem_hint)
 
 		# If the brain proposed safe actions, execute them before speaking.
+		# Special handling for memory_recall: if present, get memory and re-decide with results
+		memory_recall_result: str | None = None
 		if actions:
 			self._emit("planned_actions", component="advisor", count=len(actions), actions=actions)
-			action_results = await self._execute_planned_actions(actions)
-			self._ledger.append(f"[actions] {action_results}")
+			
+			# Check for memory_recall actions first - execute them and get results
+			for action in actions:
+				atype = str(action.get("type") or "").strip().lower()
+				if atype == "memory_recall":
+					query = str(action.get("query") or "").strip()
+					if query:
+						self._emit("memory_recall_triggered", component="advisor", query=query)
+						memory_recall_result = await self._memorizer_recall_direct(query)
+						if memory_recall_result:
+							self._ledger.append(f"[memory_recall] {memory_recall_result[:200]}...")
+			
+			# If we got memory results, re-decide with that information
+			if memory_recall_result:
+				combined_mem_hint = mem_hint or ""
+				if combined_mem_hint:
+					combined_mem_hint += "\n\n"
+				combined_mem_hint += f"Memory search results:\n{memory_recall_result}"
+				
+				self._emit("state", component="advisor", state="interaction_think_with_memory")
+				response, need_observe, remaining_actions = await self._decide_and_respond(
+					human_text=text, 
+					observation=obs, 
+					memory_hint=combined_mem_hint
+				)
+				# Execute remaining non-memory actions
+				non_memory_actions = [a for a in actions if str(a.get("type") or "").strip().lower() not in ("memory_recall",)]
+				if non_memory_actions:
+					action_results = await self._execute_planned_actions(non_memory_actions)
+					self._ledger.append(f"[actions] {action_results}")
+			else:
+				# No memory results, execute all actions normally
+				action_results = await self._execute_planned_actions(actions)
+				self._ledger.append(f"[actions] {action_results}")
 
 		# If the brain asked for an observation and we haven't taken one yet, do it once.
 		if need_observe is True and not (obs and obs.strip()):
