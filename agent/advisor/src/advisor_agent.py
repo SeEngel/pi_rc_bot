@@ -133,6 +133,8 @@ class AdvisorSettings:
 	stop_speech_on_sound_while_waiting: bool
 	post_speech_interaction_grace_seconds: float
 	stop_words: list[str]
+	# Brief listen after completing tasks to allow human interruption
+	brief_listen_timeout_seconds: float
 
 	# alone
 	think_interval_seconds: float
@@ -522,6 +524,10 @@ class AdvisorAgent:
 			stop_words = [stop_words_cfg.strip().lower()]
 		if not stop_words:
 			stop_words = ["stop", "stopp", "halt", "genug"]
+		brief_listen_timeout_seconds = float(
+			(interaction_cfg or {}).get("brief_listen_timeout_seconds") or 3.0
+		)
+		brief_listen_timeout_seconds = max(0.5, min(10.0, brief_listen_timeout_seconds))
 
 		think_interval_seconds = float((alone_cfg or {}).get("think_interval_seconds") or 20.0)
 		observation_question = str((alone_cfg or {}).get("observation_question") or "Briefly describe what you see.")
@@ -599,6 +605,7 @@ class AdvisorAgent:
 			stop_speech_on_sound_while_waiting=stop_speech_on_sound_while_waiting,
 			post_speech_interaction_grace_seconds=post_speech_interaction_grace_seconds,
 			stop_words=stop_words,
+			brief_listen_timeout_seconds=brief_listen_timeout_seconds,
 			think_interval_seconds=think_interval_seconds,
 			observation_question=observation_question,
 			max_thought_chars=max_thought_chars,
@@ -1821,6 +1828,61 @@ class AdvisorAgent:
 		text = str(res.get("text") or "")
 		return text.strip()
 
+	async def _listen_briefly(self, timeout_seconds: float | None = None) -> str:
+		"""Listen for a short time to allow human interruption.
+
+		Uses a shorter silence timeout to quickly return if no speech is detected.
+		Returns the transcript if speech was detected, or empty string otherwise.
+		"""
+		if timeout_seconds is None:
+			timeout_seconds = float(self.settings.brief_listen_timeout_seconds or 3.0)
+		timeout_seconds = max(0.5, min(10.0, timeout_seconds))
+
+		if self._dry_run:
+			self._emit("tool_call", tool="listen_briefly", component="mcp.listen", dry_run=True, timeout_seconds=timeout_seconds)
+			return ""
+		start = time.perf_counter()
+		self._emit(
+			"tool_call_start",
+			tool="listen_briefly",
+			component="mcp.listen",
+			url=self.settings.listen_mcp_url,
+			timeout_seconds=timeout_seconds,
+		)
+		payload: dict[str, Any] = {"speech_pause_seconds": timeout_seconds}
+		if self.settings.listen_stream:
+			payload["stream"] = True
+		try:
+			res = await call_mcp_tool_json(
+				url=self.settings.listen_mcp_url,
+				tool_name="listen",
+				timeout_seconds=timeout_seconds + 10.0,  # Extra margin for network
+				**payload,
+			)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="listen_briefly",
+				component="mcp.listen",
+				url=self.settings.listen_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			# Don't raise - brief listen failures should not crash the flow
+			return ""
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit(
+			"tool_call_end",
+			tool="listen_briefly",
+			component="mcp.listen",
+			url=self.settings.listen_mcp_url,
+			duration_ms=round(dur_ms, 2),
+			result_keys=sorted([str(k) for k in res.keys()]) if isinstance(res, dict) else None,
+		)
+		text = str(res.get("text") or "")
+		return text.strip()
+
 	async def _speak(self, text: str) -> None:
 		t = (text or "").strip()
 		if not t:
@@ -2664,10 +2726,62 @@ class AdvisorAgent:
 			else f"Done! I completed all {completed_count} steps."
 		)
 
+		# Speak the completion message
+		await self._speak(final_response)
+		self._ledger.append(f"Assistant: {final_response}")
+
+		# Brief listen to allow human to add more tasks or interrupt
+		self._emit("state", component="advisor", state="brief_listen_after_completion")
+		brief_text = await self._listen_briefly()
+		if brief_text and not self._is_bad_transcript(brief_text):
+			self._emit(
+				"brief_listen_result",
+				component="advisor",
+				chars=len(brief_text),
+				preview=brief_text[:100],
+			)
+			# Human said something - handle it as a new request
+			self._ledger.append(f"Human: {brief_text}")
+
+			# Check for stop words first
+			if self._matches_stop_word(brief_text):
+				self._emit("interrupt", component="advisor", kind="stop_word", transcript=brief_text)
+				self._llm_todo.clear()
+				return None  # Caller will not speak anything
+
+			# Check if it's a continuation or new request
+			# If user says something like "ja", "weiter", "continue" - check for pending tasks
+			low = brief_text.lower().strip()
+			if low in {"ja", "yes", "weiter", "continue", "mach weiter", "go on", "ok", "okay"}:
+				# User wants to continue - but we already completed everything
+				no_more = (
+					"Alle Aufgaben sind erledigt. Was möchtest du als nächstes?"
+					if is_german
+					else "All tasks are done. What would you like next?"
+				)
+				await self._speak(no_more)
+				self._ledger.append(f"Assistant: {no_more}")
+				self._llm_todo.clear()
+				return None
+
+			# User said something else - treat it as a new request
+			# Re-plan and execute with the new request
+			self._llm_todo.clear()
+			self._emit("state", component="advisor", state="follow_up_request")
+			return await self._plan_and_execute_tasks_llm(brief_text)
+		else:
+			self._emit(
+				"brief_listen_result",
+				component="advisor",
+				chars=0,
+				preview=None,
+				reason="no_speech_or_bad_transcript",
+			)
+
 		# Clear the todo list
 		self._llm_todo.clear()
 
-		return final_response
+		return None  # Already spoke the final response
 
 	async def _plan_and_execute_tasks_legacy(self, user_request: str) -> str | None:
 		"""Legacy task execution using TaskPlanner (fallback)."""

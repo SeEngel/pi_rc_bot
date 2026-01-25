@@ -114,7 +114,22 @@ else
 fi
 
 found_any=0
+
+# Start robot service FIRST (other services depend on it).
+robot_dir="$SERVICES_DIR/robot"
+if [[ -f "$robot_dir/main.py" ]]; then
+	found_any=1
+	start_service "$robot_dir"
+	echo "waiting 2s for robot service to initialize..."
+	sleep 2
+fi
+
+# Start remaining services.
 for name in "${SERVICES[@]}"; do
+	# Skip robot (already started above).
+	if [[ "$name" == "robot" ]]; then
+		continue
+	fi
 	dir="$SERVICES_DIR/$name"
 	if [[ -f "$dir/main.py" ]]; then
 		found_any=1

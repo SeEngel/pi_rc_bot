@@ -69,6 +69,7 @@ class TestDecideAndRespondIntegration(unittest.IsolatedAsyncioTestCase):
 			suppress_alone_mode_while_speaking=False,
 			stop_speech_on_sound_while_waiting=False,
 			post_speech_interaction_grace_seconds=0.0,
+			brief_listen_timeout_seconds=3.0,
 			stop_words=["stop"],
 			think_interval_seconds=999.0,
 			observation_question="Describe.",

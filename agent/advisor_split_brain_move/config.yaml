@@ -74,6 +74,8 @@ interaction:
   suppress_alone_mode_while_speaking: true
   stop_speech_on_sound_while_waiting: false
   post_speech_interaction_grace_seconds: 1.5
+  # Brief listen timeout (seconds) after completing tasks to allow human interruption
+  brief_listen_timeout_seconds: 3.0
   stop_words:
     - stop
     - stopp

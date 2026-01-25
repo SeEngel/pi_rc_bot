@@ -169,6 +169,11 @@ interaction:
   # after speech ends so the human can be captured even if they spoke over the robot.
   post_speech_interaction_grace_seconds: 1.5
 
+  # Brief listen timeout (seconds) after completing tasks to allow human interruption.
+  # The robot will listen for this duration after saying "Fertig!" to give the human
+  # a chance to add more tasks or interrupt.
+  brief_listen_timeout_seconds: 3.0
+
   # If the transcript matches one of these, stop speech immediately.
   # (Useful when someone says "Stop!" while the robot is talking.)
   stop_words:

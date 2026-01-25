@@ -105,7 +105,7 @@ should_start_service() {
 
 	case "$workflow_mode" in
 		legacy)
-			# Legacy mode: do NOT start the split-brain move advisor.
+			# Legacy mode: do NOT start the split-brain move_advisor.
 			if [[ "$name" == "move_advisor" ]]; then
 				return 1
 			fi
@@ -122,10 +122,48 @@ should_start_service() {
 	esac
 }
 
+# Helper: check if a service depends on 'robot' being available first.
+needs_robot_service() {
+	local name="$1"
+	case "$name" in
+		move|safety|proximity|perception|head)
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
 found_any=0
+
+# Start robot service FIRST (other services depend on it).
 for main_py in "$SERVICES_DIR"/*/main.py; do
 	[[ -f "$main_py" ]] || continue
 	name="$(basename "$(dirname "$main_py")")"
+	if [[ "$name" == "robot" ]]; then
+		if should_start_service "$name"; then
+			found_any=1
+			start_service "$(dirname "$main_py")"
+		fi
+		break
+	fi
+done
+
+# Give robot service time to start before dependent services.
+if [[ "$found_any" -eq 1 ]]; then
+	echo "waiting 2s for robot service to initialize..."
+	sleep 2
+fi
+
+# Start remaining services.
+for main_py in "$SERVICES_DIR"/*/main.py; do
+	[[ -f "$main_py" ]] || continue
+	name="$(basename "$(dirname "$main_py")")"
+	# Skip robot (already started above).
+	if [[ "$name" == "robot" ]]; then
+		continue
+	fi
 	if ! should_start_service "$name"; then
 		continue
 	fi
