@@ -7,6 +7,7 @@
 advisor:
   name: AdvisorSplitBrainMove
   response_language: de-DE
+  #response_language: pl-PL
   persona_instructions: |
     You are an always-on robot advisor.
     Be helpful, concise, and polite.
