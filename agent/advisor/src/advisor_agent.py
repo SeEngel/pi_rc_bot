@@ -11,7 +11,7 @@ from typing import Any
 
 from agent.src.base_agent import BaseAgentConfig, BaseWorkbenchChatAgent
 from agent.src.config import OpenAIClientConfig, load_yaml, resolve_repo_root
-from agent.todo.src import TodoAgent, TaskPlanner, TaskPlannerSettings
+from agent.todo.src import TodoAgent, TaskPlanner, TaskPlannerSettings, LLMTodoAgent, LLMTodoAgentSettings
 
 from .mcp_client import call_mcp_tool_json
 from .sound_activity import detect_sound_activity
@@ -180,6 +180,7 @@ class AdvisorAgent:
 		self._memorizer: Any | None = None
 		self._todo: TodoAgent | None = None
 		self._task_planner: TaskPlanner | None = None
+		self._llm_todo: LLMTodoAgent | None = None  # New LLM-based todo agent
 		self._memorizer_task: asyncio.Task[None] | None = None
 		self._last_alone_think_ts = 0.0
 		self._force_interaction_until_ts = 0.0
@@ -187,6 +188,7 @@ class AdvisorAgent:
 		self._protocol = ProtocolLogger(enabled=bool(settings.debug), log_path=settings.debug_log_path)
 		self._protocol.open()
 		self._init_todo_agent()
+		self._init_llm_todo_agent()  # Initialize LLM todo agent
 		self._init_task_planner()
 		# Best-effort persistent memory: load newest summary file (if any) to seed this run.
 		self._load_latest_persisted_summary()
@@ -205,6 +207,38 @@ class AdvisorAgent:
 		except Exception as exc:
 			self._emit("todo_init_warning", component="advisor.todo", error=str(exc))
 			self._todo = None
+
+	def _init_llm_todo_agent(self) -> None:
+		"""Initialize the LLM-based TodoAgent (best-effort; must never crash startup)."""
+		try:
+			cfg = self.settings.todo
+			if not bool(cfg.enabled) or not bool(cfg.use_task_planner):
+				self._emit("llm_todo_init_skip", component="advisor.llm_todo", reason="disabled_in_config")
+				return
+			if self._dry_run:
+				self._emit("llm_todo_init_skip", component="advisor.llm_todo", reason="dry_run")
+				return
+
+			# LLMTodoAgent uses the same OpenAI settings as the advisor brain.
+			llm_todo_settings = LLMTodoAgentSettings(
+				enabled=True,
+				model=self.settings.openai_model,
+				base_url=self.settings.openai_base_url,
+				env_file_path=self.settings.env_file_path,
+				language=self.settings.response_language,
+			)
+			self._llm_todo = LLMTodoAgent(llm_todo_settings)
+			is_enabled = self._llm_todo.is_enabled()
+			self._emit(
+				"llm_todo_init",
+				component="advisor.llm_todo",
+				enabled=True,
+				is_enabled=is_enabled,
+				model=self.settings.openai_model,
+			)
+		except Exception as exc:
+			self._emit("llm_todo_init_warning", component="advisor.llm_todo", error=str(exc))
+			self._llm_todo = None
 
 	def _init_task_planner(self) -> None:
 		"""Initialize the LLM-based TaskPlanner (best-effort; must never crash startup)."""
@@ -758,6 +792,14 @@ class AdvisorAgent:
 		if task_planner is not None:
 			try:
 				await task_planner.close()
+			except Exception:
+				pass
+		# Clean up LLMTodoAgent
+		llm_todo = self._llm_todo
+		self._llm_todo = None
+		if llm_todo is not None:
+			try:
+				await llm_todo.close()
 			except Exception:
 				pass
 		self._protocol.close()
@@ -1957,15 +1999,274 @@ class AdvisorAgent:
 
 	def _is_multi_step_request(self, text: str) -> bool:
 		"""Check if a user request might need multi-step task planning."""
-		if self._task_planner is None:
+		# Debug: log entry point
+		llm_todo_available = self._llm_todo is not None
+		llm_todo_enabled = self._llm_todo.is_enabled() if llm_todo_available else False
+		self._emit("multi_step_check_entry", component="advisor", text_preview=text[:100] if text else "", llm_todo_available=llm_todo_available, llm_todo_enabled=llm_todo_enabled)
+		
+		# Check if LLMTodoAgent is available first
+		if self._llm_todo is not None and self._llm_todo.is_enabled():
+			# Use heuristics to detect multi-step requests
+			lower = (text or "").lower()
+			words = lower.split()
+			if len(words) < 6:
+				self._emit("multi_step_check", component="advisor", result=False, reason="too_few_words", word_count=len(words))
+				return False
+			# Look for German/English sequence indicators
+			multi_step_indicators = [
+				" und dann ", " dann ", " danach ", " zuerst ", " erst ",
+				" anschließend ", " nachdem ", " bevor ", " schließlich ",
+				" and then ", " then ", " after ", " first ", " next ",
+				" finally ", " before ", " sekunden ", " seconds ",
+			]
+			for indicator in multi_step_indicators:
+				if indicator in lower:
+					self._emit("multi_step_check", component="advisor", result=True, reason="indicator_found", indicator=indicator.strip())
+					return True
+			# Check for numbered lists or multiple action verbs
+			action_verbs = ["schau", "look", "fahr", "drive", "dreh", "turn", "sag", "say", "beschreib", "describe", "erzähl", "tell"]
+			verb_count = sum(1 for v in action_verbs if v in lower)
+			if verb_count >= 2:
+				self._emit("multi_step_check", component="advisor", result=True, reason="multiple_verbs", verb_count=verb_count)
+				return True
+			self._emit("multi_step_check", component="advisor", result=False, reason="no_indicators", verb_count=verb_count)
 			return False
-		return self._task_planner.is_multi_step_request(text)
+
+		# Fallback to TaskPlanner if available
+		if self._task_planner is not None:
+			result = self._task_planner.is_multi_step_request(text)
+			self._emit("multi_step_check", component="advisor", result=result, reason="task_planner_fallback")
+			return result
+
+		self._emit("multi_step_check", component="advisor", result=False, reason="no_planner_available")
+		return False
 
 	async def _plan_and_execute_tasks(self, user_request: str) -> str | None:
-		"""Plan tasks from a multi-step request and execute them sequentially.
+		"""Plan tasks using LLMTodoAgent and execute them step-by-step.
+
+		The flow is:
+		1. Ask LLMTodoAgent to plan tasks from user request
+		2. Loop: ask LLMTodoAgent "what's next?" -> execute ONE task -> wait -> mark done
+		3. Repeat until no more tasks
 
 		Returns the final response to speak, or None if planning failed.
 		"""
+		# Prefer LLMTodoAgent if available, fall back to old TaskPlanner
+		if self._llm_todo is not None and self._llm_todo.is_enabled():
+			return await self._plan_and_execute_tasks_llm(user_request)
+
+		# Fallback to old TaskPlanner-based approach
+		if self._task_planner is None or self._todo is None:
+			return None
+
+		return await self._plan_and_execute_tasks_legacy(user_request)
+
+	async def _plan_and_execute_tasks_llm(self, user_request: str) -> str | None:
+		"""Execute tasks using the LLM-based TodoAgent - step by step with waiting."""
+		if self._llm_todo is None:
+			return None
+
+		self._emit("state", component="advisor", state="llm_task_planning_start")
+
+		# Step 1: Ask LLMTodoAgent to plan tasks
+		try:
+			tasks = await self._llm_todo.plan_tasks(user_request)
+		except Exception as exc:
+			self._emit("llm_task_planning_error", component="advisor.llm_todo", error=str(exc))
+			return None
+
+		if not tasks:
+			self._emit("llm_task_planning_empty", component="advisor.llm_todo")
+			return None
+
+		self._emit(
+			"llm_task_planning_done",
+			component="advisor.llm_todo",
+			task_count=len(tasks),
+			tasks=[t.get("title") for t in tasks],
+		)
+
+		# Announce the plan
+		lang = self.settings.response_language
+		is_german = str(lang).lower().startswith("de")
+		plan_announcement = (
+			f"Okay, ich habe {len(tasks)} Schritte geplant. Los geht's!"
+			if is_german
+			else f"Okay, I've planned {len(tasks)} steps. Let's go!"
+		)
+		await self._speak(plan_announcement)
+		self._ledger.append(f"Assistant: {plan_announcement}")
+
+		# Step 2: Execute tasks ONE BY ONE with waiting
+		completed_count = 0
+
+		while self._llm_todo.has_pending_tasks():
+			# Ask LLMTodoAgent: "What's the next task?"
+			next_task = await self._llm_todo.get_next_task()
+			if next_task is None:
+				break
+
+			task_id = next_task.get("id")
+			task_title = str(next_task.get("title") or "")
+			action = next_task.get("action", {})
+
+			self._emit(
+				"llm_task_execution_start",
+				component="advisor.llm_todo",
+				task_id=task_id,
+				task_title=task_title,
+				action=action,
+			)
+
+			task_result: str | None = None
+
+			try:
+				# Execute the task based on its action type
+				action_type = str(action.get("type") or "").lower()
+
+				if action_type == "observe":
+					# Just observe and describe
+					question = str(action.get("question") or "Beschreibe was du siehst.")
+					obs = await self._observe(question)
+					if obs:
+						await self._speak(obs)
+						self._ledger.append(f"Assistant: {obs}")
+					task_result = obs
+
+				elif action_type in {"head_set_angles", "set_head_angles", "look"}:
+					# Head movement with optional observe_after
+					pan = action.get("pan_deg")
+					tilt = action.get("tilt_deg")
+					observe_after = bool(action.get("observe_after", False))
+
+					# Execute head movement
+					pan_i = int(pan) if pan is not None else None
+					tilt_i = int(tilt) if tilt is not None else None
+					if pan_i is not None:
+						pan_i = max(-90, min(90, pan_i))
+					if tilt_i is not None:
+						tilt_i = max(-35, min(35, tilt_i))
+
+					self._emit(
+						"llm_task_head_move",
+						component="advisor.llm_todo",
+						task_id=task_id,
+						pan_deg=pan_i,
+						tilt_deg=tilt_i,
+					)
+
+					await self._head_set_angles(pan_deg=pan_i, tilt_deg=tilt_i)
+
+					# WAIT for head to settle (important!)
+					await asyncio.sleep(1.0)
+
+					# If observe_after, take picture and describe
+					if observe_after:
+						question = str(action.get("observe_question") or action.get("question") or "Beschreibe kurz was du siehst.")
+						self._emit(
+							"llm_task_observe_after",
+							component="advisor.llm_todo",
+							task_id=task_id,
+							question=question,
+						)
+						obs = await self._observe(question)
+						if obs:
+							await self._speak(obs)
+							self._ledger.append(f"Assistant: {obs}")
+						task_result = obs
+
+				elif action_type in {"guarded_drive", "drive", "move"}:
+					# Driving action - WAIT for completion
+					speed = int(action.get("speed") or 25)
+					steer_deg = int(action.get("steer_deg") or 0)
+					duration_s = float(action.get("duration_s") or 1.0)
+
+					speed = max(-100, min(100, speed))
+					steer_deg = max(-45, min(45, steer_deg))
+					duration_s = max(0.1, min(10.0, duration_s))
+
+					self._emit(
+						"llm_task_drive",
+						component="advisor.llm_todo",
+						task_id=task_id,
+						speed=speed,
+						steer_deg=steer_deg,
+						duration_s=duration_s,
+					)
+
+					await self._safety_guarded_drive(
+						speed=speed,
+						steer_deg=steer_deg,
+						duration_s=duration_s,
+						threshold_cm=35.0,
+						await_completion=True,  # WAIT for drive to complete
+					)
+					task_result = f"Gefahren: speed={speed}, steer={steer_deg}, {duration_s}s"
+
+				elif action_type == "speak":
+					# Just speak text
+					text = str(action.get("text") or "")
+					if text:
+						await self._speak(text)
+						self._ledger.append(f"Assistant: {text}")
+					task_result = text
+
+				else:
+					# Unknown action type - try to execute via brain
+					self._emit(
+						"llm_task_unknown_action",
+						component="advisor.llm_todo",
+						task_id=task_id,
+						action_type=action_type,
+					)
+					task_result = f"Unbekannte Aktion: {action_type}"
+
+				# Mark task as done
+				await self._llm_todo.mark_task_done(task_id, task_result)
+				completed_count += 1
+
+				self._emit(
+					"llm_task_execution_done",
+					component="advisor.llm_todo",
+					task_id=task_id,
+					task_title=task_title,
+					result=task_result[:100] if task_result else None,
+				)
+
+				# Small pause between tasks for natural pacing
+				await asyncio.sleep(0.3)
+
+			except Exception as exc:
+				self._emit(
+					"llm_task_execution_error",
+					component="advisor.llm_todo",
+					task_id=task_id,
+					task_title=task_title,
+					error=str(exc),
+				)
+				# Mark as done anyway to avoid infinite loop
+				await self._llm_todo.mark_task_done(task_id, f"Fehler: {exc}")
+
+		# Step 3: Final status
+		self._emit(
+			"llm_task_execution_complete",
+			component="advisor.llm_todo",
+			completed=completed_count,
+		)
+
+		final_response = (
+			f"Fertig! Ich habe alle {completed_count} Schritte abgeschlossen."
+			if is_german
+			else f"Done! I completed all {completed_count} steps."
+		)
+
+		# Clear the todo list
+		self._llm_todo.clear()
+
+		return final_response
+
+	async def _plan_and_execute_tasks_legacy(self, user_request: str) -> str | None:
+		"""Legacy task execution using TaskPlanner (fallback)."""
 		if self._task_planner is None or self._todo is None:
 			return None
 
@@ -2052,13 +2353,51 @@ class AdvisorAgent:
 							await self._speak(obs)
 							self._ledger.append(f"Assistant: {obs}")
 						task_result["observation"] = obs
+
+					elif action_type in {"head_set_angles", "set_head_angles", "look"}:
+						# Head movement - possibly with observe_after
+						pan = action_hint.get("pan_deg")
+						tilt = action_hint.get("tilt_deg")
+						observe_after = bool(action_hint.get("observe_after", False))
+
+						# Execute head movement
+						pan_i = int(pan) if pan is not None else None
+						tilt_i = int(tilt) if tilt is not None else None
+						if pan_i is not None:
+							pan_i = max(-90, min(90, pan_i))
+						if tilt_i is not None:
+							tilt_i = max(-35, min(35, tilt_i))
+						await self._head_set_angles(pan_deg=pan_i, tilt_deg=tilt_i)
+
+						# Wait for head to settle
+						await asyncio.sleep(1.0)
+
+						# If observe_after, take a picture and describe
+						if observe_after:
+							question = str(action_hint.get("observe_question") or action_hint.get("question") or "Beschreibe was du siehst.")
+							obs = await self._observe(question)
+							if obs:
+								await self._speak(obs)
+								self._ledger.append(f"Assistant: {obs}")
+							task_result["observation"] = obs
+
+					elif action_type in {"guarded_drive", "drive", "move"}:
+						# Execute drive with await_completion
+						action_results = await self._execute_planned_actions([action_hint])
+						task_result["action_results"] = action_results
+
+					elif action_type == "speak":
+						# Just speak
+						text = str(action_hint.get("text") or "")
+						if text:
+							await self._speak(text)
+							self._ledger.append(f"Assistant: {text}")
+						task_result["spoken"] = text
+
 					else:
 						# Regular action - execute via _execute_planned_actions
 						action_results = await self._execute_planned_actions([action_hint])
 						task_result["action_results"] = action_results
-
-						# Brief status update (optional, can be removed for silent execution)
-						# await self._speak(f"Erledigt: {task_title}" if is_german else f"Done: {task_title}")
 				else:
 					# No action hint - ask the brain what to do for this task
 					response, need_observe, actions = await self._decide_and_respond(
@@ -2089,6 +2428,9 @@ class AdvisorAgent:
 					task_id=task_id,
 					task_title=task_title,
 				)
+
+				# Pause between tasks
+				await asyncio.sleep(0.3)
 
 			except Exception as exc:
 				task_result["ok"] = False
