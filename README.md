@@ -2,6 +2,15 @@
 
 A multi-agent robotic system for the PiCar-X platform using distributed agents with MCP support.
 
+## Hardware tested
+
+- **Raspberry Pi 5** (16GB RAM)
+- **PiCar-X** robot platform
+- **Camera**: Raspberry Pi Camera Module (via picamera2)
+- **Microphone**: USB or 3.5mm audio input (ALSA/PortAudio compatible)
+- **Speaker**: Onboard audio via robot_hat module
+- **Ultrasonic Sensor**: HC-SR04 (distance sensing)
+
 ## Documentation
 
 - [PiCar-X Documentation](https://docs.sunfounder.com/projects/picar-x-v20/en/latest/)
