@@ -2250,8 +2250,14 @@ class AdvisorAgent:
 		)
 		return session_id
 
-	async def _speak_stream_chunk(self, session_id: str, text: str) -> bool:
-		"""Send a text chunk to a streaming TTS session. Returns True on success."""
+	async def _speak_stream_chunk(self, session_id: str, text: str, http_session: Any = None) -> bool:
+		"""Send a text chunk to a streaming TTS session. Returns True on success.
+		
+		Args:
+			session_id: The TTS streaming session ID
+			text: Text chunk to send
+			http_session: Optional aiohttp.ClientSession to reuse (faster)
+		"""
 		if not session_id or not text:
 			return False
 		
@@ -2267,7 +2273,8 @@ class AdvisorAgent:
 		
 		try:
 			import aiohttp
-			async with aiohttp.ClientSession() as session:
+			
+			async def do_request(session: aiohttp.ClientSession) -> bool:
 				async with session.post(
 					api_url,
 					json={"session_id": session_id, "text": text},
@@ -2275,6 +2282,12 @@ class AdvisorAgent:
 				) as resp:
 					data = await resp.json()
 					return bool(data.get("ok"))
+			
+			if http_session is not None:
+				return await do_request(http_session)
+			else:
+				async with aiohttp.ClientSession() as session:
+					return await do_request(session)
 		except Exception as exc:
 			self._emit(
 				"tool_call_error",
@@ -2839,56 +2852,70 @@ class AdvisorAgent:
 		full_response = ""
 		speech_text = ""
 		json_part = ""
-		in_json_section = False
 		separator_seen = False
+		pending_speech_chunk = ""  # Buffer to reduce HTTP calls
+		chunk_send_threshold = 40  # Send to TTS every ~40 chars (faster first response)
 		
-		try:
-			async for update in brain.run_stream(prompt):
-				# Extract text from the update
-				chunk_text = ""
-				if hasattr(update, "contents"):
-					for content in update.contents:
-						if hasattr(content, "text") and content.text:
-							chunk_text += str(content.text)
-				elif hasattr(update, "text"):
-					chunk_text = str(update.text)
-				elif hasattr(update, "content"):
-					chunk_text = str(update.content)
-				
-				if not chunk_text:
-					continue
-				
-				full_response += chunk_text
-				
-				# Check for JSON separator
-				if not separator_seen:
-					# Look for the separator in accumulated text
-					if "---JSON---" in full_response:
-						separator_seen = True
-						parts = full_response.split("---JSON---", 1)
-						speech_text = parts[0].strip()
-						json_part = parts[1] if len(parts) > 1 else ""
-						in_json_section = True
-						
-						# Send any remaining speech text
-						# (chunk may have contained both speech and separator)
+		# Create a persistent HTTP session for all chunk requests (much faster)
+		import aiohttp
+		async with aiohttp.ClientSession() as http_session:
+			try:
+				async for update in brain.run_stream(prompt):
+					# Extract text from the update
+					chunk_text = ""
+					if hasattr(update, "contents"):
+						for content in update.contents:
+							if hasattr(content, "text") and content.text:
+								chunk_text += str(content.text)
+					elif hasattr(update, "text"):
+						chunk_text = str(update.text)
+					elif hasattr(update, "content"):
+						chunk_text = str(update.content)
+					
+					if not chunk_text:
+						continue
+					
+					full_response += chunk_text
+					
+					# Check for JSON separator
+					if not separator_seen:
+						# Look for the separator in accumulated text
+						if "---JSON---" in full_response:
+							separator_seen = True
+							parts = full_response.split("---JSON---", 1)
+							speech_text = parts[0].strip()
+							json_part = parts[1] if len(parts) > 1 else ""
+							
+							# Send any remaining buffered speech text before separator
+							if pending_speech_chunk.strip():
+								await self._speak_stream_chunk(session_id, pending_speech_chunk, http_session)
+								pending_speech_chunk = ""
+						else:
+							# Still in speech section - buffer chunks to reduce HTTP calls
+							pending_speech_chunk += chunk_text
+							speech_text = full_response.strip()
+							
+							# Send when buffer is big enough
+							if len(pending_speech_chunk) >= chunk_send_threshold:
+								await self._speak_stream_chunk(session_id, pending_speech_chunk, http_session)
+								pending_speech_chunk = ""
 					else:
-						# Still in speech section, stream to TTS
-						speech_text = full_response.strip()
-						await self._speak_stream_chunk(session_id, chunk_text)
-				else:
-					# In JSON section, accumulate for parsing
-					json_part += chunk_text
-		
-		except Exception as exc:
-			self._emit(
-				"brain_stream_error",
-				component="advisor.brain",
-				error=str(exc),
-			)
-			# End TTS session on error
-			await self._speak_stream_end(session_id)
-			raise
+						# In JSON section, accumulate for parsing
+						json_part += chunk_text
+				
+				# Send any remaining buffered speech
+				if pending_speech_chunk.strip():
+					await self._speak_stream_chunk(session_id, pending_speech_chunk, http_session)
+			
+			except Exception as exc:
+				self._emit(
+					"brain_stream_error",
+					component="advisor.brain",
+					error=str(exc),
+				)
+				# End TTS session on error
+				await self._speak_stream_end(session_id)
+				raise
 
 		# End TTS streaming session
 		await self._speak_stream_end(session_id)

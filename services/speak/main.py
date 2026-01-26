@@ -344,7 +344,19 @@ def main() -> int:
 	streaming_sessions_lock = threading.Lock()
 
 	def _streaming_worker(session_id: str, sp: Speaker) -> None:
-		"""Worker thread that consumes chunks from a queue and speaks them."""
+		"""Worker thread that consumes chunks from a queue and speaks them.
+		
+		Hybrid Strategy for optimal latency:
+		1. FIRST FLUSH: Speak as soon as we have ~60-100 chars at a sentence boundary
+		   This gives fast time-to-first-audio while the LLM continues generating.
+		2. FINAL FLUSH: Collect ALL remaining text and speak it in ONE call.
+		   This minimizes total API calls (usually just 2 total).
+		
+		Why this works:
+		- OpenAI TTS with stream=True starts playing immediately
+		- Each API call has ~200-500ms overhead
+		- So 2 calls (first sentence + rest) is much faster than 5+ calls
+		"""
 		with streaming_sessions_lock:
 			session = streaming_sessions.get(session_id)
 			if session is None:
@@ -352,48 +364,70 @@ def main() -> int:
 			q: queue.Queue[str | None] = session["queue"]
 		
 		buffer = ""
-		min_chunk_chars = 30  # Minimum chars before speaking (allows sentence building)
-		sentence_enders = ('.', '!', '?', ':', ';', '\n')
+		first_flush_done = False
+		first_flush_min_chars = 60   # Minimum chars for first flush
+		first_flush_max_chars = 150  # Don't wait longer than this for first flush
+		sentence_enders = ('.', '!', '?', '\n')
 		
 		while True:
 			try:
-				chunk = q.get(timeout=30.0)  # 30s timeout to prevent hangs
+				# Short timeout - we want to react quickly
+				chunk = q.get(timeout=0.5)
 			except queue.Empty:
-				break
+				# Timeout - check if we should flush
+				if not first_flush_done and buffer.strip():
+					# Haven't spoken yet but have text - maybe LLM is slow
+					# If we have a complete sentence, speak it now
+					for ender in sentence_enders:
+						idx = buffer.find(ender)
+						if idx >= 20:  # At least 20 chars is a reasonable sentence
+							to_speak = buffer[:idx + 1].strip()
+							buffer = buffer[idx + 1:]
+							if to_speak:
+								sp.say(to_speak)
+								first_flush_done = True
+							break
+				continue
 			
 			if chunk is None:  # End of stream signal
-				# Speak any remaining buffered text
+				# FINAL FLUSH: Speak ALL remaining buffered text in ONE call
 				if buffer.strip():
 					sp.say(buffer.strip())
 				break
 			
 			buffer += chunk
 			
-			# Speak when we have enough text at a sentence boundary
-			while len(buffer) >= min_chunk_chars:
-				# Find the last sentence boundary within our buffer
-				best_idx = -1
+			# FIRST FLUSH LOGIC: Get first response out quickly
+			if not first_flush_done:
+				# Look for a sentence boundary within acceptable range
 				for ender in sentence_enders:
-					idx = buffer.rfind(ender, 0, len(buffer))
-					if idx > best_idx:
-						best_idx = idx
-				
-				if best_idx >= min_chunk_chars - 1:
-					# Speak up to and including the sentence ender
-					to_speak = buffer[:best_idx + 1].strip()
-					buffer = buffer[best_idx + 1:]
-					if to_speak:
-						sp.say(to_speak)
-				else:
-					# No good boundary, wait for more text (unless buffer is huge)
-					if len(buffer) > 200:
-						# Force speak first 150 chars
-						to_speak = buffer[:150].strip()
-						buffer = buffer[150:]
+					idx = buffer.find(ender)
+					if idx >= first_flush_min_chars - 1:
+						# Found a good boundary - speak everything up to it
+						to_speak = buffer[:idx + 1].strip()
+						buffer = buffer[idx + 1:]
 						if to_speak:
 							sp.say(to_speak)
-					else:
+							first_flush_done = True
 						break
+				
+				# Force first flush if buffer is getting too big (even without sentence end)
+				if not first_flush_done and len(buffer) >= first_flush_max_chars:
+					# Find best split point (comma, space)
+					split_idx = buffer.rfind(',', 0, first_flush_max_chars)
+					if split_idx < 30:
+						split_idx = buffer.rfind(' ', 30, first_flush_max_chars)
+					if split_idx < 30:
+						split_idx = first_flush_max_chars - 1
+					
+					to_speak = buffer[:split_idx + 1].strip()
+					buffer = buffer[split_idx + 1:]
+					if to_speak:
+						sp.say(to_speak)
+						first_flush_done = True
+			
+			# After first flush: Just collect everything for final flush
+			# (the while loop will continue until we get None)
 		
 		# Mark session as done
 		with streaming_sessions_lock:
