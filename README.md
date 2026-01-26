@@ -17,7 +17,7 @@ A multi-agent robotic system for the PiCar-X platform using distributed agents w
 ### Step 1: Install PiCar-X Modules
 Follow the [official installation guide](https://docs.sunfounder.com/projects/picar-x-v20/en/latest/python/python_start/install_all_modules.html) to install all PiCar-X modules.
 
-**Note:** Currently requires installation in the global Python environment to access the robohat module.
+**Note:** Currently requires installation in the global Python environment to access the `robot_hat` module.
 
 ### Step 2: Install Dependencies
 ```bash
@@ -131,11 +131,16 @@ You can control the network wait behavior via environment variables:
 
 In legacy mode, the advisor calls the lower-level motion stack directly via MCP.
 
+If `memorizer.enabled: true`, the advisor also uses the **MemorizerAgent**, which talks to `services/memory` via MCP (not shown in older versions of this diagram).
+
 ```mermaid
 flowchart LR
     A[agent/advisor] <-- MCP --> L[services/listening]
     A <-- MCP --> S[services/speak]
     A <-- MCP --> O[services/observe]
+
+    A --> MM[agent/memorizer]
+    MM <-- MCP --> MEM[services/memory]
 
     A <-- MCP --> SA[services/safety]
     A <-- MCP --> PX[services/proximity]
@@ -154,12 +159,21 @@ flowchart LR
 
 In split-brain mode, the advisor delegates *motion-related* actions to `services/move_advisor` (the “move cluster” entry point). This reduces sequential tool-calls in the advisor loop and lets the move cluster execute actions (optionally as background jobs) while the advisor keeps listening/speaking.
 
+Memory stays in the “brain” side: the advisor can still use `agent/memorizer` → `services/memory` regardless of the move cluster.
+
+Head control also stays in the “brain” side (the split-brain advisor calls `services/head` directly).
+
 ```mermaid
 flowchart LR
     A[agent/advisor_split_brain_move] <-- MCP --> L[services/listening]
     A <-- MCP --> S[services/speak]
     A <-- MCP --> O[services/observe]
     A <-- MCP --> MA[services/move_advisor]
+
+    A <-- MCP --> H[services/head]
+
+    A --> MM[agent/memorizer]
+    MM <-- MCP --> MEM[services/memory]
 
     MA <-- MCP --> SA[services/safety]
     MA <-- MCP --> PX[services/proximity]
@@ -169,6 +183,7 @@ flowchart LR
     SA --> R[services/robot]
     PX --> R
     MV --> R
+    H --> R
     O --> CAM[(Camera)]
 ```
 
@@ -298,6 +313,23 @@ stateDiagram-v2
 
 ---
 
+### Language / Localization
+
+Both advisor variants (`agent/advisor` and `agent/advisor_split_brain_move`) can be configured to **speak a different language**.
+
+Set `advisor.response_language` in the corresponding config:
+
+```yaml
+# agent/advisor/config.yaml or agent/advisor_split_brain_move/config.yaml
+advisor:
+    response_language: de-DE  # e.g. en-US, pl-PL, ...
+```
+
+For best results, keep the services aligned with the same language:
+
+- STT: `services/listening/config.yaml` → `stt.openai.language` (or `stt.language` for Vosk)
+- TTS: `services/speak/config.yaml` → `tts.language` (for Pico2Wave) and/or `tts.openai.*` (voice/instructions)
+
 ### Sub-Agent Responsibilities
 
 Each sub-agent extends `BaseWorkbenchChatAgent` and connects to exactly one MCP service:
@@ -350,9 +382,9 @@ flowchart TB
     end
     
     subgraph CLIENTS["Client Services"]
-        MOVE["move:8605"]
-        HEAD["head:8606"]
-        PROX["proximity:8607"]
+        MOVE["move:8005"]
+        HEAD["head:8006"]
+        PROX["proximity:8007"]
     end
     
     CLIENTS -->|HTTP /drive, /stop| RC
@@ -493,8 +525,8 @@ flowchart LR
         ESTOP["E-Stop Flag"]
     end
     
-    SAFETY -->|check distance| PROX["proximity:8607"]
-    SAFETY -->|drive| MOVE["move:8605"]
+    SAFETY -->|check distance| PROX["proximity:8007"]
+    SAFETY -->|drive| MOVE["move:8005"]
 ```
 
 **MCP Tools:**
@@ -592,7 +624,7 @@ flowchart TB
         GPT4OMINI["gpt-5.2<br/><i>Agent reasoning</i>"]
         WHISPER["gpt-4o-mini-transcribe<br/><i>Whisper STT</i>"]
         TTS["gpt-4o-mini-tts<br/><i>Text-to-Speech</i>"]
-        EMB["text-embedding-3-small<br/><i>Memory embeddings</i>"]
+        EMB["text-embedding-3-large<br/><i>Memory embeddings</i>"]
     end
 
     subgraph LOCAL["🏠 Local Models (optional)"]
@@ -770,7 +802,7 @@ vision:
 
 | Model | Used By | Purpose | Input | Output |
 |-------|---------|---------|-------|--------|
-| **text-embedding-3-large** | `memory` service | Semantic memory storage/retrieval | Text content | 1536-dim float vector |
+| **text-embedding-3-large** | `memory` service | Semantic memory storage/retrieval | Text content | Embedding vector (dimension depends on model; 3072 for `text-embedding-3-large`) |
 
 **Embedding Flow:**
 ```mermaid
@@ -793,9 +825,9 @@ sequenceDiagram
 **Configuration:**
 ```yaml
 # services/memory/config.yaml
-embedding:
-    model: text-embedding-3-large
-  # base_url: optional override
+openai:
+    embedding_model: text-embedding-3-large
+    # base_url: optional override
 ```
 
 ---
