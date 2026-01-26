@@ -72,6 +72,13 @@ class BaseWorkbenchChatAgent:
 			raise RuntimeError("Agent not initialized (did you forget 'async with'?)")
 		return await self._agent.run(user_input, **kwargs)
 
+	async def run_stream(self, user_input: Any, **kwargs: Any) -> Any:
+		"""Stream the agent's response, yielding chunks as they arrive."""
+		if self._agent is None:
+			raise RuntimeError("Agent not initialized (did you forget 'async with'?)")
+		async for update in self._agent.run_stream(user_input, **kwargs):
+			yield update
+
 	def get_new_thread(self) -> Any:
 		if self._agent is None:
 			raise RuntimeError("Agent not initialized (did you forget 'async with'?)")
