@@ -76,6 +76,8 @@ interaction:
   post_speech_interaction_grace_seconds: 1.5
   # Brief listen timeout (seconds) after completing tasks to allow human interruption
   brief_listen_timeout_seconds: 3.0
+  # Enable streaming TTS for lower latency (sends text chunks as LLM generates them)
+  streaming_tts_enabled: true
   stop_words:
     - stop
     - stopp

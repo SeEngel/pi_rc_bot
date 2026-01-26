@@ -542,25 +542,41 @@ class _TodoReviewerAgent(BaseWorkbenchChatAgent):
 
 Your task: Check if the planned tasks will fulfill the mission.
 
+IMPORTANT: Only suggest changes if something CRITICAL is missing.
+- Do NOT suggest minor improvements or "nice to have" additions.
+- Do NOT suggest changes just to make the plan "better" or "more complete".
+- APPROVE the plan unless there is a clear, important omission.
+- Be conservative - users find constant suggestions annoying.
+
 Respond ONLY with JSON in this format:
 {
   "approved": true/false,
-  "suggestion": "What is missing or should be changed" or null,
+  "suggestion": "What critical step is missing" or null,
   "reason": "Brief explanation"
 }
 
-Check:
-1. Are all steps present to fulfill the mission?
-2. Is the order logical?
-3. Are important steps missing?
-4. Are there unnecessary steps?
+APPROVE unless:
+1. A REQUIRED step to fulfill the mission is completely missing
+2. The order is clearly wrong and will cause failure
+3. There is an obvious error that will prevent completion
 
-If everything is good: {"approved": true, "suggestion": null, "reason": "Plan is complete"}
-If something is missing: {"approved": false, "suggestion": "Add X", "reason": "Missing Y"}"""
+DO NOT reject for:
+- Minor improvements
+- "Nice to have" additions
+- Subjective preferences
+- Making things "more thorough"
+
+Default to: {"approved": true, "suggestion": null, "reason": "Plan is sufficient"}"""
 
     REVIEW_COMPLETION_PROMPT = """You are a task reviewer for a robot assistant.
 
-Your task: Check if the mission is truly complete or if more should be done.
+Your task: Check if the mission is TRULY complete.
+
+IMPORTANT: Only suggest additional tasks if the mission clearly FAILED.
+- Do NOT suggest improvements or "follow-up" tasks.
+- Do NOT suggest additions just to make things "better".
+- MARK COMPLETE unless the user's request was NOT fulfilled.
+- Users find constant "should I do more?" questions VERY annoying.
 
 Respond ONLY with JSON in this format:
 {
@@ -569,13 +585,17 @@ Respond ONLY with JSON in this format:
   "reason": "Brief explanation"
 }
 
-Check:
-1. Was the original mission fully completed?
-2. Are there sensible follow-up actions?
-3. Did the user possibly expect more?
+MARK COMPLETE unless:
+1. The original request was NOT actually done
+2. There was a clear failure that needs fixing
+3. The user explicitly asked for something that wasn't delivered
 
-If everything is done: {"complete": true, "additional_tasks": null, "reason": "Mission complete"}
-If more is needed: {"complete": false, "additional_tasks": [...], "reason": "Should also do X"}"""
+DO NOT suggest more because:
+- "It would be nice to also..."
+- "A thorough approach would include..."
+- "Users might also want..."
+
+Default to: {"complete": true, "additional_tasks": null, "reason": "Mission complete"}"""
 
     def __init__(
         self,

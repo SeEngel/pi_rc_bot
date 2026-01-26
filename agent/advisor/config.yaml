@@ -174,6 +174,12 @@ interaction:
   # a chance to add more tasks or interrupt.
   brief_listen_timeout_seconds: 3.0
 
+  # Enable streaming TTS for lower latency.
+  # When enabled, the advisor will send text chunks to the speaker as the LLM generates them,
+  # rather than waiting for the complete response. This significantly reduces time to first audio.
+  # Note: With streaming, speech starts before actions are parsed, so actions execute after speech begins.
+  streaming_tts_enabled: true
+
   # If the transcript matches one of these, stop speech immediately.
   # (Useful when someone says "Stop!" while the robot is talking.)
   stop_words:

@@ -157,6 +157,9 @@ class AdvisorSettings:
 	memorizer: AdvisorMemorizerConfig
 	todo: AdvisorTodoConfig
 
+	# Fields with default values must come last in dataclasses
+	# Enable streaming TTS (sends text chunks to speaker as LLM generates them)
+	streaming_tts_enabled: bool = True
 	# alone (optional exploration/motion)
 	alone_explore_enabled: bool = False
 	alone_explore_speed: int = 20
@@ -528,6 +531,11 @@ class AdvisorAgent:
 			(interaction_cfg or {}).get("brief_listen_timeout_seconds") or 3.0
 		)
 		brief_listen_timeout_seconds = max(0.5, min(10.0, brief_listen_timeout_seconds))
+		streaming_tts_enabled = bool(
+			(interaction_cfg or {}).get("streaming_tts_enabled")
+			if "streaming_tts_enabled" in (interaction_cfg or {})
+			else True  # Default to enabled
+		)
 
 		think_interval_seconds = float((alone_cfg or {}).get("think_interval_seconds") or 20.0)
 		observation_question = str((alone_cfg or {}).get("observation_question") or "Briefly describe what you see.")
@@ -606,6 +614,7 @@ class AdvisorAgent:
 			post_speech_interaction_grace_seconds=post_speech_interaction_grace_seconds,
 			stop_words=stop_words,
 			brief_listen_timeout_seconds=brief_listen_timeout_seconds,
+			streaming_tts_enabled=streaming_tts_enabled,
 			think_interval_seconds=think_interval_seconds,
 			observation_question=observation_question,
 			max_thought_chars=max_thought_chars,
@@ -789,8 +798,21 @@ class AdvisorAgent:
 			"When asked to respond to a human, reply as the robot speaking out loud.\n"
 			"You may reason internally in English, but ALL user-facing text you output MUST be in: "
 			+ str(lang)
-			+ ".\n"
-			"Keep responses short unless the user asks for detail.\n"
+			+ ".\n\n"
+			"SPEECH STYLE - VERY IMPORTANT:\n"
+			"- Keep responses SHORT and to the point (1-2 sentences max).\n"
+			"- Do NOT ramble or add unnecessary commentary.\n"
+			"- Do NOT ask follow-up questions unless absolutely necessary.\n"
+			"- Be direct and action-oriented.\n"
+			"- ONLY give long, detailed responses when the user EXPLICITLY asks for it.\n"
+			"  Examples of when to give longer responses:\n"
+			"  * 'tell me a story/tale' or 'erzähl mir eine Geschichte'\n"
+			"  * 'explain in detail' or 'erkläre mir das genau'\n"
+			"  * 'tell me more' or 'erzähl mir mehr'\n"
+			"  * 'I want to know everything about...' or 'ich will alles wissen über...'\n"
+			"  * explicit questions asking for detailed explanations\n"
+			"- For simple commands, just acknowledge briefly: 'OK', 'Mach ich', 'Erledigt', etc.\n"
+			"- Don't repeat back what the user just said unless clarifying ambiguity.\n"
 			"\n"
 			"IMPORTANT about audio errors:\n"
 			"If you receive error messages about audio recording (e.g. 'recording too short', "
@@ -1666,6 +1688,7 @@ class AdvisorAgent:
 		actions: list[dict[str, Any]],
 		*,
 		await_completion: bool = False,
+		allow_interruption: bool = True,
 	) -> list[dict[str, Any]]:
 		"""Execute a small, whitelisted set of actions suggested by the brain.
 
@@ -1675,12 +1698,18 @@ class AdvisorAgent:
 			actions: List of action dicts with 'type' and parameters.
 			await_completion: If True, wait for time-based actions (like drive) to complete
 				before returning. This is essential for sequential task execution.
+			allow_interruption: If True and there are multiple actions, allow human to
+				interrupt between actions with brief pauses.
 		"""
 		results: list[dict[str, Any]] = []
 		if not actions:
 			return results
 
-		for a in actions[:10]:
+		lang = self.settings.response_language
+		is_german = str(lang).lower().startswith("de")
+		total_actions = min(len(actions), 10)  # Max 10 actions
+
+		for idx, a in enumerate(actions[:10]):
 			atype = str(a.get("type") or a.get("action") or "").strip().lower()
 			if not atype:
 				continue
@@ -1791,6 +1820,39 @@ class AdvisorAgent:
 				res["ok"] = False
 				res["error"] = str(exc)
 			results.append(res)
+			
+			# Check for human interruption between actions (if multiple actions and allowed)
+			if allow_interruption and (idx + 1) < total_actions and res.get("ok", False):
+				# Brief pause to allow human to interrupt
+				interrupt_prompt = (
+					"Soll ich weitermachen?"
+					if is_german
+					else "Should I continue?"
+				)
+				human_interrupt = await self._interruptible_pause(
+					interrupt_prompt,
+					initial_timeout_seconds=1.0,
+					context="between_actions",
+				)
+				if human_interrupt:
+					# Human interrupted - stop execution and record the interrupt
+					self._emit(
+						"action_execution_interrupted",
+						component="advisor.actions",
+						completed_actions=idx + 1,
+						total_actions=total_actions,
+						human_input=human_interrupt[:100],
+					)
+					self._ledger.append(f"Human (interrupt): {human_interrupt}")
+					# Add marker to results so caller knows we were interrupted
+					results.append({
+						"type": "_interrupted",
+						"human_input": human_interrupt,
+						"completed": idx + 1,
+						"total": total_actions,
+					})
+					break
+					
 		return results
 
 	async def _listen_once(self) -> str:
@@ -1883,6 +1945,224 @@ class AdvisorAgent:
 		text = str(res.get("text") or "")
 		return text.strip()
 
+	async def _interruptible_pause(
+		self,
+		prompt: str,
+		*,
+		initial_timeout_seconds: float = 2.0,
+		context: str = "pause",
+	) -> str | None:
+		"""Speak a prompt and listen briefly for human input.
+
+		This allows the human to interrupt or provide additional input at key moments.
+		If the human starts speaking during the initial wait, we acknowledge them
+		and switch to full listening mode (like a normal conversation).
+
+		Args:
+			prompt: What to say (e.g., "Say something or I move on")
+			initial_timeout_seconds: How long to wait initially for sound (default 2s)
+			context: Label for logging
+
+		Returns:
+			The transcript if meaningful speech was detected, None otherwise.
+		"""
+		lang = self.settings.response_language
+		is_german = str(lang).lower().startswith("de")
+
+		self._emit("interruptible_pause_start", component="advisor", context=context, prompt=prompt[:50])
+
+		# Speak the prompt
+		await self._speak(prompt)
+		self._ledger.append(f"Assistant: {prompt}")
+
+		# Wait and check for sound activity during the pause window
+		# Poll multiple times since detect_sound_activity has max 1s window
+		sound_detected = False
+		if self.settings.sound_enabled and not self._dry_run:
+			poll_window = min(self.settings.sound_window_seconds, 0.5)  # Short poll windows
+			elapsed = 0.0
+			
+			while elapsed < initial_timeout_seconds and not sound_detected:
+				try:
+					# Run sound detection in thread pool since it's blocking
+					loop = asyncio.get_running_loop()
+					result = await loop.run_in_executor(
+						None,
+						lambda: detect_sound_activity(
+							threshold_rms=self.settings.sound_threshold_rms,
+							sample_rate_hz=self.settings.sound_sample_rate_hz,
+							window_seconds=poll_window,
+							arecord_device=self.settings.sound_arecord_device,
+						),
+					)
+					if result.active:
+						sound_detected = True
+						self._emit(
+							"interruptible_pause_sound_detected",
+							component="advisor",
+							context=context,
+							rms=result.rms,
+							backend=result.backend,
+							elapsed_seconds=round(elapsed, 2),
+						)
+						break
+				except Exception as exc:
+					self._emit(
+						"interruptible_pause_sound_error",
+						component="advisor",
+						context=context,
+						error=str(exc),
+					)
+					break
+				
+				elapsed += poll_window
+				# Small gap between polls
+				if elapsed < initial_timeout_seconds:
+					await asyncio.sleep(0.05)
+
+		self._emit(
+			"interruptible_pause_sound_check",
+			component="advisor",
+			context=context,
+			sound_detected=sound_detected,
+		)
+
+		if not sound_detected:
+			# No sound - user didn't want to interrupt, continue with task
+			self._emit("interruptible_pause_timeout", component="advisor", context=context)
+			return None
+
+		# Sound detected! User wants to say something.
+		# Acknowledge and switch to full listening mode
+		ack_prompt = "Ok, was möchtest du?" if is_german else "Ok, what's your request?"
+		self._emit(
+			"interruptible_pause_acknowledged",
+			component="advisor",
+			context=context,
+			ack_prompt=ack_prompt,
+		)
+		await self._speak(ack_prompt)
+		self._ledger.append(f"Assistant: {ack_prompt}")
+
+		# Now listen fully like a normal conversation (up to 3 minutes)
+		self._emit("interruptible_pause_full_listen", component="advisor", context=context)
+		try:
+			transcript = await self._listen_once()
+		except Exception as exc:
+			self._emit(
+				"interruptible_pause_listen_error",
+				component="advisor",
+				context=context,
+				error=str(exc),
+			)
+			return None
+
+		# Check if we got meaningful input
+		if transcript and not self._is_bad_transcript(transcript):
+			self._emit(
+				"interruptible_pause_input",
+				component="advisor",
+				context=context,
+				chars=len(transcript),
+				preview=transcript[:100],
+			)
+			return transcript
+
+		self._emit("interruptible_pause_no_input", component="advisor", context=context)
+		return None
+
+	async def _silent_interrupt_check(
+		self,
+		timeout_seconds: float = 1.5,
+		context: str = "silent_check",
+	) -> str | None:
+		"""Silently check for sound and listen if detected, WITHOUT speaking any prompt.
+
+		This allows the human to interrupt at key moments without the robot asking
+		"Do you want to say something?" every time - which is annoying.
+
+		Args:
+			timeout_seconds: How long to check for sound activity
+			context: Label for logging
+
+		Returns:
+			The transcript if meaningful speech was detected, None otherwise.
+		"""
+		self._emit("silent_interrupt_check_start", component="advisor", context=context)
+
+		# Check for sound activity without speaking
+		sound_detected = False
+		if self.settings.sound_enabled and not self._dry_run:
+			poll_window = min(self.settings.sound_window_seconds, 0.5)
+			elapsed = 0.0
+			
+			while elapsed < timeout_seconds and not sound_detected:
+				try:
+					loop = asyncio.get_running_loop()
+					result = await loop.run_in_executor(
+						None,
+						lambda: detect_sound_activity(
+							threshold_rms=self.settings.sound_threshold_rms,
+							sample_rate_hz=self.settings.sound_sample_rate_hz,
+							window_seconds=poll_window,
+							arecord_device=self.settings.sound_arecord_device,
+						),
+					)
+					if result.active:
+						sound_detected = True
+						self._emit(
+							"silent_interrupt_sound_detected",
+							component="advisor",
+							context=context,
+							rms=result.rms,
+							backend=result.backend,
+							elapsed_seconds=round(elapsed, 2),
+						)
+						break
+				except Exception as exc:
+					self._emit(
+						"silent_interrupt_sound_error",
+						component="advisor",
+						context=context,
+						error=str(exc),
+					)
+					break
+				
+				elapsed += poll_window
+				if elapsed < timeout_seconds:
+					await asyncio.sleep(0.05)
+
+		if not sound_detected:
+			self._emit("silent_interrupt_no_sound", component="advisor", context=context)
+			return None
+
+		# Sound detected - listen without asking "what do you want?"
+		# Just switch to listening mode silently
+		self._emit("silent_interrupt_listening", component="advisor", context=context)
+		try:
+			transcript = await self._listen_once()
+		except Exception as exc:
+			self._emit(
+				"silent_interrupt_listen_error",
+				component="advisor",
+				context=context,
+				error=str(exc),
+			)
+			return None
+
+		if transcript and not self._is_bad_transcript(transcript):
+			self._emit(
+				"silent_interrupt_input",
+				component="advisor",
+				context=context,
+				chars=len(transcript),
+				preview=transcript[:100],
+			)
+			return transcript
+
+		self._emit("silent_interrupt_no_input", component="advisor", context=context)
+		return None
+
 	async def _speak(self, text: str) -> None:
 		t = (text or "").strip()
 		if not t:
@@ -1916,6 +2196,157 @@ class AdvisorAgent:
 		)
 		if self.settings.wait_for_speech_finish:
 			await self._wait_for_speech_completion(context="after_speak")
+
+	# ========== STREAMING TTS METHODS ==========
+	# These methods enable low-latency streaming TTS by sending text chunks
+	# as they are generated by the LLM, rather than waiting for the full response.
+
+	async def _speak_stream_start(self) -> str | None:
+		"""Start a streaming TTS session. Returns session_id or None on failure."""
+		if self._dry_run:
+			self._emit("tool_call", tool="stream_start", component="mcp.speak", dry_run=True)
+			return "dry_run_session"
+		
+		# Use HTTP directly since MCP may not expose the streaming endpoints
+		speak_url = self.settings.speak_mcp_url
+		# Convert MCP URL to HTTP API URL (e.g., http://127.0.0.1:8601/mcp -> http://127.0.0.1:8001)
+		import urllib.parse
+		parsed = urllib.parse.urlparse(speak_url)
+		# MCP port is typically API port + 600
+		api_port = parsed.port - 600 if parsed.port else 8001
+		api_url = f"{parsed.scheme}://{parsed.hostname}:{api_port}/stream/start"
+		
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="stream_start", component="mcp.speak", url=api_url)
+		
+		try:
+			import aiohttp
+			async with aiohttp.ClientSession() as session:
+				async with session.post(api_url, timeout=aiohttp.ClientTimeout(total=10.0)) as resp:
+					data = await resp.json()
+					if not data.get("ok"):
+						raise RuntimeError(data.get("detail", "stream_start failed"))
+					session_id = data.get("session_id")
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="stream_start",
+				component="mcp.speak",
+				url=api_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return None
+		
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit(
+			"tool_call_end",
+			tool="stream_start",
+			component="mcp.speak",
+			url=api_url,
+			duration_ms=round(dur_ms, 2),
+			session_id=session_id,
+		)
+		return session_id
+
+	async def _speak_stream_chunk(self, session_id: str, text: str, http_session: Any = None) -> bool:
+		"""Send a text chunk to a streaming TTS session. Returns True on success.
+		
+		Args:
+			session_id: The TTS streaming session ID
+			text: Text chunk to send
+			http_session: Optional aiohttp.ClientSession to reuse (faster)
+		"""
+		if not session_id or not text:
+			return False
+		
+		if self._dry_run:
+			self._emit("tool_call", tool="stream_chunk", component="mcp.speak", dry_run=True, text=text[:50])
+			return True
+		
+		speak_url = self.settings.speak_mcp_url
+		import urllib.parse
+		parsed = urllib.parse.urlparse(speak_url)
+		api_port = parsed.port - 600 if parsed.port else 8001
+		api_url = f"{parsed.scheme}://{parsed.hostname}:{api_port}/stream/chunk"
+		
+		try:
+			import aiohttp
+			
+			async def do_request(session: aiohttp.ClientSession) -> bool:
+				async with session.post(
+					api_url,
+					json={"session_id": session_id, "text": text},
+					timeout=aiohttp.ClientTimeout(total=5.0),
+				) as resp:
+					data = await resp.json()
+					return bool(data.get("ok"))
+			
+			if http_session is not None:
+				return await do_request(http_session)
+			else:
+				async with aiohttp.ClientSession() as session:
+					return await do_request(session)
+		except Exception as exc:
+			self._emit(
+				"tool_call_error",
+				tool="stream_chunk",
+				component="mcp.speak",
+				error=str(exc),
+			)
+			return False
+
+	async def _speak_stream_end(self, session_id: str) -> bool:
+		"""End a streaming TTS session. Returns True on success."""
+		if not session_id:
+			return False
+		
+		if self._dry_run:
+			self._emit("tool_call", tool="stream_end", component="mcp.speak", dry_run=True)
+			return True
+		
+		speak_url = self.settings.speak_mcp_url
+		import urllib.parse
+		parsed = urllib.parse.urlparse(speak_url)
+		api_port = parsed.port - 600 if parsed.port else 8001
+		api_url = f"{parsed.scheme}://{parsed.hostname}:{api_port}/stream/end"
+		
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="stream_end", component="mcp.speak", url=api_url, session_id=session_id)
+		
+		try:
+			import aiohttp
+			async with aiohttp.ClientSession() as session:
+				async with session.post(
+					api_url,
+					json={"session_id": session_id},
+					timeout=aiohttp.ClientTimeout(total=10.0),
+				) as resp:
+					data = await resp.json()
+					success = bool(data.get("ok"))
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="stream_end",
+				component="mcp.speak",
+				url=api_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return False
+		
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit(
+			"tool_call_end",
+			tool="stream_end",
+			component="mcp.speak",
+			url=api_url,
+			duration_ms=round(dur_ms, 2),
+			success=success,
+		)
+		return success
 
 	async def _speaker_status(self) -> dict[str, Any]:
 		if self._dry_run:
@@ -2329,6 +2760,219 @@ class AdvisorAgent:
 		# Fallback: treat model output as plain speech.
 		return (raw, None, [])
 
+	async def _decide_and_respond_streaming(
+		self,
+		*,
+		human_text: str,
+		observation: str | None,
+		memory_hint: str | None,
+	) -> tuple[str, bool | None, list[dict[str, Any]]]:
+		"""Streaming version of _decide_and_respond that speaks text as it arrives.
+		
+		This method streams the LLM response and sends text chunks to TTS as they arrive,
+		significantly reducing the time to first audio. The full response is still accumulated
+		for parsing actions and need_observe.
+		
+		Returns the same tuple as _decide_and_respond: (response_text, need_observe, actions)
+		"""
+		if self._dry_run:
+			# Minimal, deterministic behavior for test runs.
+			if observation and observation.strip():
+				return (f"(dry_run) Based on what I see: {observation.strip()}", None, [])
+			return (f"(dry_run) I heard: {human_text.strip()}", None, [])
+
+		brain = await self._ensure_brain()
+
+		obs_block = ""
+		if observation and observation.strip():
+			obs_block = f"\n\nObservation (camera):\n{observation.strip()}\n"
+
+		mem_block = ""
+		if memory_hint and memory_hint.strip():
+			mem_block = "\n\nMemory report (from memorizer agent):\n" + memory_hint.strip() + "\n"
+
+		mem = self.settings.memory
+		max_chars_budget = int(mem.max_tokens) * max(1, int(mem.avg_chars_per_token))
+		ctx = self._conversation_context(max_chars=min(8000, max(1200, max_chars_budget // 10)))
+		ctx_block = ""
+		if ctx:
+			ctx_block = "\n\nConversation so far (most recent last):\n" + ctx + "\n"
+
+		todo_block = self._todo_status_block()
+		todo_policy = self._todo_policy_block()
+
+		# Modified prompt that asks for speech text FIRST, then JSON metadata
+		# This allows us to stream the speech text while the model is still generating
+		lang = self.settings.response_language
+		prompt = (
+			"You are responding to a human speaking to the robot.\n"
+			"The robot MUST speak in language: "
+			+ str(lang)
+			+ ".\n\n"
+			"IMPORTANT OUTPUT FORMAT FOR STREAMING:\n"
+			"1. First, output the text the robot should say (response_text)\n"
+			"2. Then output a separator line: ---JSON---\n"
+			"3. Then output a JSON object with: {\"need_observe\": boolean, \"actions\": array}\n\n"
+			"Example output:\n"
+			"Hallo! Ich schaue mich mal um.\n"
+			"---JSON---\n"
+			"{\"need_observe\": false, \"actions\": [{\"type\": \"head_scan\", \"pattern\": \"sweep\"}]}\n\n"
+			"Allowed action types:\n"
+			"- head_center, head_set_angles (pan_deg, tilt_deg), head_scan (pattern, duration_s)\n"
+			"- guarded_drive (speed: -100..100, steer_deg, duration_s: 0.1-10.0)\n"
+			"- safety_stop, estop_on, estop_off\n"
+			"- memory_recall (query: string), memory_store (content: string, tags?: string[])\n\n"
+			+ ctx_block
+			+ f"Human said: {human_text.strip()}"
+			+ obs_block
+			+ mem_block
+			+ todo_block
+			+ todo_policy
+		)
+
+		start = time.perf_counter()
+		self._emit(
+			"brain_call_start",
+			component="advisor.brain",
+			kind="decide_and_respond_streaming",
+			has_observation=bool(observation and observation.strip()),
+		)
+
+		# Start streaming TTS session
+		session_id = await self._speak_stream_start()
+		if not session_id:
+			# Fallback to non-streaming if TTS streaming unavailable
+			self._emit("streaming_fallback", component="advisor", reason="tts_session_failed")
+			return await self._decide_and_respond(
+				human_text=human_text,
+				observation=observation,
+				memory_hint=memory_hint,
+			)
+
+		full_response = ""
+		speech_text = ""
+		json_part = ""
+		separator_seen = False
+		pending_speech_chunk = ""  # Buffer to reduce HTTP calls
+		chunk_send_threshold = 40  # Send to TTS every ~40 chars (faster first response)
+		
+		# Create a persistent HTTP session for all chunk requests (much faster)
+		import aiohttp
+		async with aiohttp.ClientSession() as http_session:
+			try:
+				async for update in brain.run_stream(prompt):
+					# Extract text from the update
+					chunk_text = ""
+					if hasattr(update, "contents"):
+						for content in update.contents:
+							if hasattr(content, "text") and content.text:
+								chunk_text += str(content.text)
+					elif hasattr(update, "text"):
+						chunk_text = str(update.text)
+					elif hasattr(update, "content"):
+						chunk_text = str(update.content)
+					
+					if not chunk_text:
+						continue
+					
+					full_response += chunk_text
+					
+					# Check for JSON separator
+					if not separator_seen:
+						# Look for the separator in accumulated text
+						if "---JSON---" in full_response:
+							separator_seen = True
+							parts = full_response.split("---JSON---", 1)
+							speech_text = parts[0].strip()
+							json_part = parts[1] if len(parts) > 1 else ""
+							
+							# Send any remaining buffered speech text before separator
+							if pending_speech_chunk.strip():
+								await self._speak_stream_chunk(session_id, pending_speech_chunk, http_session)
+								pending_speech_chunk = ""
+						else:
+							# Still in speech section - buffer chunks to reduce HTTP calls
+							pending_speech_chunk += chunk_text
+							speech_text = full_response.strip()
+							
+							# Send when buffer is big enough
+							if len(pending_speech_chunk) >= chunk_send_threshold:
+								await self._speak_stream_chunk(session_id, pending_speech_chunk, http_session)
+								pending_speech_chunk = ""
+					else:
+						# In JSON section, accumulate for parsing
+						json_part += chunk_text
+				
+				# Send any remaining buffered speech
+				if pending_speech_chunk.strip():
+					await self._speak_stream_chunk(session_id, pending_speech_chunk, http_session)
+			
+			except Exception as exc:
+				self._emit(
+					"brain_stream_error",
+					component="advisor.brain",
+					error=str(exc),
+				)
+				# End TTS session on error
+				await self._speak_stream_end(session_id)
+				raise
+
+		# End TTS streaming session
+		await self._speak_stream_end(session_id)
+
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit(
+			"brain_call_end",
+			component="advisor.brain",
+			kind="decide_and_respond_streaming",
+			duration_ms=round(dur_ms, 2),
+			speech_chars=len(speech_text),
+			json_chars=len(json_part),
+		)
+
+		# Parse the JSON metadata
+		need_observe: bool | None = None
+		actions: list[dict[str, Any]] = []
+		
+		if json_part.strip():
+			try:
+				# Clean up JSON (remove markdown code blocks if present)
+				json_clean = json_part.strip()
+				if json_clean.startswith("```"):
+					json_clean = re.sub(r"^```(?:json)?\s*", "", json_clean)
+					json_clean = re.sub(r"\s*```$", "", json_clean)
+				
+				obj = json.loads(json_clean)
+				if isinstance(obj, dict):
+					need_observe = bool(obj.get("need_observe")) if "need_observe" in obj else None
+					actions = list(obj.get("actions") or []) if "actions" in obj else []
+			except Exception as parse_exc:
+				self._emit(
+					"json_parse_error",
+					component="advisor.brain",
+					error=str(parse_exc),
+					json_preview=json_part[:200],
+				)
+
+		# If no separator was found, try to parse as original JSON format
+		if not separator_seen:
+			decision = self._parse_decision_json(full_response)
+			if decision is not None and decision.response_text is not None:
+				return (decision.response_text, decision.need_observe, decision.actions)
+			# Fallback: treat entire output as speech
+			speech_text = full_response.strip()
+
+		self._emit(
+			"decision",
+			component="advisor.brain",
+			need_observe=need_observe,
+			has_observation=bool(observation and observation.strip()),
+			response_preview=speech_text[:100] if speech_text else "(empty)",
+			streaming=True,
+		)
+
+		return (speech_text or full_response.strip(), need_observe, actions)
+
 	def _is_multi_step_request(self, text: str) -> bool:
 		"""Check if a user request might need multi-step task planning."""
 		# Debug: log entry point
@@ -2421,7 +3065,9 @@ class AdvisorAgent:
 			tasks=[t.get("title") for t in tasks],
 		)
 
-		# Step 1b: Review the plan (optional) - ask LLM if it's sufficient
+		# Step 1b: Review the plan (optional) - LLM checks if plan is sufficient
+		# NOTE: If not approved, we auto-modify WITHOUT asking the user to avoid annoying re-asks.
+		# The LLM decides autonomously if the plan needs adjustments.
 		if self.settings.todo.review_after_planning:
 			review_result = await self._llm_todo.review_plan()
 			self._emit(
@@ -2435,16 +3081,7 @@ class AdvisorAgent:
 			if not review_result.get("approved", True):
 				suggestion = review_result.get("suggestion")
 				if suggestion:
-					# Modify the plan based on the suggestion
-					ask_modify = (
-						f"Ich habe {len(tasks)} Schritte geplant, aber vielleicht sollte ich: {suggestion}. Soll ich den Plan anpassen?"
-						if is_german
-						else f"I planned {len(tasks)} steps, but maybe I should: {suggestion}. Should I adjust the plan?"
-					)
-					await self._speak(ask_modify)
-					self._ledger.append(f"Assistant: {ask_modify}")
-
-					# Auto-modify the plan based on the suggestion
+					# Auto-modify the plan based on the suggestion - NO user confirmation needed
 					self._emit("llm_task_plan_modify", component="advisor.llm_todo", suggestion=suggestion)
 					await self._llm_todo.modify_plan(suggestion)
 					tasks = await self._llm_todo.get_next_task()  # Refresh tasks
@@ -2453,14 +3090,44 @@ class AdvisorAgent:
 					else:
 						tasks = [tasks]  # Just get the list from the agent
 
-		# Announce the plan
+		# Brief announcement - just say "OK" and get going (no detailed plan explanation)
 		plan_announcement = (
-			f"Okay, ich habe {len(self._llm_todo._tasks)} Schritte geplant. Los geht's!"
+			"OK, los geht's."
 			if is_german
-			else f"Okay, I've planned {len(self._llm_todo._tasks)} steps. Let's go!"
+			else "OK, let's go."
 		)
 		await self._speak(plan_announcement)
 		self._ledger.append(f"Assistant: {plan_announcement}")
+
+		# Silent brief listen - allow human to interrupt before starting, but don't ask/prompt
+		# This preserves the ability to interrupt without annoying "Say something or I start" prompts.
+		self._emit("silent_interrupt_check_start", component="advisor", context="before_task_execution")
+		human_input = await self._silent_interrupt_check(timeout_seconds=1.0)
+		if human_input:
+			# Human said something - check if they want to modify the plan
+			low = human_input.lower()
+			modify_cues = ("änder", "change", "add", "hinzufüg", "mehr", "more", "anders", "different", "warte", "wait", "stop", "nein", "no")
+			if any(cue in low for cue in modify_cues):
+				# Human wants to modify - let them add to the plan
+				self._emit("plan_modification_requested", component="advisor", input=human_input[:100])
+				modify_response = (
+					"Okay, was soll ich ändern oder hinzufügen?"
+					if is_german
+					else "Okay, what should I change or add?"
+				)
+				await self._speak(modify_response)
+				self._ledger.append(f"Assistant: {modify_response}")
+
+				# Listen for their modification
+				modification = await self._listen_briefly(timeout_seconds=5.0)
+				if modification and not self._is_bad_transcript(modification):
+					self._ledger.append(f"Human: {modification}")
+					# Re-plan with the modification
+					combined_request = f"{user_request}. Außerdem: {modification}" if is_german else f"{user_request}. Also: {modification}"
+					await self._llm_todo.modify_plan(modification)
+					self._emit("plan_modified", component="advisor", modification=modification[:100])
+
+		self._emit("task_execution_starting", component="advisor", task_count=len(self._llm_todo._tasks))
 
 		# Step 2: Execute tasks ONE BY ONE with waiting
 		completed_count = 0
@@ -2662,8 +3329,31 @@ class AdvisorAgent:
 					result=task_result[:100] if task_result else None,
 				)
 
-				# Small pause between tasks for natural pacing
-				await asyncio.sleep(0.3)
+				# Check if there are more tasks - allow silent interrupt check between tasks
+				# NOTE: We do NOT speak "Soll ich weitermachen?" - that's annoying.
+				# Instead, we silently check for sound and only listen if user starts talking.
+				if self._llm_todo.has_pending_tasks():
+					# Silent brief check for human interruption between tasks
+					human_input_between = await self._silent_interrupt_check(
+						timeout_seconds=1.0,
+						context="between_tasks",
+					)
+					if human_input_between:
+						# Human wants to adjust - handle the input
+						self._emit(
+							"llm_task_interrupted_between",
+							component="advisor.llm_todo",
+							completed_so_far=completed_count,
+							human_input=human_input_between[:50],
+						)
+						# Add the human input to the ledger and let the brain decide
+						self._ledger.append(f"User: {human_input_between}")
+						# Break out of the loop to handle the new input
+						# The human's input will be processed in the next interaction cycle
+						break
+				else:
+					# Last task - just a small pause
+					await asyncio.sleep(0.3)
 
 			except Exception as exc:
 				self._emit(
@@ -2684,6 +3374,9 @@ class AdvisorAgent:
 		)
 
 		# Step 4: Review if mission is complete (optional)
+		# Step 4: Review if mission is complete (optional)
+		# NOTE: We do this review silently and only act if LLM suggests important missing tasks.
+		# We do NOT ask the user "should I do more?" for every trivial thing.
 		if self.settings.todo.review_after_completion:
 			review_result = await self._llm_todo.review_completion()
 			self._emit(
@@ -2696,86 +3389,76 @@ class AdvisorAgent:
 			if not review_result.get("complete", True):
 				additional_tasks = review_result.get("additional_tasks")
 				if additional_tasks:
-					# Ask the user if they want to continue
-					ask_continue = (
-						f"Ich habe {completed_count} Schritte erledigt. Aber vielleicht sollte ich noch mehr tun: "
-						f"{', '.join(t.get('title', '?') for t in additional_tasks[:3])}. Soll ich weitermachen?"
-						if is_german
-						else f"I completed {completed_count} steps. But maybe I should do more: "
-						f"{', '.join(t.get('title', '?') for t in additional_tasks[:3])}. Should I continue?"
-					)
-					await self._speak(ask_continue)
-					self._ledger.append(f"Assistant: {ask_continue}")
-
-					# Add the tasks for potential future execution
-					# The user can say "ja" in the next interaction to trigger them
-					await self._llm_todo.add_tasks(additional_tasks)
-
+					# Don't ask - just do it if there are obvious follow-up tasks
+					# This reduces unnecessary "should I continue?" questions
 					self._emit(
-						"llm_task_additional_suggested",
+						"llm_task_additional_auto_execute",
 						component="advisor.llm_todo",
 						additional_count=len(additional_tasks),
 					)
+					# Add the tasks and continue execution
+					await self._llm_todo.add_tasks(additional_tasks)
+					# Don't speak anything - just continue executing the additional tasks
+					# The loop will continue in the next iteration
 
-					# Don't clear the todo list - keep it for potential continuation
-					return ask_continue
-
+		# Simple completion message - just "Fertig!" (short and sweet)
 		final_response = (
-			f"Fertig! Ich habe alle {completed_count} Schritte abgeschlossen."
+			"Fertig!"
 			if is_german
-			else f"Done! I completed all {completed_count} steps."
+			else "Done!"
 		)
 
 		# Speak the completion message
 		await self._speak(final_response)
 		self._ledger.append(f"Assistant: {final_response}")
 
-		# Brief listen to allow human to add more tasks or interrupt
-		self._emit("state", component="advisor", state="brief_listen_after_completion")
-		brief_text = await self._listen_briefly()
-		if brief_text and not self._is_bad_transcript(brief_text):
+		# Silent interrupt check after completion - allow user to add more without asking
+		# NOTE: We do NOT ask "Zufrieden?" - that's annoying. User will speak if needed.
+		self._emit("state", component="advisor", state="completion_silent_check")
+		human_feedback = await self._silent_interrupt_check(
+			timeout_seconds=1.5,
+			context="after_completion",
+		)
+		
+		if human_feedback and not self._is_bad_transcript(human_feedback):
 			self._emit(
-				"brief_listen_result",
+				"completion_feedback",
 				component="advisor",
-				chars=len(brief_text),
-				preview=brief_text[:100],
+				chars=len(human_feedback),
+				preview=human_feedback[:100],
 			)
-			# Human said something - handle it as a new request
-			self._ledger.append(f"Human: {brief_text}")
+			# Human said something - handle it as new request
+			self._ledger.append(f"Human: {human_feedback}")
 
 			# Check for stop words first
-			if self._matches_stop_word(brief_text):
-				self._emit("interrupt", component="advisor", kind="stop_word", transcript=brief_text)
+			if self._matches_stop_word(human_feedback):
+				self._emit("interrupt", component="advisor", kind="stop_word", transcript=human_feedback)
 				self._llm_todo.clear()
 				return None  # Caller will not speak anything
 
-			# Check if it's a continuation or new request
-			# If user says something like "ja", "weiter", "continue" - check for pending tasks
-			low = brief_text.lower().strip()
-			if low in {"ja", "yes", "weiter", "continue", "mach weiter", "go on", "ok", "okay"}:
-				# User wants to continue - but we already completed everything
-				no_more = (
-					"Alle Aufgaben sind erledigt. Was möchtest du als nächstes?"
-					if is_german
-					else "All tasks are done. What would you like next?"
-				)
-				await self._speak(no_more)
-				self._ledger.append(f"Assistant: {no_more}")
+			# Check if it's a positive response (happy with result) - just acknowledge briefly
+			low = human_feedback.lower().strip()
+			positive_responses = {
+				"ja", "yes", "gut", "good", "super", "toll", "great", "perfekt", "perfect",
+				"danke", "thanks", "thank you", "ok", "okay", "passt", "alles klar",
+				"zufrieden", "happy", "fine", "cool", "nice", "wunderbar", "excellent"
+			}
+			if low in positive_responses or any(p in low for p in positive_responses):
+				# User is happy - just acknowledge very briefly
 				self._llm_todo.clear()
-				return None
+				return None  # No need to say "Super, freut mich!" - "Fertig!" was enough
 
-			# User said something else - treat it as a new request
-			# Re-plan and execute with the new request
+			# User said something else - treat it as new task/request
 			self._llm_todo.clear()
-			self._emit("state", component="advisor", state="follow_up_request")
-			return await self._plan_and_execute_tasks_llm(brief_text)
+			self._emit("state", component="advisor", state="adjustment_request")
+			return await self._plan_and_execute_tasks_llm(human_feedback)
 		else:
 			self._emit(
-				"brief_listen_result",
+				"completion_feedback",
 				component="advisor",
 				chars=0,
 				preview=None,
-				reason="no_speech_or_bad_transcript",
+				reason="no_speech_or_timeout",
 			)
 
 		# Clear the todo list
@@ -3080,7 +3763,23 @@ class AdvisorAgent:
 		mem_hint = await self._memorizer_recall(text)
 		if mem_hint:
 			self._ledger.append(f"[recall] {mem_hint}")
-		response, need_observe, actions = await self._decide_and_respond(human_text=text, observation=obs, memory_hint=mem_hint)
+		
+		# Use streaming TTS if enabled (reduces latency by speaking as LLM generates)
+		# Note: With streaming, we speak first, then handle actions. This is a tradeoff.
+		use_streaming = bool(self.settings.streaming_tts_enabled) and not self._dry_run
+		
+		if use_streaming:
+			self._emit("state", component="advisor", state="interaction_think_streaming")
+			response, need_observe, actions = await self._decide_and_respond_streaming(
+				human_text=text, observation=obs, memory_hint=mem_hint
+			)
+			# Note: With streaming, speech has already been sent during generation
+			speech_already_streamed = True
+		else:
+			response, need_observe, actions = await self._decide_and_respond(
+				human_text=text, observation=obs, memory_hint=mem_hint
+			)
+			speech_already_streamed = False
 
 		# If the brain proposed safe actions, execute them before speaking.
 		# Special handling for memory_recall: if present, get memory and re-decide with results
@@ -3107,26 +3806,46 @@ class AdvisorAgent:
 				combined_mem_hint += f"Memory search results:\n{memory_recall_result}"
 				
 				self._emit("state", component="advisor", state="interaction_think_with_memory")
+				# Re-deciding after memory recall uses non-streaming (original response was likely incomplete)
 				response, need_observe, remaining_actions = await self._decide_and_respond(
 					human_text=text, 
 					observation=obs, 
 					memory_hint=combined_mem_hint
 				)
+				speech_already_streamed = False  # Need to speak this new response
 				# Execute remaining non-memory actions
 				non_memory_actions = [a for a in actions if str(a.get("type") or "").strip().lower() not in ("memory_recall",)]
 				if non_memory_actions:
 					action_results = await self._execute_planned_actions(non_memory_actions)
 					self._ledger.append(f"[actions] {action_results}")
+					# Check if we were interrupted
+					if action_results and action_results[-1].get("type") == "_interrupted":
+						human_input = action_results[-1].get("human_input", "")
+						self._emit("interaction_interrupted", component="advisor", human_input=human_input[:100])
+						# Handle the interruption - recurse with new input
+						await self._maybe_summarize_and_reset()
+						await self._interaction_step(human_input)
+						return
 			else:
 				# No memory results, execute all actions normally
 				action_results = await self._execute_planned_actions(actions)
 				self._ledger.append(f"[actions] {action_results}")
+				# Check if we were interrupted
+				if action_results and action_results[-1].get("type") == "_interrupted":
+					human_input = action_results[-1].get("human_input", "")
+					self._emit("interaction_interrupted", component="advisor", human_input=human_input[:100])
+					# Handle the interruption - recurse with new input
+					await self._maybe_summarize_and_reset()
+					await self._interaction_step(human_input)
+					return
 
 		# If the brain asked for an observation and we haven't taken one yet, do it once.
 		if need_observe is True and not (obs and obs.strip()):
 			self._emit("state", component="advisor", state="interaction_observe_assist")
 			obs = await self._observe(f"Help answer the human request: {text}")
+			# If we need to re-decide after observation, use non-streaming (need full response for actions)
 			response, _, _ = await self._decide_and_respond(human_text=text, observation=obs, memory_hint=mem_hint)
+			speech_already_streamed = False  # Need to speak this new response
 
 		response = response.strip()
 		if not response:
@@ -3143,9 +3862,19 @@ class AdvisorAgent:
 				hint = f"{prefix} {str(nxt.get('title')).strip()}"
 				if hint.lower() not in response.lower():
 					response = response.rstrip() + "\n\n" + hint
+					# If we're adding a hint, need to speak it (even if main response was streamed)
+					if speech_already_streamed:
+						# Just speak the hint part
+						await self._speak(hint)
+						self._ledger.append(f"Assistant: {response}")
+						speech_already_streamed = True  # Mark as handled
 
-		self._emit("state", component="advisor", state="interaction_speak")
-		await self._speak(response)
+		# Only speak if not already streamed
+		if not speech_already_streamed:
+			self._emit("state", component="advisor", state="interaction_speak")
+			await self._speak(response)
+		else:
+			self._emit("state", component="advisor", state="interaction_speak_streamed")
 		self._ledger.append(f"Assistant: {response}")
 
 		# Ask memorizer to decide whether to store this user utterance (best-effort, non-blocking).

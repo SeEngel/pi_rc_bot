@@ -323,6 +323,9 @@ def main() -> int:
 		sys.path.insert(0, here)
 
 	from contextlib import asynccontextmanager
+	import asyncio
+	import queue
+	import uuid
 
 	from src import Speaker
 
@@ -335,6 +338,147 @@ def main() -> int:
 	current_job: subprocess.Popen[bytes] | None = None
 	current_job_started_ts: float | None = None
 	current_job_text_preview: str | None = None
+
+	# Streaming chunk state: session_id -> {"queue": Queue, "thread": Thread, "done": bool}
+	streaming_sessions: dict[str, dict[str, Any]] = {}
+	streaming_sessions_lock = threading.Lock()
+
+	def _streaming_worker(session_id: str, sp: Speaker) -> None:
+		"""Worker thread that consumes chunks from a queue and speaks them.
+		
+		Hybrid Strategy for optimal latency:
+		1. FIRST FLUSH: Speak as soon as we have ~60-100 chars at a sentence boundary
+		   This gives fast time-to-first-audio while the LLM continues generating.
+		2. FINAL FLUSH: Collect ALL remaining text and speak it in ONE call.
+		   This minimizes total API calls (usually just 2 total).
+		
+		Why this works:
+		- OpenAI TTS with stream=True starts playing immediately
+		- Each API call has ~200-500ms overhead
+		- So 2 calls (first sentence + rest) is much faster than 5+ calls
+		"""
+		with streaming_sessions_lock:
+			session = streaming_sessions.get(session_id)
+			if session is None:
+				return
+			q: queue.Queue[str | None] = session["queue"]
+		
+		buffer = ""
+		first_flush_done = False
+		first_flush_min_chars = 60   # Minimum chars for first flush
+		first_flush_max_chars = 150  # Don't wait longer than this for first flush
+		sentence_enders = ('.', '!', '?', '\n')
+		
+		while True:
+			try:
+				# Short timeout - we want to react quickly
+				chunk = q.get(timeout=0.5)
+			except queue.Empty:
+				# Timeout - check if we should flush
+				if not first_flush_done and buffer.strip():
+					# Haven't spoken yet but have text - maybe LLM is slow
+					# If we have a complete sentence, speak it now
+					for ender in sentence_enders:
+						idx = buffer.find(ender)
+						if idx >= 20:  # At least 20 chars is a reasonable sentence
+							to_speak = buffer[:idx + 1].strip()
+							buffer = buffer[idx + 1:]
+							if to_speak:
+								sp.say(to_speak)
+								first_flush_done = True
+							break
+				continue
+			
+			if chunk is None:  # End of stream signal
+				# FINAL FLUSH: Speak ALL remaining buffered text in ONE call
+				if buffer.strip():
+					sp.say(buffer.strip())
+				break
+			
+			buffer += chunk
+			
+			# FIRST FLUSH LOGIC: Get first response out quickly
+			if not first_flush_done:
+				# Look for a sentence boundary within acceptable range
+				for ender in sentence_enders:
+					idx = buffer.find(ender)
+					if idx >= first_flush_min_chars - 1:
+						# Found a good boundary - speak everything up to it
+						to_speak = buffer[:idx + 1].strip()
+						buffer = buffer[idx + 1:]
+						if to_speak:
+							sp.say(to_speak)
+							first_flush_done = True
+						break
+				
+				# Force first flush if buffer is getting too big (even without sentence end)
+				if not first_flush_done and len(buffer) >= first_flush_max_chars:
+					# Find best split point (comma, space)
+					split_idx = buffer.rfind(',', 0, first_flush_max_chars)
+					if split_idx < 30:
+						split_idx = buffer.rfind(' ', 30, first_flush_max_chars)
+					if split_idx < 30:
+						split_idx = first_flush_max_chars - 1
+					
+					to_speak = buffer[:split_idx + 1].strip()
+					buffer = buffer[split_idx + 1:]
+					if to_speak:
+						sp.say(to_speak)
+						first_flush_done = True
+			
+			# After first flush: Just collect everything for final flush
+			# (the while loop will continue until we get None)
+		
+		# Mark session as done
+		with streaming_sessions_lock:
+			if session_id in streaming_sessions:
+				streaming_sessions[session_id]["done"] = True
+
+	def _start_streaming_session() -> str:
+		"""Create a new streaming session and return its ID."""
+		session_id = str(uuid.uuid4())
+		sp = speaker
+		if sp is None or not sp.is_available:
+			raise RuntimeError("Speaker not available")
+		
+		q: queue.Queue[str | None] = queue.Queue()
+		
+		with streaming_sessions_lock:
+			# Stop any existing regular playback
+			with speaker_lock:
+				_stop_current_job()
+			
+			# Clean up old completed sessions
+			to_remove = [sid for sid, s in streaming_sessions.items() if s.get("done")]
+			for sid in to_remove:
+				del streaming_sessions[sid]
+			
+			# Start worker thread
+			t = threading.Thread(target=_streaming_worker, args=(session_id, sp), daemon=True)
+			streaming_sessions[session_id] = {"queue": q, "thread": t, "done": False}
+			t.start()
+		
+		return session_id
+
+	def _send_chunk(session_id: str, text: str) -> bool:
+		"""Send a text chunk to a streaming session. Returns False if session not found."""
+		with streaming_sessions_lock:
+			session = streaming_sessions.get(session_id)
+			if session is None or session.get("done"):
+				return False
+			q: queue.Queue[str | None] = session["queue"]
+		q.put(text)
+		return True
+
+	def _end_streaming_session(session_id: str) -> bool:
+		"""Signal end of stream for a session. Returns False if session not found."""
+		with streaming_sessions_lock:
+			session = streaming_sessions.get(session_id)
+			if session is None:
+				return False
+			q: queue.Queue[str | None] = session["queue"]
+		q.put(None)  # End signal
+		return True
 
 	def _stop_current_job() -> bool:
 		"""Best-effort stop of any in-flight playback job."""
@@ -519,6 +663,136 @@ def main() -> int:
 			"age_ms": age_ms,
 			"text_preview": preview,
 		}
+
+	# ========== STREAMING TTS ENDPOINTS ==========
+	# These endpoints enable low-latency streaming TTS by accepting text chunks
+	# as they are generated by the LLM, rather than waiting for the full response.
+
+	@app.post(
+		"/stream/start",
+		operation_id="stream_start",
+		summary="Start a streaming TTS session",
+		description=(
+			"Creates a new streaming TTS session. Returns a session_id that must be used "
+			"with /stream/chunk and /stream/end. Text chunks sent to /stream/chunk will be "
+			"queued and spoken as they arrive, enabling low-latency speech during LLM generation."
+		),
+	)
+	async def stream_start() -> dict[str, Any]:
+		sp = speaker
+		if sp is None:
+			raise HTTPException(status_code=503, detail="Speaker not initialized")
+		if not sp.is_available:
+			raise HTTPException(status_code=503, detail=sp.unavailable_reason or "TTS unavailable")
+		
+		try:
+			session_id = _start_streaming_session()
+		except Exception as exc:
+			raise HTTPException(status_code=500, detail=f"Failed to start streaming session: {exc}") from exc
+		
+		return {
+			"ok": True,
+			"session_id": session_id,
+		}
+
+	@app.post(
+		"/stream/chunk",
+		operation_id="stream_chunk",
+		summary="Send a text chunk to a streaming session",
+		description=(
+			"Sends a text chunk to an active streaming TTS session. Chunks are buffered "
+			"and spoken at natural sentence boundaries for smooth audio output."
+		),
+		openapi_extra={
+			"requestBody": {
+				"required": True,
+				"content": {
+					"application/json": {
+						"schema": {
+							"type": "object",
+							"properties": {
+								"session_id": {"type": "string", "description": "The streaming session ID from /stream/start"},
+								"text": {"type": "string", "description": "Text chunk to speak"},
+							},
+							"required": ["session_id", "text"],
+						},
+					}
+				},
+			}
+		},
+	)
+	async def stream_chunk(request: Request) -> dict[str, Any]:
+		raw = await request.body()
+		if not raw:
+			raise HTTPException(status_code=422, detail="Missing request body")
+		
+		try:
+			import json
+			data = json.loads(raw.decode("utf-8", errors="strict"))
+		except Exception:
+			raise HTTPException(status_code=422, detail="Invalid JSON")
+		
+		session_id = str(data.get("session_id") or "").strip()
+		text = str(data.get("text") or "")
+		
+		if not session_id:
+			raise HTTPException(status_code=422, detail="Missing session_id")
+		
+		# Empty text is allowed (no-op)
+		if not text:
+			return {"ok": True, "queued": False}
+		
+		success = _send_chunk(session_id, text)
+		if not success:
+			raise HTTPException(status_code=404, detail="Session not found or already ended")
+		
+		return {"ok": True, "queued": True}
+
+	@app.post(
+		"/stream/end",
+		operation_id="stream_end",
+		summary="End a streaming TTS session",
+		description=(
+			"Signals the end of a streaming TTS session. Any remaining buffered text "
+			"will be spoken before the session terminates."
+		),
+		openapi_extra={
+			"requestBody": {
+				"required": True,
+				"content": {
+					"application/json": {
+						"schema": {
+							"type": "object",
+							"properties": {
+								"session_id": {"type": "string", "description": "The streaming session ID to end"},
+							},
+							"required": ["session_id"],
+						},
+					}
+				},
+			}
+		},
+	)
+	async def stream_end(request: Request) -> dict[str, Any]:
+		raw = await request.body()
+		if not raw:
+			raise HTTPException(status_code=422, detail="Missing request body")
+		
+		try:
+			import json
+			data = json.loads(raw.decode("utf-8", errors="strict"))
+		except Exception:
+			raise HTTPException(status_code=422, detail="Invalid JSON")
+		
+		session_id = str(data.get("session_id") or "").strip()
+		if not session_id:
+			raise HTTPException(status_code=422, detail="Missing session_id")
+		
+		success = _end_streaming_session(session_id)
+		if not success:
+			raise HTTPException(status_code=404, detail="Session not found")
+		
+		return {"ok": True, "ended": True}
 
 	# Start the HTTP API server + a proper MCP server (separate port).
 	import asyncio

@@ -3,3 +3,4 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 openapi-to-mcp>=0.1.1
 fastmcp
+aiohttp>=3.9

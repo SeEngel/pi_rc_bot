@@ -388,6 +388,14 @@ flowchart LR
 
 **MCP Tools:** `speak {text}`, `stop {}`, `status {}`
 
+**Optional low-latency streaming (HTTP API on port 8001):**
+
+- `POST /stream/start` → `{session_id}`
+- `POST /stream/chunk` → `{session_id, text}` (send incremental text)
+- `POST /stream/end` → `{session_id}`
+
+This is used by the advisor when `interaction.streaming_tts_enabled: true` (see `agent/advisor*/config.yaml`).
+
 ---
 
 ### Listening Service
@@ -581,7 +589,7 @@ The system uses external OpenAI APIs and optional local models for various capab
 flowchart TB
     subgraph OPENAI["☁️ OpenAI API"]
         GPT4O["gpt-4o<br/><i>Vision LLM</i>"]
-        GPT4OMINI["gpt-4o-mini<br/><i>Agent reasoning</i>"]
+        GPT4OMINI["gpt-5.2<br/><i>Agent reasoning</i>"]
         WHISPER["gpt-4o-mini-transcribe<br/><i>Whisper STT</i>"]
         TTS["gpt-4o-mini-tts<br/><i>Text-to-Speech</i>"]
         EMB["text-embedding-3-small<br/><i>Memory embeddings</i>"]
@@ -628,14 +636,14 @@ flowchart TB
 
 | Model | Used By | Purpose | Input | Output |
 |-------|---------|---------|-------|--------|
-| **gpt-4o-mini** | All Agents (via `OpenAIChatClient`) | Reasoning, tool selection, response generation | System prompt + user message + tool results | Text response or tool calls |
+| **gpt-5.2** | All Agents (via `OpenAIChatClient`) | Reasoning, tool selection, response generation | System prompt + user message + tool results | Text response or tool calls |
 | **gpt-4o** | `observe` service | Vision understanding | JPEG image + question | Scene description / grid selection |
 
 **Agent LLM Flow:**
 ```mermaid
 sequenceDiagram
     participant A as Agent
-    participant LLM as OpenAI gpt-4o-mini
+    participant LLM as OpenAI gpt-5.2
     participant MCP as MCP Service
 
     A->>LLM: Instructions + User request
@@ -677,9 +685,9 @@ stt:
   openai:
     model: gpt-4o-mini-transcribe
     language: de  # ISO-639-1
-    record_seconds: 6.0
-    stop_silence_seconds: 2.0
-    energy_threshold: 300.0
+    record_seconds: 15.0
+    stop_silence_seconds: 1.0
+    energy_threshold: 900.0
 ```
 
 ---
@@ -716,9 +724,9 @@ tts:
   openai:
     model: gpt-4o-mini-tts
     voice: alloy  # alloy, echo, fable, onyx, nova, shimmer
-    instructions: "Speak warmly and clearly"
+    instructions: ""
     stream: true
-    gain: 1.5
+    gain: 1.0
     chunking: true
     max_chars: 600
 ```
@@ -762,7 +770,7 @@ vision:
 
 | Model | Used By | Purpose | Input | Output |
 |-------|---------|---------|-------|--------|
-| **text-embedding-3-small** | `memory` service | Semantic memory storage/retrieval | Text content | 1536-dim float vector |
+| **text-embedding-3-large** | `memory` service | Semantic memory storage/retrieval | Text content | 1536-dim float vector |
 
 **Embedding Flow:**
 ```mermaid
@@ -771,7 +779,7 @@ sequenceDiagram
     participant API as OpenAI embeddings.create
     participant IDX as Vector Index
 
-    M->>API: POST /embeddings<br/>model: text-embedding-3-small<br/>input: "memory content"
+    M->>API: POST /embeddings<br/>model: text-embedding-3-large<br/>input: "memory content"
     API->>M: {"data": [{"embedding": [...]}]}
     M->>IDX: Store normalized vector
     
@@ -786,7 +794,7 @@ sequenceDiagram
 ```yaml
 # services/memory/config.yaml
 embedding:
-  model: text-embedding-3-small
+    model: text-embedding-3-large
   # base_url: optional override
 ```
 
@@ -824,10 +832,10 @@ OPENAI_BASE_URL=https://your-endpoint/v1
 
 | Operation | Model | ~Tokens/Call | Frequency |
 |-----------|-------|--------------|-----------|
-| Agent reasoning | gpt-4o-mini | 500-2000 | Every user interaction |
+| Agent reasoning | gpt-5.2 | 500-2000 | Every user interaction |
 | Vision observe | gpt-4o | 1000-2000 + image | Alone mode + on-demand |
 | STT transcribe | Whisper | ~1-10s audio | Every speech input |
 | TTS speak | gpt-4o-mini-tts | ~50-600 chars | Every robot response |
-| Memory embed | text-embedding-3-small | ~50-500 | Store + recall |
+| Memory embed | text-embedding-3-large | ~50-500 | Store + recall |
 
 **Tip:** Use `dry_run: true` in config files to test without API calls
