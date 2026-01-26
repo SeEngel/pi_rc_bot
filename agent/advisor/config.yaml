@@ -32,7 +32,7 @@ advisor:
 
 openai:
   # Model used for the advisor's reasoning (NOT the vision/STT/TTS backends).
-  model: gpt-4o-mini
+  model: gpt-5.2
   base_url: ""
 
 mcp:
@@ -40,6 +40,13 @@ mcp:
   listen_mcp_url: "http://127.0.0.1:8602/mcp"
   speak_mcp_url: "http://127.0.0.1:8601/mcp"
   observe_mcp_url: "http://127.0.0.1:8603/mcp"
+
+  # Optional robot control services (enable by running the services).
+  move_mcp_url: "http://127.0.0.1:8605/mcp"
+  head_mcp_url: "http://127.0.0.1:8606/mcp"
+  proximity_mcp_url: "http://127.0.0.1:8607/mcp"
+  perception_mcp_url: "http://127.0.0.1:8608/mcp"
+  safety_mcp_url: "http://127.0.0.1:8609/mcp"
 
 memorizer:
   # If enabled, the advisor will:
@@ -63,6 +70,62 @@ memorizer:
   # Safety timeouts (seconds) so the advisor loop can't stall forever.
   ingest_timeout_seconds: 12.0
   recall_timeout_seconds: 12.0
+
+todo:
+  # Local-only todo list with optional LLM-based task planning.
+  # The advisor will:
+  # - inject todo status into its reasoning prompt (optional)
+  # - optionally always mention the next open task out loud
+  # - use LLM to decompose multi-step requests into sequential tasks
+  # - review plans before execution and after completion
+  # - generate autonomous todos in alone mode
+  enabled: true
+
+  # Path to the todo agent config.
+  # Relative paths are resolved from repo root.
+  config_path: "agent/todo/config.yaml"
+
+  # If true, always include the todo status block in the brain prompt.
+  include_in_prompt: true
+
+  # If true, the advisor will try to mention the next open task in its response.
+  mention_next_in_response: true
+
+  # If true, use LLM-based TaskPlanner for multi-step requests.
+  # Example: "fahr 2 sekunden links, dann rechts, dann schau hoch und beschreibe was du siehst"
+  # will be decomposed into individual tasks and executed sequentially.
+  use_task_planner: true
+
+  # Minimum words to trigger task planning (avoid planning for simple commands).
+  task_planner_min_words: 6
+
+  # If true, after creating a plan, ask the LLM if the plan is sufficient
+  # or if changes are needed. This enables interactive plan refinement.
+  review_after_planning: true
+
+  # If true, after completing all tasks, ask the LLM if the mission is truly
+  # complete or if additional tasks should be suggested.
+  review_after_completion: true
+
+  # If true, in alone mode (no human interaction), the advisor will generate
+  # random/autonomous todos like: look around, drive forward, tell a joke, etc.
+  # This makes the robot more "alive" when no one is talking to it.
+  autonomous_mode_enabled: true
+
+  # --- Review Settings ---
+  # If true, after planning tasks, the LLM will review and suggest changes if needed.
+  # This helps ensure the plan is complete and makes sense.
+  review_after_planning: true
+
+  # If true, after all tasks are done, the LLM will check if the mission is truly complete
+  # or if additional tasks should be suggested.
+  review_after_completion: true
+
+  # --- Autonomous Mode Settings ---
+  # If true, in alone mode the robot will generate its own random todos instead of
+  # just observing and thinking out loud.
+  # Examples: "schau nach links", "fahr ein Stück vorwärts", "erzähl einen Witz"
+  autonomous_mode_enabled: true
 
 interaction:
   # When sound is detected, we attempt STT.
@@ -106,6 +169,11 @@ interaction:
   # after speech ends so the human can be captured even if they spoke over the robot.
   post_speech_interaction_grace_seconds: 1.5
 
+  # Brief listen timeout (seconds) after completing tasks to allow human interruption.
+  # The robot will listen for this duration after saying "Fertig!" to give the human
+  # a chance to add more tasks or interrupt.
+  brief_listen_timeout_seconds: 3.0
+
   # If the transcript matches one of these, stop speech immediately.
   # (Useful when someone says "Stop!" while the robot is talking.)
   stop_words:
@@ -122,6 +190,26 @@ alone:
   observation_question: "Briefly describe what you see in front of the robot."
   max_thought_chars: 240
 
+  # Optional: enable a tiny, safety-guarded exploration move in alone mode.
+  # Uses `services/observe` tool `observe_direction` + `services/safety` tool `guarded_drive`.
+  # Kept off by default for safety.
+  explore_enabled: false
+
+  # Signed speed (-100..100). Positive drives forward.
+  explore_speed: 20
+
+  # Safety threshold for obstacle blocking.
+  explore_threshold_cm: 35.0
+
+  # Duration for "near" actions (e.g., forward/left/right).
+  explore_duration_s: 0.6
+
+  # Duration for "far" actions (e.g., go far forward/go far left/go far right).
+  explore_far_duration_s: 1.2
+
+  # If true, speak brief messages when movement is blocked/unavailable.
+  explore_speak: false
+
 sound_activity:
   # Sound activity detection.
   # The detector tries:
@@ -131,7 +219,10 @@ sound_activity:
   enabled: true
   # Tune this using the debug protocol's "sound" events.
   # Start around 250-400 for typical USB mics; increase if it triggers too easily.
-  threshold_rms: 700
+  threshold_rms: 1200
+  # Require N consecutive windows above threshold before entering interaction mode.
+  # This reduces false triggers from brief ambient noise spikes.
+  active_windows_required: 2
   sample_rate_hz: 16000
   window_seconds: 0.15
   poll_interval_seconds: 0.25

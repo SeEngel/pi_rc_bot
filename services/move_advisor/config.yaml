@@ -1,0 +1,35 @@
+# Move Advisor service configuration
+#
+# This service is the entry point of the "move cluster".
+# It accepts high-level action requests (from the brain/advisor) and executes them
+# by calling lower-level MCP services (safety, proximity, perception, move).
+
+service:
+  host: 0.0.0.0
+  port: 8011
+
+openai:
+  # Optional: if you later enable NL->action translation inside move_advisor.
+  model: gpt-5.2
+  base_url: ""
+
+mcp:
+  # Lower-level services used by the move cluster.
+  safety_mcp_url: "http://127.0.0.1:8609/mcp"
+  proximity_mcp_url: "http://127.0.0.1:8607/mcp"
+  perception_mcp_url: "http://127.0.0.1:8608/mcp"
+  move_mcp_url: "http://127.0.0.1:8605/mcp"
+
+move_advisor:
+  # If true, do not call any MCP services; return simulated responses.
+  dry_run: false
+
+  # Hard limits to keep requests safe.
+  max_speed: 100
+  max_steer_deg: 45
+  max_duration_s: 10.0
+  default_threshold_cm: 35.0
+
+  # Job retention (for /job_status polling)
+  max_jobs: 50
+  job_ttl_seconds: 600

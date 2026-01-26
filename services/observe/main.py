@@ -13,6 +13,7 @@ FASTAPI_AVAILABLE = False
 
 try:
 	from fastapi import FastAPI, HTTPException, Request
+	from pydantic import BaseModel, Field
 	import uvicorn
 
 	FASTAPI_AVAILABLE = True
@@ -25,11 +26,84 @@ except Exception:  # pragma: no cover
 	class FastAPI:  # type: ignore[no-redef]
 		pass
 
+	class BaseModel:  # type: ignore[no-redef]
+		pass
+
+	def Field(*_args, **_kwargs):  # type: ignore[no-redef]
+		return None
+
 	class HTTPException(Exception):  # type: ignore[no-redef]
 		def __init__(self, status_code: int, detail: str):
 			super().__init__(f"{status_code}: {detail}")
 
 	uvicorn = None  # type: ignore[assignment]
+
+
+if FASTAPI_AVAILABLE:
+	class ObserveRequest(BaseModel):
+		"""Optional request payload for /observe endpoint.
+
+		If body is empty or question is omitted, uses the default question from config.
+		"""
+		question: str | None = Field(
+			default=None,
+			description="Custom question/prompt to ask the vision model about what it sees. Overrides the default question from config.",
+			examples=["What objects do you see?", "Is there a person in the image?", "Describe the scene."],
+		)
+
+	class ObserveResponse(BaseModel):
+		"""Response from /observe with the vision model's description."""
+		text: str = Field(
+			description="The vision model's textual description of what it observed.",
+			examples=["I see a table with a red cup on it and a window in the background."],
+		)
+
+	class ObserveDirectionRequest(BaseModel):
+		"""Optional request payload for /observe/direction endpoint.
+
+		This endpoint overlays a 2x3 grid on the camera image and asks the vision model
+		to select a cell indicating which direction the robot should move.
+		"""
+		question: str | None = Field(
+			default=None,
+			description="Optional goal/question to guide the direction selection. E.g., 'Find the red ball' or 'Navigate to the door'.",
+			examples=["Find the red ball", "Navigate to the door", "Go towards the person"],
+		)
+
+	class GridCell(BaseModel):
+		"""Grid cell coordinates."""
+		row: int = Field(description="Row index (0=top/far, 1=bottom/near).", ge=0, le=1)
+		col: int = Field(description="Column index (0=left, 1=center, 2=right).", ge=0, le=2)
+
+	class LLMDirectionOutput(BaseModel):
+		"""Parsed output from the vision model."""
+		row: int = Field(description="Selected row (0 or 1).")
+		col: int = Field(description="Selected column (0, 1, or 2).")
+		why: str = Field(description="Model's explanation for the selection.")
+		fit: str = Field(description="Model's assessment of whether the suggested movement makes sense.")
+
+	class ObserveDirectionResponse(BaseModel):
+		"""Response from /observe/direction with movement suggestion.
+
+		The grid maps to movements:
+		- (0,0): go far left
+		- (0,1): go far forward
+		- (0,2): go far right
+		- (1,0): left
+		- (1,1): forward
+		- (1,2): right
+		"""
+		cell: GridCell = Field(description="The selected grid cell.")
+		action: str = Field(
+			description="Human-readable movement suggestion based on the cell.",
+			examples=["forward", "left", "right", "go far forward", "go far left", "go far right"],
+		)
+		why: str = Field(description="The model's explanation for selecting this direction.")
+		fit: str = Field(description="The model's assessment of whether this movement makes sense for the goal.")
+		llm: LLMDirectionOutput = Field(description="The parsed output from the vision model.")
+		parse_error: str | None = Field(default=None, description="Present if model output couldn't be parsed cleanly.")
+		llm_raw_text: str | None = Field(default=None, description="Raw model output (only present if parse_error).")
+		debug: dict[str, Any] | None = Field(default=None, description="Debug info if enabled in config.")
 
 
 def _load_dotenv(path: str) -> None:
@@ -317,6 +391,7 @@ def main() -> int:
 
 	@app.get(
 		"/healthz",
+		operation_id="healthz_healthz_get",
 		summary="Health check",
 		description="Returns service health and vision/camera availability.",
 	)

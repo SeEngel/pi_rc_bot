@@ -13,6 +13,7 @@ FASTAPI_AVAILABLE = False
 
 try:
 	from fastapi import FastAPI, HTTPException, Request
+	from pydantic import BaseModel, Field
 	import uvicorn
 
 	FASTAPI_AVAILABLE = True
@@ -25,11 +26,48 @@ except Exception:  # pragma: no cover
 	class FastAPI:  # type: ignore[no-redef]
 		pass
 
+	class BaseModel:  # type: ignore[no-redef]
+		pass
+
+	def Field(*_args, **_kwargs):  # type: ignore[no-redef]
+		return None
+
 	class HTTPException(Exception):  # type: ignore[no-redef]
 		def __init__(self, status_code: int, detail: str):
 			super().__init__(f"{status_code}: {detail}")
 
 	uvicorn = None  # type: ignore[assignment]
+
+
+if FASTAPI_AVAILABLE:
+	class ListenRequest(BaseModel):
+		"""Optional request payload for the /listen endpoint.
+
+		All fields are optional. If body is empty, defaults are used.
+		"""
+		stream: bool = Field(
+			default=False,
+			description="(Vosk only) Enable streaming mode if supported by the STT backend. Ignored for OpenAI.",
+			examples=[False, True],
+		)
+		speech_pause_seconds: float | None = Field(
+			default=None,
+			description="(OpenAI only) Stop recording after this many seconds of continuous silence AFTER speech starts. If omitted, uses config default.",
+			examples=[1.5, 2.0, 3.0],
+			ge=0.5,
+			le=10.0,
+		)
+		stop_silence_seconds: float | None = Field(
+			default=None,
+			description="Alias for speech_pause_seconds (OpenAI only).",
+			examples=[1.5, 2.0],
+		)
+
+	class ListenResponse(BaseModel):
+		"""Response from the /listen endpoint containing the recognized speech."""
+		ok: bool = Field(default=True, description="Whether the operation completed without errors.")
+		text: str = Field(description="The recognized speech text.", examples=["Hello robot, move forward"])
+		raw: dict = Field(description="Raw response from the STT backend for debugging.")
 
 
 def _load_dotenv(path: str) -> None:
@@ -310,6 +348,7 @@ def main() -> int:
 
 	@app.get(
 		"/healthz",
+		operation_id="healthz_healthz_get",
 		summary="Health check",
 		description="Returns service health and STT availability.",
 	)

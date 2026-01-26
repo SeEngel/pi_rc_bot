@@ -1,0 +1,14 @@
+## Proximity service configuration
+
+proximity:
+  dry_run: false
+
+  # Base URL of the shared hardware owner service.
+  robot_base_url: http://127.0.0.1:8010
+
+  # Default obstacle threshold (cm)
+  obstacle_threshold_cm: 35
+
+service:
+  host: 0.0.0.0
+  port: 8007

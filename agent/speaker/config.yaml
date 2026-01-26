@@ -33,7 +33,7 @@ agent:
 
 openai:
   # OpenAI chat model id used by Agent Framework's OpenAIChatClient.
-  model: gpt-4o-mini
+  model: gpt-5.2
 
   # Optional OpenAI-compatible base URL.
   # Leave empty ("") to use OpenAI default.

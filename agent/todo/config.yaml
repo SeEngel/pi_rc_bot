@@ -1,0 +1,32 @@
+# Todo Agent configuration
+#
+# This agent manages task state locally with optional LLM-based task planning.
+# - TodoAgent: local-only state manager (persistence, status)
+# - TaskPlanner: LLM-based decomposition of multi-step requests
+
+todo:
+  enabled: true
+
+  # Where to persist the todo state.
+  # Relative paths are resolved from repo root.
+  state_path: "memory/todo/state.json"
+
+  # If true, every mutation writes to state_path immediately.
+  autosave: true
+
+  # Max tasks to show in status summaries.
+  max_status_tasks: 6
+
+# TaskPlanner settings (LLM-based task decomposition)
+task_planner:
+  enabled: true
+
+  # Minimum word count to trigger multi-step planning.
+  # Short commands like "stop" or "look" don't need a plan.
+  min_words_for_planning: 6
+
+# OpenAI settings for TaskPlanner
+# (Uses the same model as the advisor by default)
+openai:
+  model: "gpt-5.2"
+  base_url: ""

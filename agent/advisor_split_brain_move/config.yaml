@@ -1,0 +1,112 @@
+# Split-brain Advisor configuration
+#
+# Compatible with agent/advisor/config.yaml.
+# Additional field:
+#   mcp.move_advisor_mcp_url
+
+advisor:
+  name: AdvisorSplitBrainMove
+  response_language: de-DE
+  #response_language: pl-PL
+  persona_instructions: |
+    You are an always-on robot advisor.
+    Be helpful, concise, and polite.
+    If you are unsure, ask a short clarifying question.
+  debug: true
+  debug_log_path: "./protocol.jsonl"
+
+openai:
+  model: gpt-5.2
+  base_url: ""
+
+mcp:
+  listen_mcp_url: "http://127.0.0.1:8602/mcp"
+  speak_mcp_url: "http://127.0.0.1:8601/mcp"
+  observe_mcp_url: "http://127.0.0.1:8603/mcp"
+
+  # Head stays in the brain cluster for now.
+  head_mcp_url: "http://127.0.0.1:8606/mcp"
+
+  # Move cluster entry point.
+  move_advisor_mcp_url: "http://127.0.0.1:8611/mcp"
+
+  # These legacy URLs are still required by the base AdvisorSettings parser,
+  # but this split-brain agent will NOT call them directly.
+  move_mcp_url: "http://127.0.0.1:8605/mcp"
+  proximity_mcp_url: "http://127.0.0.1:8607/mcp"
+  perception_mcp_url: "http://127.0.0.1:8608/mcp"
+  safety_mcp_url: "http://127.0.0.1:8609/mcp"
+
+memorizer:
+  enabled: true
+  config_path: "agent/memorizer/config.yaml"
+  ingest_user_utterances: true
+  recall_for_questions: true
+  recall_top_n: 3
+  ingest_timeout_seconds: 12.0
+  recall_timeout_seconds: 12.0
+
+todo:
+  enabled: true
+  config_path: "agent/todo/config.yaml"
+  include_in_prompt: true
+  mention_next_in_response: true
+  # LLM-based task planning for multi-step requests
+  use_task_planner: true
+  task_planner_min_words: 6
+
+  # Review settings: ask LLM to verify/improve the plan
+  review_after_planning: true
+  review_after_completion: true
+
+  # Autonomous mode: generate random todos in alone mode
+  autonomous_mode_enabled: true
+
+interaction:
+  min_transcript_chars: 3
+  max_listen_attempts: 2
+  reprompt_text: "Bitte sag das noch einmal."
+  listen_stream: false
+  interrupt_speech_on_sound: true
+  wait_for_speech_finish: true
+  speech_status_poll_interval_seconds: 0.2
+  speech_max_wait_seconds: 120.0
+  suppress_alone_mode_while_speaking: true
+  stop_speech_on_sound_while_waiting: false
+  post_speech_interaction_grace_seconds: 1.5
+  # Brief listen timeout (seconds) after completing tasks to allow human interruption
+  brief_listen_timeout_seconds: 3.0
+  stop_words:
+    - stop
+    - stopp
+    - halt
+    - genug
+
+alone:
+  think_interval_seconds: 20.0
+  observation_question: "Briefly describe what you see in front of the robot."
+  max_thought_chars: 240
+
+  # Keep exploration disabled by default.
+  explore_enabled: false
+  explore_speed: 20
+  explore_threshold_cm: 35.0
+  explore_duration_s: 0.6
+  explore_far_duration_s: 1.2
+  explore_speak: false
+
+sound_activity:
+  enabled: true
+  threshold_rms: 1200
+  active_windows_required: 2
+  sample_rate_hz: 16000
+  window_seconds: 0.15
+  poll_interval_seconds: 0.25
+  arecord_device: ""
+  fallback_to_interaction_on_error: true
+
+memory:
+  max_tokens: 30000
+  avg_chars_per_token: 4
+  summary_dir: "memory/advisor"
+  summary_max_chars: 2500

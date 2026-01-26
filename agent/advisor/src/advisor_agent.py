@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from glob import glob
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import Any
 
 from agent.src.base_agent import BaseAgentConfig, BaseWorkbenchChatAgent
 from agent.src.config import OpenAIClientConfig, load_yaml, resolve_repo_root
+from agent.todo.src import TodoAgent, TaskPlanner, TaskPlannerSettings, LLMTodoAgent, LLMTodoAgentSettings
 
 from .mcp_client import call_mcp_tool_json
 from .sound_activity import detect_sound_activity
@@ -34,6 +36,36 @@ class AdvisorMemorizerConfig:
 	# Timeouts (seconds) so the advisor loop can't stall forever.
 	ingest_timeout_seconds: float
 	recall_timeout_seconds: float
+
+@dataclass(frozen=True)
+class AdvisorTodoConfig:
+	"""Configuration for the local TodoAgent integration with optional LLM task planning."""
+
+	enabled: bool
+	# Path to agent/todo/config.yaml (absolute).
+	config_path: str
+
+	# If true, always provide todo status to the brain prompt.
+	include_in_prompt: bool
+
+	# If true, instruct the brain to always mention the next open task.
+	# (Keeps the human aware of what happens next.)
+	mention_next_in_response: bool
+
+	# If true, use LLM-based TaskPlanner to decompose multi-step requests.
+	use_task_planner: bool = True
+
+	# Minimum words to trigger task planning (avoid planning for simple commands).
+	task_planner_min_words: int = 6
+
+	# If true, review the plan after creation and ask if changes are needed.
+	review_after_planning: bool = True
+
+	# If true, review after all tasks are done to check if mission is complete.
+	review_after_completion: bool = True
+
+	# If true, enable autonomous todo generation in alone mode.
+	autonomous_mode_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -61,6 +93,13 @@ class AdvisorLedger:
 
 
 @dataclass(frozen=True)
+class AdvisorDecision:
+	response_text: str | None
+	need_observe: bool | None
+	actions: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
 class AdvisorSettings:
 	name: str
 	persona_instructions: str
@@ -75,6 +114,11 @@ class AdvisorSettings:
 	listen_mcp_url: str
 	speak_mcp_url: str
 	observe_mcp_url: str
+	move_mcp_url: str
+	head_mcp_url: str
+	proximity_mcp_url: str
+	perception_mcp_url: str
+	safety_mcp_url: str
 
 	# interaction
 	min_transcript_chars: int
@@ -89,6 +133,8 @@ class AdvisorSettings:
 	stop_speech_on_sound_while_waiting: bool
 	post_speech_interaction_grace_seconds: float
 	stop_words: list[str]
+	# Brief listen after completing tasks to allow human interruption
+	brief_listen_timeout_seconds: float
 
 	# alone
 	think_interval_seconds: float
@@ -98,6 +144,9 @@ class AdvisorSettings:
 	# sound activity
 	sound_enabled: bool
 	sound_threshold_rms: int
+	# Require this many consecutive "active" sound windows before entering interaction mode.
+	# Helps avoid false triggers from brief ambient noise spikes.
+	sound_active_windows_required: int
 	sound_sample_rate_hz: int
 	sound_window_seconds: float
 	sound_poll_interval_seconds: float
@@ -106,6 +155,15 @@ class AdvisorSettings:
 
 	memory: AdvisorMemoryConfig
 	memorizer: AdvisorMemorizerConfig
+	todo: AdvisorTodoConfig
+
+	# alone (optional exploration/motion)
+	alone_explore_enabled: bool = False
+	alone_explore_speed: int = 20
+	alone_explore_threshold_cm: float = 35.0
+	alone_explore_duration_s: float = 0.6
+	alone_explore_far_duration_s: float = 1.2
+	alone_explore_speak: bool = False
 
 
 class AdvisorBrain(BaseWorkbenchChatAgent):
@@ -131,13 +189,96 @@ class AdvisorAgent:
 		self._summary: str | None = None
 		self._brain: AdvisorBrain | None = None
 		self._memorizer: Any | None = None
+		self._todo: TodoAgent | None = None
+		self._task_planner: TaskPlanner | None = None
+		self._llm_todo: LLMTodoAgent | None = None  # New LLM-based todo agent
 		self._memorizer_task: asyncio.Task[None] | None = None
 		self._last_alone_think_ts = 0.0
 		self._force_interaction_until_ts = 0.0
+		self._sound_active_streak = 0
 		self._protocol = ProtocolLogger(enabled=bool(settings.debug), log_path=settings.debug_log_path)
 		self._protocol.open()
+		self._init_todo_agent()
+		self._init_llm_todo_agent()  # Initialize LLM todo agent
+		self._init_task_planner()
 		# Best-effort persistent memory: load newest summary file (if any) to seed this run.
 		self._load_latest_persisted_summary()
+    
+	def _init_todo_agent(self) -> None:
+		"""Initialize local TodoAgent (best-effort; must never crash startup)."""
+		try:
+			cfg = self.settings.todo
+			if not bool(cfg.enabled):
+				return
+			# The TodoAgent manages its own persistence.
+			agent = TodoAgent.from_config_yaml(cfg.config_path)
+			agent.load()
+			self._todo = agent
+			self._emit("todo_init", component="advisor.todo", enabled=True, state_path=agent.settings.state_path)
+		except Exception as exc:
+			self._emit("todo_init_warning", component="advisor.todo", error=str(exc))
+			self._todo = None
+
+	def _init_llm_todo_agent(self) -> None:
+		"""Initialize the LLM-based TodoAgent (best-effort; must never crash startup)."""
+		try:
+			cfg = self.settings.todo
+			if not bool(cfg.enabled) or not bool(cfg.use_task_planner):
+				self._emit("llm_todo_init_skip", component="advisor.llm_todo", reason="disabled_in_config")
+				return
+			if self._dry_run:
+				self._emit("llm_todo_init_skip", component="advisor.llm_todo", reason="dry_run")
+				return
+
+			# LLMTodoAgent uses the same OpenAI settings as the advisor brain.
+			llm_todo_settings = LLMTodoAgentSettings(
+				enabled=True,
+				model=self.settings.openai_model,
+				base_url=self.settings.openai_base_url,
+				env_file_path=self.settings.env_file_path,
+				language=self.settings.response_language,
+				review_after_planning=bool(cfg.review_after_planning),
+				review_after_completion=bool(cfg.review_after_completion),
+				autonomous_mode_enabled=bool(cfg.autonomous_mode_enabled),
+			)
+			self._llm_todo = LLMTodoAgent(llm_todo_settings)
+			is_enabled = self._llm_todo.is_enabled()
+			self._emit(
+				"llm_todo_init",
+				component="advisor.llm_todo",
+				enabled=True,
+				is_enabled=is_enabled,
+				model=self.settings.openai_model,
+				review_after_planning=bool(cfg.review_after_planning),
+				review_after_completion=bool(cfg.review_after_completion),
+				autonomous_mode_enabled=bool(cfg.autonomous_mode_enabled),
+			)
+		except Exception as exc:
+			self._emit("llm_todo_init_warning", component="advisor.llm_todo", error=str(exc))
+			self._llm_todo = None
+
+	def _init_task_planner(self) -> None:
+		"""Initialize the LLM-based TaskPlanner (best-effort; must never crash startup)."""
+		try:
+			cfg = self.settings.todo
+			if not bool(cfg.enabled) or not bool(cfg.use_task_planner):
+				return
+			if self._dry_run:
+				return
+
+			# TaskPlanner uses the same OpenAI settings as the advisor brain.
+			planner_settings = TaskPlannerSettings(
+				enabled=True,
+				model=self.settings.openai_model,
+				base_url=self.settings.openai_base_url,
+				env_file_path=self.settings.env_file_path,
+				min_words_for_planning=cfg.task_planner_min_words,
+			)
+			self._task_planner = TaskPlanner(planner_settings)
+			self._emit("task_planner_init", component="advisor.task_planner", enabled=True)
+		except Exception as exc:
+			self._emit("task_planner_init_warning", component="advisor.task_planner", error=str(exc))
+			self._task_planner = None
 
 	def _load_latest_persisted_summary(self) -> None:
 		"""Load the newest persisted summary into `_summary`.
@@ -232,7 +373,12 @@ class AdvisorAgent:
 		return summary or "Ich konnte gerade keine sinnvolle Zusammenfassung erzeugen."
 
 	@classmethod
-	def from_config_yaml(cls, path: str) -> "AdvisorAgent":
+	def settings_from_config_yaml(cls, path: str) -> AdvisorSettings:
+		"""Load AdvisorSettings from YAML without constructing an AdvisorAgent.
+
+		This keeps config parsing side-effect free (no protocol/todo init) so callers
+		can decide how/when to instantiate the agent (e.g. dry-run).
+		"""
 		cfg = load_yaml(path)
 		here = os.path.dirname(os.path.abspath(path))
 		repo_root = resolve_repo_root(here)
@@ -246,6 +392,7 @@ class AdvisorAgent:
 		sound_cfg = cfg.get("sound_activity", {}) if isinstance(cfg, dict) else {}
 		memory_cfg = cfg.get("memory", {}) if isinstance(cfg, dict) else {}
 		memorizer_cfg = cfg.get("memorizer", {}) if isinstance(cfg, dict) else {}
+		todo_cfg = cfg.get("todo", {}) if isinstance(cfg, dict) else {}
 
 		name = str((advisor_cfg or {}).get("name") or "AdvisorAgent")
 		persona_instructions = str((advisor_cfg or {}).get("persona_instructions") or "").strip() or "You are an always-on robot advisor."
@@ -261,6 +408,11 @@ class AdvisorAgent:
 		listen_mcp_url = str((mcp_cfg or {}).get("listen_mcp_url") or "http://127.0.0.1:8602/mcp").strip()
 		speak_mcp_url = str((mcp_cfg or {}).get("speak_mcp_url") or "http://127.0.0.1:8601/mcp").strip()
 		observe_mcp_url = str((mcp_cfg or {}).get("observe_mcp_url") or "http://127.0.0.1:8603/mcp").strip()
+		move_mcp_url = str((mcp_cfg or {}).get("move_mcp_url") or "http://127.0.0.1:8605/mcp").strip()
+		head_mcp_url = str((mcp_cfg or {}).get("head_mcp_url") or "http://127.0.0.1:8606/mcp").strip()
+		proximity_mcp_url = str((mcp_cfg or {}).get("proximity_mcp_url") or "http://127.0.0.1:8607/mcp").strip()
+		perception_mcp_url = str((mcp_cfg or {}).get("perception_mcp_url") or "http://127.0.0.1:8608/mcp").strip()
+		safety_mcp_url = str((mcp_cfg or {}).get("safety_mcp_url") or "http://127.0.0.1:8609/mcp").strip()
 
 		# Memorizer (optional, separate agent that uses services/memory MCP)
 		memorizer_enabled = bool((memorizer_cfg or {}).get("enabled") if "enabled" in (memorizer_cfg or {}) else True)
@@ -285,6 +437,53 @@ class AdvisorAgent:
 		if not os.path.isabs(memorizer_config_path):
 			memorizer_config_path = os.path.join(repo_root, memorizer_config_path)
 		memorizer_config_path = os.path.abspath(memorizer_config_path)
+        
+		# TodoAgent (local-only)
+		todo_enabled = bool((todo_cfg or {}).get("enabled") if "enabled" in (todo_cfg or {}) else True)
+		todo_config_path_raw = str((todo_cfg or {}).get("config_path") or "agent/todo/config.yaml").strip()
+		todo_config_path = todo_config_path_raw
+		if not os.path.isabs(todo_config_path):
+			todo_config_path = os.path.join(repo_root, todo_config_path)
+		todo_config_path = os.path.abspath(todo_config_path)
+		include_in_prompt = bool((todo_cfg or {}).get("include_in_prompt") if "include_in_prompt" in (todo_cfg or {}) else True)
+		mention_next_in_response = bool(
+			(todo_cfg or {}).get("mention_next_in_response")
+			if "mention_next_in_response" in (todo_cfg or {})
+			else True
+		)
+		use_task_planner = bool(
+			(todo_cfg or {}).get("use_task_planner")
+			if "use_task_planner" in (todo_cfg or {})
+			else True
+		)
+		task_planner_min_words = int((todo_cfg or {}).get("task_planner_min_words") or 6)
+		review_after_planning = bool(
+			(todo_cfg or {}).get("review_after_planning")
+			if "review_after_planning" in (todo_cfg or {})
+			else True
+		)
+		review_after_completion = bool(
+			(todo_cfg or {}).get("review_after_completion")
+			if "review_after_completion" in (todo_cfg or {})
+			else True
+		)
+		autonomous_mode_enabled = bool(
+			(todo_cfg or {}).get("autonomous_mode_enabled")
+			if "autonomous_mode_enabled" in (todo_cfg or {})
+			else True
+		)
+
+		todo = AdvisorTodoConfig(
+			enabled=bool(todo_enabled),
+			config_path=todo_config_path,
+			include_in_prompt=bool(include_in_prompt),
+			mention_next_in_response=bool(mention_next_in_response),
+			use_task_planner=bool(use_task_planner),
+			task_planner_min_words=int(task_planner_min_words),
+			review_after_planning=bool(review_after_planning),
+			review_after_completion=bool(review_after_completion),
+			autonomous_mode_enabled=bool(autonomous_mode_enabled),
+		)
 
 		min_transcript_chars = int((interaction_cfg or {}).get("min_transcript_chars") or 3)
 		max_listen_attempts = int((interaction_cfg or {}).get("max_listen_attempts") or 2)
@@ -325,13 +524,30 @@ class AdvisorAgent:
 			stop_words = [stop_words_cfg.strip().lower()]
 		if not stop_words:
 			stop_words = ["stop", "stopp", "halt", "genug"]
+		brief_listen_timeout_seconds = float(
+			(interaction_cfg or {}).get("brief_listen_timeout_seconds") or 3.0
+		)
+		brief_listen_timeout_seconds = max(0.5, min(10.0, brief_listen_timeout_seconds))
 
 		think_interval_seconds = float((alone_cfg or {}).get("think_interval_seconds") or 20.0)
 		observation_question = str((alone_cfg or {}).get("observation_question") or "Briefly describe what you see.")
 		max_thought_chars = int((alone_cfg or {}).get("max_thought_chars") or 240)
 
+		alone_explore_enabled = bool((alone_cfg or {}).get("explore_enabled") if "explore_enabled" in (alone_cfg or {}) else False)
+		alone_explore_speed = int((alone_cfg or {}).get("explore_speed") or 20)
+		alone_explore_speed = max(-100, min(100, alone_explore_speed))
+		alone_explore_threshold_cm = float((alone_cfg or {}).get("explore_threshold_cm") or 35.0)
+		alone_explore_threshold_cm = max(5.0, min(300.0, alone_explore_threshold_cm))
+		alone_explore_duration_s = float((alone_cfg or {}).get("explore_duration_s") or 0.6)
+		alone_explore_duration_s = max(0.1, min(5.0, alone_explore_duration_s))
+		alone_explore_far_duration_s = float((alone_cfg or {}).get("explore_far_duration_s") or 1.2)
+		alone_explore_far_duration_s = max(0.1, min(8.0, alone_explore_far_duration_s))
+		alone_explore_speak = bool((alone_cfg or {}).get("explore_speak") if "explore_speak" in (alone_cfg or {}) else False)
+
 		sound_enabled = bool((sound_cfg or {}).get("enabled"))
 		sound_threshold_rms = int((sound_cfg or {}).get("threshold_rms") or 800)
+		sound_active_windows_required = int((sound_cfg or {}).get("active_windows_required") or 1)
+		sound_active_windows_required = max(1, min(10, sound_active_windows_required))
 		sound_sample_rate_hz = int((sound_cfg or {}).get("sample_rate_hz") or 16000)
 		sound_window_seconds = float((sound_cfg or {}).get("window_seconds") or 0.15)
 		sound_poll_interval_seconds = float((sound_cfg or {}).get("poll_interval_seconds") or 0.25)
@@ -360,44 +576,90 @@ class AdvisorAgent:
 			recall_timeout_seconds=float(recall_timeout_seconds),
 		)
 
-		return cls(
-			AdvisorSettings(
-				name=name,
-				persona_instructions=persona_instructions,
-				debug=debug,
-				debug_log_path=debug_log_path,
-				response_language=response_language,
-				openai_model=openai_model,
-				openai_base_url=openai_base_url,
-				env_file_path=env_file_path,
-				listen_mcp_url=listen_mcp_url,
-				speak_mcp_url=speak_mcp_url,
-				observe_mcp_url=observe_mcp_url,
-				min_transcript_chars=min_transcript_chars,
-				max_listen_attempts=max_listen_attempts,
-				reprompt_text=reprompt_text,
-				listen_stream=listen_stream,
-				interrupt_speech_on_sound=interrupt_speech_on_sound,
-				wait_for_speech_finish=wait_for_speech_finish,
-				speech_status_poll_interval_seconds=speech_status_poll_interval_seconds,
-				speech_max_wait_seconds=speech_max_wait_seconds,
-				suppress_alone_mode_while_speaking=suppress_alone_mode_while_speaking,
-				stop_speech_on_sound_while_waiting=stop_speech_on_sound_while_waiting,
-				post_speech_interaction_grace_seconds=post_speech_interaction_grace_seconds,
-				stop_words=stop_words,
-				think_interval_seconds=think_interval_seconds,
-				observation_question=observation_question,
-				max_thought_chars=max_thought_chars,
-				sound_enabled=sound_enabled,
-				sound_threshold_rms=sound_threshold_rms,
-				sound_sample_rate_hz=sound_sample_rate_hz,
-				sound_window_seconds=sound_window_seconds,
-				sound_poll_interval_seconds=sound_poll_interval_seconds,
-				sound_arecord_device=sound_arecord_device,
-				sound_fallback_to_interaction_on_error=sound_fallback_to_interaction_on_error,
-				memory=mem,
-				memorizer=memorizer,
-			)
+		return AdvisorSettings(
+			name=name,
+			persona_instructions=persona_instructions,
+			debug=debug,
+			debug_log_path=debug_log_path,
+			response_language=response_language,
+			openai_model=openai_model,
+			openai_base_url=openai_base_url,
+			env_file_path=env_file_path,
+			listen_mcp_url=listen_mcp_url,
+			speak_mcp_url=speak_mcp_url,
+			observe_mcp_url=observe_mcp_url,
+			move_mcp_url=move_mcp_url,
+			head_mcp_url=head_mcp_url,
+			proximity_mcp_url=proximity_mcp_url,
+			perception_mcp_url=perception_mcp_url,
+			safety_mcp_url=safety_mcp_url,
+			min_transcript_chars=min_transcript_chars,
+			max_listen_attempts=max_listen_attempts,
+			reprompt_text=reprompt_text,
+			listen_stream=listen_stream,
+			interrupt_speech_on_sound=interrupt_speech_on_sound,
+			wait_for_speech_finish=wait_for_speech_finish,
+			speech_status_poll_interval_seconds=speech_status_poll_interval_seconds,
+			speech_max_wait_seconds=speech_max_wait_seconds,
+			suppress_alone_mode_while_speaking=suppress_alone_mode_while_speaking,
+			stop_speech_on_sound_while_waiting=stop_speech_on_sound_while_waiting,
+			post_speech_interaction_grace_seconds=post_speech_interaction_grace_seconds,
+			stop_words=stop_words,
+			brief_listen_timeout_seconds=brief_listen_timeout_seconds,
+			think_interval_seconds=think_interval_seconds,
+			observation_question=observation_question,
+			max_thought_chars=max_thought_chars,
+			alone_explore_enabled=alone_explore_enabled,
+			alone_explore_speed=alone_explore_speed,
+			alone_explore_threshold_cm=alone_explore_threshold_cm,
+			alone_explore_duration_s=alone_explore_duration_s,
+			alone_explore_far_duration_s=alone_explore_far_duration_s,
+			alone_explore_speak=alone_explore_speak,
+			sound_enabled=sound_enabled,
+			sound_threshold_rms=sound_threshold_rms,
+			sound_active_windows_required=sound_active_windows_required,
+			sound_sample_rate_hz=sound_sample_rate_hz,
+			sound_window_seconds=sound_window_seconds,
+			sound_poll_interval_seconds=sound_poll_interval_seconds,
+			sound_arecord_device=sound_arecord_device,
+			sound_fallback_to_interaction_on_error=sound_fallback_to_interaction_on_error,
+			memory=mem,
+			memorizer=memorizer,
+			todo=todo,
+		)
+
+	@classmethod
+	def from_config_yaml(cls, path: str) -> "AdvisorAgent":
+		settings = cls.settings_from_config_yaml(path)
+		return cls(settings)
+
+	def _todo_status_block(self) -> str:
+		cfg = self.settings.todo
+		if not bool(cfg.enabled) or not bool(cfg.include_in_prompt):
+			return ""
+		agent = self._todo
+		if agent is None:
+			return ""
+		try:
+			status = agent.status_text().strip()
+		except Exception:
+			return ""
+		if not status:
+			return ""
+		return "\n\nTodo status (local):\n" + status + "\n"
+
+	def _todo_policy_block(self) -> str:
+		cfg = self.settings.todo
+		if not bool(cfg.enabled) or not bool(cfg.include_in_prompt):
+			return ""
+		if not bool(cfg.mention_next_in_response):
+			return ""
+		return (
+			"\n\nTodo policy:\n"
+			"- Always keep the human aware of what happens next.\n"
+			"- After answering, include the next OPEN todo item in your spoken response.\n"
+			"- If there is no open task, explicitly say that there are no open tasks.\n"
+			"- If the human changes the plan, acknowledge and ask for a new short step list if needed.\n"
 		)
 
 	async def _ensure_memorizer(self) -> Any:
@@ -529,6 +791,15 @@ class AdvisorAgent:
 			+ str(lang)
 			+ ".\n"
 			"Keep responses short unless the user asks for detail.\n"
+			"\n"
+			"IMPORTANT about audio errors:\n"
+			"If you receive error messages about audio recording (e.g. 'recording too short', "
+			"'no speech detected', 'audio duration less than X seconds'), these are NORMAL technical "
+			"occurrences that happen when the user didn't speak long enough or there was background noise.\n"
+			"DO NOT try to 'fix' or 'solve' these errors. DO NOT discuss the technical details.\n"
+			"Simply ask the user briefly if they said something, e.g. 'Did you say something?' or "
+			"'I didn't catch that, could you repeat?'\n"
+			"Never mention specific error messages or technical audio parameters to the user.\n"
 			+ seed
 		)
 
@@ -562,6 +833,22 @@ class AdvisorAgent:
 		if memorizer is not None:
 			try:
 				await memorizer.__aexit__(None, None, None)
+			except Exception:
+				pass
+		# Clean up TaskPlanner
+		task_planner = self._task_planner
+		self._task_planner = None
+		if task_planner is not None:
+			try:
+				await task_planner.close()
+			except Exception:
+				pass
+		# Clean up LLMTodoAgent
+		llm_todo = self._llm_todo
+		self._llm_todo = None
+		if llm_todo is not None:
+			try:
+				await llm_todo.close()
 			except Exception:
 				pass
 		self._protocol.close()
@@ -684,6 +971,150 @@ class AdvisorAgent:
 				return None
 			return out_s
 
+	async def _get_memory_mcp_url(self) -> str | None:
+		"""Get the memory MCP URL from the memorizer agent's settings."""
+		try:
+			memorizer = await self._ensure_memorizer()
+			return getattr(memorizer.settings, "memory_mcp_url", None)
+		except Exception:
+			return None
+
+	async def _memorizer_recall_direct(self, query: str) -> str | None:
+		"""Direct memory recall via MCP (LLM-triggered, bypasses heuristics).
+
+		This is called when the Brain decides to use memory_recall action.
+		Unlike _memorizer_recall, this doesn't use the MemorizerAgent LLM,
+		it calls the memory MCP directly.
+		"""
+		if self._dry_run:
+			return "(dry_run) Memory recall not available"
+		if not self.settings.memorizer.enabled:
+			return None
+
+		memory_url = await self._get_memory_mcp_url()
+		if not memory_url:
+			self._emit("memory_direct_error", component="advisor.memory", action="recall", error="no_memory_url")
+			return None
+
+		start = time.perf_counter()
+		self._emit(
+			"memory_direct_call_start",
+			component="advisor.memory",
+			action="recall",
+			query=query,
+			url=memory_url,
+		)
+		try:
+			result = await asyncio.wait_for(
+				call_mcp_tool_json(
+					url=memory_url,
+					tool_name="get_top_n_memory_by_tags",
+					timeout_seconds=15.0,
+					content=query,
+					top_n=self.settings.memorizer.recall_top_n,
+					top_k_tags=5,  # Pre-filter by top 5 matching tags
+				),
+				timeout=float(self.settings.memorizer.recall_timeout_seconds),
+			)
+			dur_ms = (time.perf_counter() - start) * 1000.0
+
+			# Extract memories from MCP response - format for natural speech
+			if isinstance(result, dict):
+				# Collect memory contents only (no technical details)
+				memory_contents = []
+				for mem in result.get("short_term_memory", []):
+					content = mem.get("content", "").strip()
+					if content:
+						memory_contents.append(content)
+				for mem in result.get("long_term_memory", []):
+					content = mem.get("content", "").strip()
+					if content:
+						memory_contents.append(content)
+				
+				if memory_contents:
+					# Join memories naturally for speech
+					if len(memory_contents) == 1:
+						text = memory_contents[0]
+					else:
+						# Multiple memories - join with natural connectors
+						text = " Außerdem: ".join(memory_contents)
+				else:
+					text = None  # No memories found
+			else:
+				text = str(result) if result else None
+
+			self._emit(
+				"memory_direct_call_end",
+				component="advisor.memory",
+				action="recall",
+				duration_ms=round(dur_ms, 2),
+				result_preview=str(text)[:300] if text else None,
+			)
+			return str(text).strip() if text else None
+
+		except asyncio.TimeoutError:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit("memory_direct_error", component="advisor.memory", action="recall", duration_ms=round(dur_ms, 2), error="timeout")
+			return None
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit("memory_direct_error", component="advisor.memory", action="recall", duration_ms=round(dur_ms, 2), error=str(exc))
+			return None
+
+	async def _memorizer_store_direct(self, content: str, tags: list[str] | None = None) -> bool:
+		"""Direct memory store via MCP (LLM-triggered).
+
+		This is called when the Brain decides to use memory_store action.
+		"""
+		if self._dry_run:
+			return True
+		if not self.settings.memorizer.enabled:
+			return False
+
+		memory_url = await self._get_memory_mcp_url()
+		if not memory_url:
+			self._emit("memory_direct_error", component="advisor.memory", action="store", error="no_memory_url")
+			return False
+
+		start = time.perf_counter()
+		self._emit(
+			"memory_direct_call_start",
+			component="advisor.memory",
+			action="store",
+			content_preview=content[:100],
+			tags=tags,
+			url=memory_url,
+		)
+		try:
+			await asyncio.wait_for(
+				call_mcp_tool_json(
+					url=memory_url,
+					tool_name="store_memory",
+					timeout_seconds=15.0,
+					content=content,
+					tags=tags or [],
+				),
+				timeout=float(self.settings.memorizer.ingest_timeout_seconds),
+			)
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"memory_direct_call_end",
+				component="advisor.memory",
+				action="store",
+				duration_ms=round(dur_ms, 2),
+				ok=True,
+			)
+			return True
+
+		except asyncio.TimeoutError:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit("memory_direct_error", component="advisor.memory", action="store", duration_ms=round(dur_ms, 2), error="timeout")
+			return False
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit("memory_direct_error", component="advisor.memory", action="store", duration_ms=round(dur_ms, 2), error=str(exc))
+			return False
+
 	async def _memorizer_ingest_background(self, text: str) -> None:
 		"""Ask memorizer to decide whether to store the user utterance.
 
@@ -767,6 +1198,21 @@ class AdvisorAgent:
 		low = t.lower()
 		if low in {"(dry_run)", "[unk]", "unk", "", "..."}:
 			return True
+		# Audio error messages from listen service - these are not real transcripts
+		audio_error_markers = (
+			"recording too short",
+			"audio duration",
+			"less than",
+			"no speech detected",
+			"speech not detected",
+			"audio error",
+			"microphone error",
+			"aufnahme zu kurz",
+			"keine sprache erkannt",
+		)
+		for marker in audio_error_markers:
+			if marker in low:
+				return True
 		return False
 
 	def _matches_stop_word(self, text: str) -> bool:
@@ -827,8 +1273,328 @@ class AdvisorAgent:
 		)
 		return any(k in low for k in keywords)
 
-	def _parse_decision_json(self, raw: str) -> tuple[str | None, bool | None]:
-		"""Parse a brain JSON response. Returns (response_text, need_observe)."""
+	@staticmethod
+	def _parse_number_with_unit(text: str, *, unit_words: tuple[str, ...]) -> float | None:
+		"""Extract a floating point number with a unit (e.g. "0.7 sek")."""
+		low = (text or "").lower()
+		if not low:
+			return None
+		# Require an explicit unit word to reduce accidental matches (e.g., a speed value).
+		pat = r"(\d+(?:[\.,]\d+)?)\s*(?:" + "|".join([re.escape(u) for u in unit_words]) + r")\b"
+		m = re.search(pat, low)
+		if not m:
+			return None
+		try:
+			return float(m.group(1).replace(",", "."))
+		except Exception:
+			return None
+
+	@staticmethod
+	def _parse_speed(text: str) -> int | None:
+		low = (text or "").lower()
+		m = re.search(r"\b(?:speed|tempo|geschwindigkeit)\s*(?:ist\s*)?(\-?\d{1,3})\b", low)
+		if not m:
+			return None
+		try:
+			v = int(m.group(1))
+			return max(-100, min(100, v))
+		except Exception:
+			return None
+
+	async def _proximity_distance_cm(self) -> float | None:
+		if self._dry_run:
+			return 100.0
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="distance_cm", component="mcp.proximity", url=self.settings.proximity_mcp_url)
+		try:
+			res = await call_mcp_tool_json(url=self.settings.proximity_mcp_url, tool_name="distance_cm", timeout_seconds=5.0)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="distance_cm",
+				component="mcp.proximity",
+				url=self.settings.proximity_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return None
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit(
+			"tool_call_end",
+			tool="distance_cm",
+			component="mcp.proximity",
+			url=self.settings.proximity_mcp_url,
+			duration_ms=round(dur_ms, 2),
+			result_keys=sorted([str(k) for k in res.keys()]) if isinstance(res, dict) else None,
+		)
+		if isinstance(res, dict):
+			try:
+				v = res.get("distance_cm")
+				return float(v) if v is not None else None
+			except Exception:
+				return None
+		return None
+
+	async def _safety_stop(self) -> None:
+		if self._dry_run:
+			self._emit("tool_call", tool="stop", component="mcp.safety", dry_run=True)
+			return
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="stop", component="mcp.safety", url=self.settings.safety_mcp_url)
+		try:
+			await call_mcp_tool_json(url=self.settings.safety_mcp_url, tool_name="stop", timeout_seconds=10.0)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="stop",
+				component="mcp.safety",
+				url=self.settings.safety_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit("tool_call_end", tool="stop", component="mcp.safety", url=self.settings.safety_mcp_url, duration_ms=round(dur_ms, 2))
+
+	async def _safety_estop_on(self) -> None:
+		if self._dry_run:
+			self._emit("tool_call", tool="estop_on", component="mcp.safety", dry_run=True)
+			return
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="estop_on", component="mcp.safety", url=self.settings.safety_mcp_url)
+		try:
+			await call_mcp_tool_json(url=self.settings.safety_mcp_url, tool_name="estop_on", timeout_seconds=5.0)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="estop_on",
+				component="mcp.safety",
+				url=self.settings.safety_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit("tool_call_end", tool="estop_on", component="mcp.safety", url=self.settings.safety_mcp_url, duration_ms=round(dur_ms, 2))
+
+	async def _safety_estop_off(self) -> None:
+		if self._dry_run:
+			self._emit("tool_call", tool="estop_off", component="mcp.safety", dry_run=True)
+			return
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="estop_off", component="mcp.safety", url=self.settings.safety_mcp_url)
+		try:
+			await call_mcp_tool_json(url=self.settings.safety_mcp_url, tool_name="estop_off", timeout_seconds=5.0)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="estop_off",
+				component="mcp.safety",
+				url=self.settings.safety_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit("tool_call_end", tool="estop_off", component="mcp.safety", url=self.settings.safety_mcp_url, duration_ms=round(dur_ms, 2))
+
+	async def _safety_guarded_drive(
+		self,
+		*,
+		speed: int,
+		steer_deg: int = 0,
+		duration_s: float | None = None,
+		threshold_cm: float | None = None,
+		await_completion: bool = False,
+	) -> dict[str, Any] | None:
+		"""Execute a guarded drive command.
+
+		Args:
+			speed: Signed speed percentage (-100 to 100).
+			steer_deg: Steering angle in degrees (-35 to 35).
+			duration_s: Duration in seconds. If provided, the motion runs for this long.
+			threshold_cm: Obstacle detection threshold in cm.
+			await_completion: If True, wait for the motion duration to complete before returning.
+				This is useful for sequential task execution where the next task should
+				only start after this motion is done.
+		"""
+		if self._dry_run:
+			self._emit(
+				"tool_call",
+				tool="guarded_drive",
+				component="mcp.safety",
+				dry_run=True,
+				speed=int(speed),
+				steer_deg=int(steer_deg),
+				duration_s=duration_s,
+				threshold_cm=threshold_cm,
+				await_completion=await_completion,
+			)
+			# In dry-run mode, still simulate the wait if requested
+			if await_completion and duration_s is not None and duration_s > 0:
+				await asyncio.sleep(float(duration_s))
+			return {"ok": True, "dry_run": True}
+		payload: dict[str, Any] = {"speed": int(speed), "steer_deg": int(steer_deg)}
+		if duration_s is not None:
+			payload["duration_s"] = float(duration_s)
+		if threshold_cm is not None:
+			payload["threshold_cm"] = float(threshold_cm)
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="guarded_drive", component="mcp.safety", url=self.settings.safety_mcp_url, await_completion=await_completion, **payload)
+		try:
+			res = await call_mcp_tool_json(url=self.settings.safety_mcp_url, tool_name="guarded_drive", timeout_seconds=10.0, **payload)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="guarded_drive",
+				component="mcp.safety",
+				url=self.settings.safety_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return None
+
+		# If await_completion is requested and the motion was started successfully,
+		# wait for the duration to elapse. The move service spawns a subprocess that
+		# runs for duration_s, but returns immediately. We need to wait here.
+		if await_completion and duration_s is not None and duration_s > 0:
+			if isinstance(res, dict) and res.get("ok") and not res.get("blocked"):
+				self._emit(
+					"tool_call_wait",
+					tool="guarded_drive",
+					component="mcp.safety",
+					wait_seconds=duration_s,
+				)
+				# Add a small buffer (0.1s) to ensure the motion subprocess completes
+				await asyncio.sleep(float(duration_s) + 0.1)
+
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit(
+			"tool_call_end",
+			tool="guarded_drive",
+			component="mcp.safety",
+			url=self.settings.safety_mcp_url,
+			duration_ms=round(dur_ms, 2),
+			result_keys=sorted([str(k) for k in res.keys()]) if isinstance(res, dict) else None,
+		)
+		return res if isinstance(res, dict) else {"ok": True, "value": res}
+
+	async def _head_set_angles(self, *, pan_deg: int | None = None, tilt_deg: int | None = None) -> None:
+		if self._dry_run:
+			self._emit("tool_call", tool="set_angles", component="mcp.head", dry_run=True, pan_deg=pan_deg, tilt_deg=tilt_deg)
+			return
+		payload: dict[str, Any] = {}
+		if pan_deg is not None:
+			payload["pan_deg"] = int(pan_deg)
+		if tilt_deg is not None:
+			payload["tilt_deg"] = int(tilt_deg)
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="set_angles", component="mcp.head", url=self.settings.head_mcp_url, **payload)
+		try:
+			await call_mcp_tool_json(url=self.settings.head_mcp_url, tool_name="set_angles", timeout_seconds=10.0, **payload)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="set_angles",
+				component="mcp.head",
+				url=self.settings.head_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit("tool_call_end", tool="set_angles", component="mcp.head", url=self.settings.head_mcp_url, duration_ms=round(dur_ms, 2))
+
+	async def _head_center(self) -> None:
+		if self._dry_run:
+			self._emit("tool_call", tool="center", component="mcp.head", dry_run=True)
+			return
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="center", component="mcp.head", url=self.settings.head_mcp_url)
+		try:
+			await call_mcp_tool_json(url=self.settings.head_mcp_url, tool_name="center", timeout_seconds=10.0)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="center",
+				component="mcp.head",
+				url=self.settings.head_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit("tool_call_end", tool="center", component="mcp.head", url=self.settings.head_mcp_url, duration_ms=round(dur_ms, 2))
+
+	async def _head_stop(self) -> None:
+		if self._dry_run:
+			self._emit("tool_call", tool="stop", component="mcp.head", dry_run=True)
+			return
+		try:
+			await call_mcp_tool_json(url=self.settings.head_mcp_url, tool_name="stop", timeout_seconds=5.0)
+		except Exception:
+			return
+
+	async def _try_handle_robot_command(self, text: str) -> str | None:
+		low = (text or "").strip().lower()
+		if not low:
+			return None
+
+		# Emergency stop.
+		if any(k in low for k in ("notaus", "not-aus", "emergency stop", "e-stop", "estop")):
+			await self._speaker_stop()
+			await self._safety_estop_on()
+			await self._safety_stop()
+			return "Not-Aus aktiviert. Ich stoppe sofort."
+
+		# Release estop.
+		if any(k in low for k in ("notaus aus", "not-aus aus", "estop aus", "e-stop aus", "release estop")):
+			await self._safety_estop_off()
+			return "Not-Aus deaktiviert."
+
+		# Distance query.
+		if any(k in low for k in ("abstand", "wie weit", "distance", "how far")):
+			d = await self._proximity_distance_cm()
+			if d is None:
+				return "Ich kann den Abstand gerade nicht messen."
+			return f"Der Abstand nach vorne ist ungefähr {int(round(d))} Zentimeter."
+
+		# Head/look commands.
+		# Head and motion commands are handled by the LLM to properly parse natural language.
+		# The LLM has access to head MCP tools (set_angles, scan, center) and will use them
+		# based on understanding the user's intent.
+
+		# Perception quick checks.
+		if any(k in low for k in ("gesicht", "faces", "people", "person", "personen", "menschen")) and any(
+			k in low for k in ("siehst", "siehst du", "do you see", "see", "erkennst", "detect")
+		):
+			res = await self._perception_detect()
+			if not isinstance(res, dict) or not bool(res.get("ok")):
+				return "Ich kann gerade keine Erkennung durchführen."
+			faces = res.get("faces") if isinstance(res.get("faces"), list) else []
+			people = res.get("people") if isinstance(res.get("people"), list) else []
+			if faces:
+				return f"Ich sehe {len(faces)} Gesicht(er)."
+			if people:
+				return f"Ich sehe {len(people)} Person(en), aber keine klaren Gesichter."
+			return "Ich sehe keine Personen oder Gesichter."
+
+		return None
+
+	def _parse_decision_json(self, raw: str) -> AdvisorDecision | None:
+		"""Parse a brain JSON response.
+
+		Supported shapes:
+		- v1: {"response_text": str, "need_observe": bool}
+		- v2: {"response_text": str, "need_observe": bool, "actions": [ {"type": ..., ...}, ... ]}
+		"""
 		def _strip_code_fence(s: str) -> str:
 			s = (s or "").strip()
 			if not s.startswith("```"):
@@ -869,9 +1635,9 @@ class AdvisorAgent:
 			# One more try on the original (in case the JSON wasn't inside the code fence).
 			obj = _try_load_json(raw or "")
 		if obj is None:
-			return (None, None)
+			return None
 		if not isinstance(obj, dict):
-			return (None, None)
+			return None
 		resp = obj.get("response_text")
 		need = obj.get("need_observe")
 		resp_s = str(resp).strip() if resp is not None else None
@@ -884,7 +1650,148 @@ class AdvisorAgent:
 			need_b = need.strip().lower() in {"true", "1", "yes", "y"}
 		else:
 			need_b = None
-		return (resp_s if resp_s else None, need_b)
+
+		actions_raw = obj.get("actions")
+		actions: list[dict[str, Any]] = []
+		if isinstance(actions_raw, list):
+			for item in actions_raw:
+				if isinstance(item, dict):
+					actions.append({str(k): v for k, v in item.items()})
+		# Cap to avoid runaway behavior (increased from 3 to 10 for multi-step tasks).
+		actions = actions[:10]
+		return AdvisorDecision(response_text=(resp_s if resp_s else None), need_observe=need_b, actions=actions)
+
+	async def _execute_planned_actions(
+		self,
+		actions: list[dict[str, Any]],
+		*,
+		await_completion: bool = False,
+	) -> list[dict[str, Any]]:
+		"""Execute a small, whitelisted set of actions suggested by the brain.
+
+		This is intentionally conservative: unknown actions are ignored.
+
+		Args:
+			actions: List of action dicts with 'type' and parameters.
+			await_completion: If True, wait for time-based actions (like drive) to complete
+				before returning. This is essential for sequential task execution.
+		"""
+		results: list[dict[str, Any]] = []
+		if not actions:
+			return results
+
+		for a in actions[:10]:
+			atype = str(a.get("type") or a.get("action") or "").strip().lower()
+			if not atype:
+				continue
+
+			res: dict[str, Any] = {"type": atype, "ok": True}
+			try:
+				# --- Head ---
+				if atype in {"head_center", "center_head", "look_center"}:
+					await self._head_center()
+				elif atype in {"head_set_angles", "set_head_angles", "look"}:
+					pan = a.get("pan_deg")
+					tilt = a.get("tilt_deg")
+					pan_i = int(pan) if pan is not None else None
+					tilt_i = int(tilt) if tilt is not None else None
+					if pan_i is not None:
+						pan_i = max(-90, min(90, pan_i))
+					if tilt_i is not None:
+						tilt_i = max(-35, min(35, tilt_i))
+					await self._head_set_angles(pan_deg=pan_i, tilt_deg=tilt_i)
+				elif atype in {"head_scan", "scan", "look_around"}:
+					pattern = str(a.get("pattern") or "sweep")
+					duration_s = float(a.get("duration_s") or 3.0)
+					duration_s = max(0.5, min(10.0, duration_s))
+					if self._dry_run:
+						self._emit(
+							"tool_call",
+							tool="scan",
+							component="mcp.head",
+							dry_run=True,
+							pattern=pattern,
+							duration_s=duration_s,
+						)
+						# Simulate wait in dry-run mode if await_completion
+						if await_completion:
+							await asyncio.sleep(duration_s)
+					else:
+						await call_mcp_tool_json(
+							url=self.settings.head_mcp_url,
+							tool_name="scan",
+							timeout_seconds=5.0,
+							pattern=pattern,
+							duration_s=duration_s,
+						)
+						# Head scan is typically blocking on the service side,
+						# but wait anyway if requested
+						if await_completion:
+							await asyncio.sleep(duration_s)
+
+				# --- Safety / Motion ---
+				elif atype in {"stop", "safety_stop", "halt"}:
+					await self._safety_stop()
+				elif atype in {"estop_on", "e_stop", "emergency_stop"}:
+					await self._speaker_stop()
+					await self._safety_estop_on()
+					await self._safety_stop()
+				elif atype in {"estop_off", "release_estop"}:
+					await self._safety_estop_off()
+				elif atype in {"guarded_drive", "drive", "move"}:
+					speed = int(a.get("speed") if a.get("speed") is not None else a.get("speed_pct") or 25)
+					steer = int(a.get("steer_deg") if a.get("steer_deg") is not None else 0)
+					duration_s = float(a.get("duration_s") or 0.7)
+					threshold_cm = float(a.get("threshold_cm") or 35.0)
+					speed = max(-100, min(100, speed))
+					steer = max(-45, min(45, steer))
+					duration_s = max(0.1, min(10.0, duration_s))
+					threshold_cm = max(5.0, min(150.0, threshold_cm))
+					drive_res = await self._safety_guarded_drive(
+						speed=speed,
+						steer_deg=steer,
+						duration_s=duration_s,
+						threshold_cm=threshold_cm,
+						await_completion=True,  # Wait for motion to complete before next action
+					)
+					res["drive_result"] = drive_res
+
+				# --- Memory Actions (LLM-triggered) ---
+				elif atype == "memory_recall":
+					query = str(a.get("query") or "").strip()
+					if query:
+						self._emit("memory_action_start", component="advisor.memory", action="recall", query=query)
+						recall_result = await self._memorizer_recall_direct(query)
+						res["recall_result"] = recall_result
+						self._emit("memory_action_end", component="advisor.memory", action="recall", result_preview=str(recall_result)[:200] if recall_result else None)
+					else:
+						res["ok"] = False
+						res["reason"] = "empty_query"
+
+				elif atype == "memory_store":
+					content = str(a.get("content") or "").strip()
+					tags = a.get("tags") or []
+					if isinstance(tags, str):
+						tags = [t.strip() for t in tags.split(",") if t.strip()]
+					if content:
+						self._emit("memory_action_start", component="advisor.memory", action="store", content_preview=content[:100])
+						store_result = await self._memorizer_store_direct(content, tags)
+						res["store_result"] = store_result
+						self._emit("memory_action_end", component="advisor.memory", action="store", ok=store_result)
+					else:
+						res["ok"] = False
+						res["reason"] = "empty_content"
+
+				# Unknown action type -> ignore (do not fail the interaction).
+				else:
+					res["ok"] = False
+					res["ignored"] = True
+					res["reason"] = "unknown_action"
+			except Exception as exc:
+				res["ok"] = False
+				res["error"] = str(exc)
+			results.append(res)
+		return results
 
 	async def _listen_once(self) -> str:
 		if self._dry_run:
@@ -918,6 +1825,61 @@ class AdvisorAgent:
 			result_keys=sorted([str(k) for k in res.keys()]) if isinstance(res, dict) else None,
 		)
 		# listening service returns {ok, text, raw}
+		text = str(res.get("text") or "")
+		return text.strip()
+
+	async def _listen_briefly(self, timeout_seconds: float | None = None) -> str:
+		"""Listen for a short time to allow human interruption.
+
+		Uses a shorter silence timeout to quickly return if no speech is detected.
+		Returns the transcript if speech was detected, or empty string otherwise.
+		"""
+		if timeout_seconds is None:
+			timeout_seconds = float(self.settings.brief_listen_timeout_seconds or 3.0)
+		timeout_seconds = max(0.5, min(10.0, timeout_seconds))
+
+		if self._dry_run:
+			self._emit("tool_call", tool="listen_briefly", component="mcp.listen", dry_run=True, timeout_seconds=timeout_seconds)
+			return ""
+		start = time.perf_counter()
+		self._emit(
+			"tool_call_start",
+			tool="listen_briefly",
+			component="mcp.listen",
+			url=self.settings.listen_mcp_url,
+			timeout_seconds=timeout_seconds,
+		)
+		payload: dict[str, Any] = {"speech_pause_seconds": timeout_seconds}
+		if self.settings.listen_stream:
+			payload["stream"] = True
+		try:
+			res = await call_mcp_tool_json(
+				url=self.settings.listen_mcp_url,
+				tool_name="listen",
+				timeout_seconds=timeout_seconds + 10.0,  # Extra margin for network
+				**payload,
+			)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="listen_briefly",
+				component="mcp.listen",
+				url=self.settings.listen_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			# Don't raise - brief listen failures should not crash the flow
+			return ""
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit(
+			"tool_call_end",
+			tool="listen_briefly",
+			component="mcp.listen",
+			url=self.settings.listen_mcp_url,
+			duration_ms=round(dur_ms, 2),
+			result_keys=sorted([str(k) for k in res.keys()]) if isinstance(res, dict) else None,
+		)
 		text = str(res.get("text") or "")
 		return text.strip()
 
@@ -1053,6 +2015,94 @@ class AdvisorAgent:
 		)
 		return str(res.get("text") or res.get("value") or res.get("raw") or "").strip()
 
+	async def _observe_direction(self, question: str | None = None) -> dict[str, Any]:
+		"""Ask the observe service to suggest a movement direction."""
+		if self._dry_run:
+			q = (question or "").strip() or "Where should the robot move next?"
+			self._emit("tool_call", tool="observe_direction", component="mcp.observe", dry_run=True, question=q)
+			return {"cell": {"row": 1, "col": 1}, "action": "forward", "why": "dry_run", "fit": "dry_run"}
+
+		q = (question or "").strip() or "Where should the robot move next to approach the most interesting object?"
+		start = time.perf_counter()
+		self._emit(
+			"tool_call_start",
+			tool="observe_direction",
+			component="mcp.observe",
+			url=self.settings.observe_mcp_url,
+			question=q,
+		)
+		try:
+			res = await call_mcp_tool_json(
+				url=self.settings.observe_mcp_url,
+				tool_name="observe_direction",
+				timeout_seconds=120.0,
+				question=q,
+			)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="observe_direction",
+				component="mcp.observe",
+				url=self.settings.observe_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return {"ok": False, "error": str(exc)}
+
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit(
+			"tool_call_end",
+			tool="observe_direction",
+			component="mcp.observe",
+			url=self.settings.observe_mcp_url,
+			duration_ms=round(dur_ms, 2),
+			result_keys=sorted([str(k) for k in res.keys()]) if isinstance(res, dict) else None,
+		)
+		return res if isinstance(res, dict) else {"ok": True, "value": res}
+
+	async def _perception_detect(self) -> dict[str, Any] | None:
+		"""Best-effort perception detection call."""
+		if self._dry_run:
+			return {"ok": True, "available": True, "dry_run": True, "faces": [], "people": []}
+		start = time.perf_counter()
+		self._emit("tool_call_start", tool="detect", component="mcp.perception", url=self.settings.perception_mcp_url)
+		try:
+			res = await call_mcp_tool_json(url=self.settings.perception_mcp_url, tool_name="detect", timeout_seconds=8.0)
+		except Exception as exc:
+			dur_ms = (time.perf_counter() - start) * 1000.0
+			self._emit(
+				"tool_call_error",
+				tool="detect",
+				component="mcp.perception",
+				url=self.settings.perception_mcp_url,
+				duration_ms=round(dur_ms, 2),
+				error=str(exc),
+			)
+			return None
+		dur_ms = (time.perf_counter() - start) * 1000.0
+		self._emit(
+			"tool_call_end",
+			tool="detect",
+			component="mcp.perception",
+			url=self.settings.perception_mcp_url,
+			duration_ms=round(dur_ms, 2),
+			result_keys=sorted([str(k) for k in res.keys()]) if isinstance(res, dict) else None,
+		)
+		return res if isinstance(res, dict) else {"ok": True, "value": res}
+
+	@staticmethod
+	def _drive_plan_from_observe_action(action: str | None, *, near_s: float, far_s: float) -> tuple[int, float]:
+		"""Map observe_direction 'action' -> (steer_deg, duration_s)."""
+		a = (action or "").strip().lower()
+		dur = float(far_s) if "far" in a else float(near_s)
+		steer = 0
+		if "left" in a:
+			steer = -25
+		elif "right" in a:
+			steer = 25
+		return (int(steer), max(0.1, float(dur)))
+
 	async def _maybe_summarize_and_reset(self) -> None:
 		if self._dry_run:
 			return
@@ -1110,18 +2160,43 @@ class AdvisorAgent:
 		self._protocol.open()
 		self._emit("memory_summarize_end", component="advisor.memory", path=path)
 
+	async def _ask_brain_simple(self, prompt: str) -> str | None:
+		"""Ask the brain LLM a simple question and get a plain text response.
+		
+		This is used for things like formatting memory results into natural speech.
+		No JSON parsing, no action handling - just text in, text out.
+		"""
+		if self._dry_run:
+			return f"(dry_run) {prompt[:50]}"
+		
+		try:
+			brain = await self._ensure_brain()
+			thread = brain.get_new_thread()
+			response = await brain._agent.run(prompt, thread=thread)
+			
+			# Extract text from response
+			if hasattr(response, "text"):
+				return str(response.text).strip()
+			elif hasattr(response, "content"):
+				return str(response.content).strip()
+			else:
+				return str(response).strip()
+		except Exception as exc:
+			self._emit("brain_simple_error", component="advisor.brain", error=str(exc))
+			return None
+
 	async def _decide_and_respond(
 		self,
 		*,
 		human_text: str,
 		observation: str | None,
 		memory_hint: str | None,
-	) -> tuple[str, bool | None]:
+	) -> tuple[str, bool | None, list[dict[str, Any]]]:
 		if self._dry_run:
 			# Minimal, deterministic behavior for test runs.
 			if observation and observation.strip():
-				return (f"(dry_run) Based on what I see: {observation.strip()}", None)
-			return (f"(dry_run) I heard: {human_text.strip()}", None)
+				return (f"(dry_run) Based on what I see: {observation.strip()}", None, [])
+			return (f"(dry_run) I heard: {human_text.strip()}", None, [])
 
 		brain = await self._ensure_brain()
 
@@ -1143,18 +2218,51 @@ class AdvisorAgent:
 		if ctx:
 			ctx_block = "\n\nConversation so far (most recent last):\n" + ctx + "\n"
 
-		# Ask for a JSON decision so we can optionally trigger observation earlier later.
+		todo_block = self._todo_status_block()
+		todo_policy = self._todo_policy_block()
+
+		# Ask for a JSON decision so we can optionally trigger observation and/or
+		# execute a small set of safe robot actions.
 		lang = self.settings.response_language
 		few_shots = (
 			"Examples (decision JSON only):\n"
 			"Human: Was siehst du?\n"
-			"Assistant: {\"response_text\": \"Einen Moment, ich schaue nach.\", \"need_observe\": true}\n\n"
+			"Assistant: {\"response_text\": \"Einen Moment, ich schaue nach.\", \"need_observe\": true, \"actions\": []}\n\n"
 			"Human: Schau mich an.\n"
-			"Assistant: {\"response_text\": \"Okay, ich schaue dich an.\", \"need_observe\": true}\n\n"
+			"Assistant: {\"response_text\": \"Okay, ich schaue dich an.\", \"need_observe\": true, \"actions\": [{\"type\":\"head_center\"}]}\n\n"
+			"Human: Schau nach oben.\n"
+			"Assistant: {\"response_text\": \"Okay, ich schaue nach oben.\", \"need_observe\": false, \"actions\": [{\"type\":\"head_set_angles\", \"tilt_deg\": 15}]}\n\n"
+			"Human: Guck mal hoch bitte.\n"
+			"Assistant: {\"response_text\": \"Okay.\", \"need_observe\": false, \"actions\": [{\"type\":\"head_set_angles\", \"tilt_deg\": 15}]}\n\n"
+			"Human: Look down.\n"
+			"Assistant: {\"response_text\": \"Okay, looking down.\", \"need_observe\": false, \"actions\": [{\"type\":\"head_set_angles\", \"tilt_deg\": -15}]}\n\n"
+			"Human: Schau nach links.\n"
+			"Assistant: {\"response_text\": \"Okay, ich schaue nach links.\", \"need_observe\": false, \"actions\": [{\"type\":\"head_set_angles\", \"pan_deg\": -30}]}\n\n"
+			"Human: Turn your head to the right.\n"
+			"Assistant: {\"response_text\": \"Okay.\", \"need_observe\": false, \"actions\": [{\"type\":\"head_set_angles\", \"pan_deg\": 30}]}\n\n"
+			"Human: Schau dich mal um.\n"
+			"Assistant: {\"response_text\": \"Okay, ich schaue mich um.\", \"need_observe\": false, \"actions\": [{\"type\":\"head_scan\", \"pattern\": \"sweep\", \"duration_s\": 3.0}]}\n\n"
+			"Human: Fahr drei Sekunden nach links.\n"
+			"Assistant: {\"response_text\": \"Okay, ich fahre drei Sekunden nach links.\", \"need_observe\": false, \"actions\": [{\"type\":\"guarded_drive\", \"speed\": 25, \"steer_deg\": -25, \"duration_s\": 3.0}]}\n\n"
+			"Human: Drive forward for 5 seconds.\n"
+			"Assistant: {\"response_text\": \"Okay, driving forward for 5 seconds.\", \"need_observe\": false, \"actions\": [{\"type\":\"guarded_drive\", \"speed\": 30, \"steer_deg\": 0, \"duration_s\": 5.0}]}\n\n"
+			"Human: Fahr mal kurz vorwärts.\n"
+			"Assistant: {\"response_text\": \"Okay.\", \"need_observe\": false, \"actions\": [{\"type\":\"guarded_drive\", \"speed\": 25, \"steer_deg\": 0, \"duration_s\": 0.7}]}\n\n"
 			"Human: Was ist vor dir?\n"
-			"Assistant: {\"response_text\": \"Einen Moment, ich beschreibe, was vor mir ist.\", \"need_observe\": true}\n\n"
+			"Assistant: {\"response_text\": \"Einen Moment, ich beschreibe, was vor mir ist.\", \"need_observe\": true, \"actions\": []}\n\n"
 			"Human: Wie spät ist es?\n"
-			"Assistant: {\"response_text\": \"Ich kann dir helfen, aber ich habe keine Uhrzeit-Sensorik.\", \"need_observe\": false}\n"
+			"Assistant: {\"response_text\": \"Ich kann dir helfen, aber ich habe keine Uhrzeit-Sensorik.\", \"need_observe\": false, \"actions\": []}\n\n"
+			# Memory examples - LLM decides when to use memory
+			"Human: Wer ist Sebastian?\n"
+			"Assistant: {\"response_text\": \"Moment, ich schaue in meinem Gedächtnis nach.\", \"need_observe\": false, \"actions\": [{\"type\":\"memory_recall\", \"query\": \"Sebastian\"}]}\n\n"
+			"Human: Erinnerst du dich an Katharina?\n"
+			"Assistant: {\"response_text\": \"Lass mich nachdenken...\", \"need_observe\": false, \"actions\": [{\"type\":\"memory_recall\", \"query\": \"Katharina\"}]}\n\n"
+			"Human: Suche in deiner Erinnerung nach meiner Familie.\n"
+			"Assistant: {\"response_text\": \"Ich schaue mal, was ich über deine Familie weiß.\", \"need_observe\": false, \"actions\": [{\"type\":\"memory_recall\", \"query\": \"Familie\"}]}\n\n"
+			"Human: Merk dir, dass ich Pizza mag.\n"
+			"Assistant: {\"response_text\": \"Okay, ich merke mir, dass du Pizza magst.\", \"need_observe\": false, \"actions\": [{\"type\":\"memory_store\", \"content\": \"Der Benutzer mag Pizza.\", \"tags\": [\"vorlieben\", \"essen\"]}]}\n\n"
+			"Human: Was weißt du über mich?\n"
+			"Assistant: {\"response_text\": \"Lass mich schauen, was ich über dich weiß.\", \"need_observe\": false, \"actions\": [{\"type\":\"memory_recall\", \"query\": \"Benutzer Informationen Vorlieben\"}]}\n"
 		)
 		prompt = (
 			"You are responding to a human speaking to the robot.\n"
@@ -1164,13 +2272,32 @@ class AdvisorAgent:
 			"You may think in English, but the returned response_text MUST be in that language.\n"
 			"Return ONLY a JSON object with keys:\n"
 			"- response_text: string (what the robot should say out loud)\n"
-			"- need_observe: boolean (true if you need camera info to answer well)\n\n"
+			"- need_observe: boolean (true if you need camera info to answer well)\n"
+			"- actions: array of small robot actions (optional; may be empty)\n\n"
+			"Allowed action types (use EXACT type strings):\n"
+			"- head_center\n"
+			"- head_set_angles (pan_deg?: int, tilt_deg?: int)\n"
+			"- head_scan (pattern?: string, duration_s?: number)\n"
+			"- guarded_drive (speed: int -100..100, steer_deg?: int, duration_s: number 0.1-10.0, threshold_cm?: number)\n"
+			"  IMPORTANT: When the user specifies a time duration (e.g. 'drive 3 seconds left'), you MUST include duration_s in the action!\n"
+			"- safety_stop\n"
+			"- estop_on\n"
+			"- estop_off\n"
+			"- memory_recall (query: string) - Search robot's memory for information about a person, topic, or fact\n"
+			"- memory_store (content: string, tags?: string[]) - Store important information in robot's memory\n"
+			"\nIMPORTANT: Use memory_recall whenever the user asks about:\n"
+			"- People (names, family, friends)\n"
+			"- Past conversations or things they told you\n"
+			"- User preferences or personal information\n"
+			"- Anything that requires remembering previous interactions\n\n"
 			+ few_shots
 			+ "\n"
 			+ ctx_block
 			+ f"Human said: {human_text.strip()}"
 			+ obs_block
 			+ mem_block
+			+ todo_block
+			+ todo_policy
 		)
 		start = time.perf_counter()
 		self._emit(
@@ -1188,19 +2315,671 @@ class AdvisorAgent:
 			duration_ms=round(dur_ms, 2),
 			raw_preview=raw,
 		)
-		resp, need_observe = self._parse_decision_json(raw)
+		decision = self._parse_decision_json(raw)
 		self._emit(
 			"decision",
 			component="advisor.brain",
-			need_observe=need_observe,
+			need_observe=(decision.need_observe if decision else None),
 			has_observation=bool(observation and observation.strip()),
-			response_preview=resp or raw,
+			response_preview=(decision.response_text if decision and decision.response_text else raw),
 		)
-		if resp is not None:
-			return (resp, need_observe)
+		if decision is not None and decision.response_text is not None:
+			return (decision.response_text, decision.need_observe, decision.actions)
 
 		# Fallback: treat model output as plain speech.
-		return (raw, None)
+		return (raw, None, [])
+
+	def _is_multi_step_request(self, text: str) -> bool:
+		"""Check if a user request might need multi-step task planning."""
+		# Debug: log entry point
+		llm_todo_available = self._llm_todo is not None
+		llm_todo_enabled = self._llm_todo.is_enabled() if llm_todo_available else False
+		self._emit("multi_step_check_entry", component="advisor", text_preview=text[:100] if text else "", llm_todo_available=llm_todo_available, llm_todo_enabled=llm_todo_enabled)
+		
+		# Check if LLMTodoAgent is available first
+		if self._llm_todo is not None and self._llm_todo.is_enabled():
+			# Use heuristics to detect multi-step requests
+			lower = (text or "").lower()
+			words = lower.split()
+			if len(words) < 6:
+				self._emit("multi_step_check", component="advisor", result=False, reason="too_few_words", word_count=len(words))
+				return False
+			# Look for German/English sequence indicators
+			multi_step_indicators = [
+				" und dann ", " dann ", " danach ", " zuerst ", " erst ",
+				" anschließend ", " nachdem ", " bevor ", " schließlich ",
+				" and then ", " then ", " after ", " first ", " next ",
+				" finally ", " before ", " sekunden ", " seconds ",
+			]
+			for indicator in multi_step_indicators:
+				if indicator in lower:
+					self._emit("multi_step_check", component="advisor", result=True, reason="indicator_found", indicator=indicator.strip())
+					return True
+			# Check for numbered lists or multiple action verbs
+			action_verbs = ["schau", "look", "fahr", "drive", "dreh", "turn", "sag", "say", "beschreib", "describe", "erzähl", "tell"]
+			verb_count = sum(1 for v in action_verbs if v in lower)
+			if verb_count >= 2:
+				self._emit("multi_step_check", component="advisor", result=True, reason="multiple_verbs", verb_count=verb_count)
+				return True
+			self._emit("multi_step_check", component="advisor", result=False, reason="no_indicators", verb_count=verb_count)
+			return False
+
+		# Fallback to TaskPlanner if available
+		if self._task_planner is not None:
+			result = self._task_planner.is_multi_step_request(text)
+			self._emit("multi_step_check", component="advisor", result=result, reason="task_planner_fallback")
+			return result
+
+		self._emit("multi_step_check", component="advisor", result=False, reason="no_planner_available")
+		return False
+
+	async def _plan_and_execute_tasks(self, user_request: str) -> str | None:
+		"""Plan tasks using LLMTodoAgent and execute them step-by-step.
+
+		The flow is:
+		1. Ask LLMTodoAgent to plan tasks from user request
+		2. Loop: ask LLMTodoAgent "what's next?" -> execute ONE task -> wait -> mark done
+		3. Repeat until no more tasks
+
+		Returns the final response to speak, or None if planning failed.
+		"""
+		# Prefer LLMTodoAgent if available, fall back to old TaskPlanner
+		if self._llm_todo is not None and self._llm_todo.is_enabled():
+			return await self._plan_and_execute_tasks_llm(user_request)
+
+		# Fallback to old TaskPlanner-based approach
+		if self._task_planner is None or self._todo is None:
+			return None
+
+		return await self._plan_and_execute_tasks_legacy(user_request)
+
+	async def _plan_and_execute_tasks_llm(self, user_request: str) -> str | None:
+		"""Execute tasks using the LLM-based TodoAgent - step by step with waiting."""
+		if self._llm_todo is None:
+			return None
+
+		self._emit("state", component="advisor", state="llm_task_planning_start")
+
+		lang = self.settings.response_language
+		is_german = str(lang).lower().startswith("de")
+
+		# Step 1: Ask LLMTodoAgent to plan tasks
+		try:
+			tasks = await self._llm_todo.plan_tasks(user_request)
+		except Exception as exc:
+			self._emit("llm_task_planning_error", component="advisor.llm_todo", error=str(exc))
+			return None
+
+		if not tasks:
+			self._emit("llm_task_planning_empty", component="advisor.llm_todo")
+			return None
+
+		self._emit(
+			"llm_task_planning_done",
+			component="advisor.llm_todo",
+			task_count=len(tasks),
+			tasks=[t.get("title") for t in tasks],
+		)
+
+		# Step 1b: Review the plan (optional) - ask LLM if it's sufficient
+		if self.settings.todo.review_after_planning:
+			review_result = await self._llm_todo.review_plan()
+			self._emit(
+				"llm_task_plan_review",
+				component="advisor.llm_todo",
+				approved=review_result.get("approved", True),
+				suggestion=review_result.get("suggestion"),
+				reason=review_result.get("reason"),
+			)
+
+			if not review_result.get("approved", True):
+				suggestion = review_result.get("suggestion")
+				if suggestion:
+					# Modify the plan based on the suggestion
+					ask_modify = (
+						f"Ich habe {len(tasks)} Schritte geplant, aber vielleicht sollte ich: {suggestion}. Soll ich den Plan anpassen?"
+						if is_german
+						else f"I planned {len(tasks)} steps, but maybe I should: {suggestion}. Should I adjust the plan?"
+					)
+					await self._speak(ask_modify)
+					self._ledger.append(f"Assistant: {ask_modify}")
+
+					# Auto-modify the plan based on the suggestion
+					self._emit("llm_task_plan_modify", component="advisor.llm_todo", suggestion=suggestion)
+					await self._llm_todo.modify_plan(suggestion)
+					tasks = await self._llm_todo.get_next_task()  # Refresh tasks
+					if tasks is None:
+						tasks = []
+					else:
+						tasks = [tasks]  # Just get the list from the agent
+
+		# Announce the plan
+		plan_announcement = (
+			f"Okay, ich habe {len(self._llm_todo._tasks)} Schritte geplant. Los geht's!"
+			if is_german
+			else f"Okay, I've planned {len(self._llm_todo._tasks)} steps. Let's go!"
+		)
+		await self._speak(plan_announcement)
+		self._ledger.append(f"Assistant: {plan_announcement}")
+
+		# Step 2: Execute tasks ONE BY ONE with waiting
+		completed_count = 0
+
+		while self._llm_todo.has_pending_tasks():
+			# Ask LLMTodoAgent: "What's the next task?"
+			next_task = await self._llm_todo.get_next_task()
+			if next_task is None:
+				break
+
+			task_id = next_task.get("id")
+			task_title = str(next_task.get("title") or "")
+			action = next_task.get("action", {})
+
+			self._emit(
+				"llm_task_execution_start",
+				component="advisor.llm_todo",
+				task_id=task_id,
+				task_title=task_title,
+				action=action,
+			)
+
+			task_result: str | None = None
+
+			try:
+				# Execute the task based on its action type
+				action_type = str(action.get("type") or "").lower()
+
+				if action_type == "observe":
+					# Just observe and describe
+					question = str(action.get("question") or "Beschreibe was du siehst.")
+					obs = await self._observe(question)
+					if obs:
+						await self._speak(obs)
+						self._ledger.append(f"Assistant: {obs}")
+					task_result = obs
+
+				elif action_type in {"head_set_angles", "set_head_angles", "look"}:
+					# Head movement with optional observe_after
+					pan = action.get("pan_deg")
+					tilt = action.get("tilt_deg")
+					observe_after = bool(action.get("observe_after", False))
+
+					# Execute head movement
+					pan_i = int(pan) if pan is not None else None
+					tilt_i = int(tilt) if tilt is not None else None
+					if pan_i is not None:
+						pan_i = max(-90, min(90, pan_i))
+					if tilt_i is not None:
+						tilt_i = max(-35, min(35, tilt_i))
+
+					self._emit(
+						"llm_task_head_move",
+						component="advisor.llm_todo",
+						task_id=task_id,
+						pan_deg=pan_i,
+						tilt_deg=tilt_i,
+					)
+
+					await self._head_set_angles(pan_deg=pan_i, tilt_deg=tilt_i)
+
+					# WAIT for head to settle (important!)
+					await asyncio.sleep(1.0)
+
+					# If observe_after, take picture and describe
+					if observe_after:
+						question = str(action.get("observe_question") or action.get("question") or "Beschreibe kurz was du siehst.")
+						self._emit(
+							"llm_task_observe_after",
+							component="advisor.llm_todo",
+							task_id=task_id,
+							question=question,
+						)
+						obs = await self._observe(question)
+						if obs:
+							await self._speak(obs)
+							self._ledger.append(f"Assistant: {obs}")
+						task_result = obs
+
+				elif action_type in {"guarded_drive", "drive", "move"}:
+					# Driving action - WAIT for completion
+					speed = int(action.get("speed") or 25)
+					steer_deg = int(action.get("steer_deg") or 0)
+					duration_s = float(action.get("duration_s") or 1.0)
+
+					speed = max(-100, min(100, speed))
+					steer_deg = max(-45, min(45, steer_deg))
+					duration_s = max(0.1, min(10.0, duration_s))
+
+					self._emit(
+						"llm_task_drive",
+						component="advisor.llm_todo",
+						task_id=task_id,
+						speed=speed,
+						steer_deg=steer_deg,
+						duration_s=duration_s,
+					)
+
+					await self._safety_guarded_drive(
+						speed=speed,
+						steer_deg=steer_deg,
+						duration_s=duration_s,
+						threshold_cm=35.0,
+						await_completion=True,  # WAIT for drive to complete
+					)
+					task_result = f"Gefahren: speed={speed}, steer={steer_deg}, {duration_s}s"
+
+				elif action_type == "speak":
+					# Just speak text
+					text = str(action.get("text") or "")
+					if text:
+						await self._speak(text)
+						self._ledger.append(f"Assistant: {text}")
+					task_result = text
+
+				elif action_type == "memory_recall":
+					# Search memory database and let LLM formulate response
+					query = str(action.get("query") or "")
+					if query:
+						self._emit(
+							"llm_task_memory_recall",
+							component="advisor.llm_todo",
+							task_id=task_id,
+							query=query,
+						)
+						recall_result = await self._memorizer_recall_direct(query)
+						if recall_result:
+							# Let the Brain LLM formulate a natural response based on memory
+							llm_prompt = (
+								f"Der Benutzer hat nach '{query}' gefragt. "
+								f"Hier sind relevante Informationen aus deinem Gedächtnis:\n\n{recall_result}\n\n"
+								f"Formuliere eine kurze, natürliche Antwort auf Deutsch basierend auf diesen Informationen. "
+								f"Antworte direkt ohne Einleitung wie 'Basierend auf meinem Gedächtnis'."
+							)
+							natural_response = await self._ask_brain_simple(llm_prompt)
+							if natural_response:
+								await self._speak(natural_response)
+								self._ledger.append(f"Assistant: {natural_response}")
+								task_result = natural_response
+							else:
+								# Fallback: speak raw result
+								await self._speak(recall_result)
+								self._ledger.append(f"Assistant: {recall_result}")
+								task_result = recall_result
+						else:
+							no_memory_msg = "Dazu habe ich leider nichts in meinem Gedächtnis gefunden."
+							await self._speak(no_memory_msg)
+							self._ledger.append(f"Assistant: {no_memory_msg}")
+							task_result = no_memory_msg
+					else:
+						task_result = "Keine Query angegeben"
+
+				elif action_type == "memory_store":
+					# Store information in memory
+					content = str(action.get("content") or "")
+					tags = action.get("tags", [])
+					if isinstance(tags, str):
+						tags = [tags]
+					if content:
+						self._emit(
+							"llm_task_memory_store",
+							component="advisor.llm_todo",
+							task_id=task_id,
+							content=content[:100],
+							tags=tags,
+						)
+						success = await self._memorizer_store_direct(content, tags)
+						if success:
+							confirm_msg = "Ich habe mir das gemerkt."
+							await self._speak(confirm_msg)
+							self._ledger.append(f"Assistant: {confirm_msg}")
+							task_result = f"Gespeichert: {content[:50]}"
+						else:
+							fail_msg = "Speichern fehlgeschlagen."
+							await self._speak(fail_msg)
+							task_result = fail_msg
+					else:
+						task_result = "Kein Inhalt zum Speichern"
+
+				else:
+					# Unknown action type - try to execute via brain
+					self._emit(
+						"llm_task_unknown_action",
+						component="advisor.llm_todo",
+						task_id=task_id,
+						action_type=action_type,
+					)
+					task_result = f"Unbekannte Aktion: {action_type}"
+
+				# Mark task as done
+				await self._llm_todo.mark_task_done(task_id, task_result)
+				completed_count += 1
+
+				self._emit(
+					"llm_task_execution_done",
+					component="advisor.llm_todo",
+					task_id=task_id,
+					task_title=task_title,
+					result=task_result[:100] if task_result else None,
+				)
+
+				# Small pause between tasks for natural pacing
+				await asyncio.sleep(0.3)
+
+			except Exception as exc:
+				self._emit(
+					"llm_task_execution_error",
+					component="advisor.llm_todo",
+					task_id=task_id,
+					task_title=task_title,
+					error=str(exc),
+				)
+				# Mark as done anyway to avoid infinite loop
+				await self._llm_todo.mark_task_done(task_id, f"Fehler: {exc}")
+
+		# Step 3: Final status
+		self._emit(
+			"llm_task_execution_complete",
+			component="advisor.llm_todo",
+			completed=completed_count,
+		)
+
+		# Step 4: Review if mission is complete (optional)
+		if self.settings.todo.review_after_completion:
+			review_result = await self._llm_todo.review_completion()
+			self._emit(
+				"llm_task_completion_review",
+				component="advisor.llm_todo",
+				complete=review_result.get("complete", True),
+				reason=review_result.get("reason"),
+			)
+
+			if not review_result.get("complete", True):
+				additional_tasks = review_result.get("additional_tasks")
+				if additional_tasks:
+					# Ask the user if they want to continue
+					ask_continue = (
+						f"Ich habe {completed_count} Schritte erledigt. Aber vielleicht sollte ich noch mehr tun: "
+						f"{', '.join(t.get('title', '?') for t in additional_tasks[:3])}. Soll ich weitermachen?"
+						if is_german
+						else f"I completed {completed_count} steps. But maybe I should do more: "
+						f"{', '.join(t.get('title', '?') for t in additional_tasks[:3])}. Should I continue?"
+					)
+					await self._speak(ask_continue)
+					self._ledger.append(f"Assistant: {ask_continue}")
+
+					# Add the tasks for potential future execution
+					# The user can say "ja" in the next interaction to trigger them
+					await self._llm_todo.add_tasks(additional_tasks)
+
+					self._emit(
+						"llm_task_additional_suggested",
+						component="advisor.llm_todo",
+						additional_count=len(additional_tasks),
+					)
+
+					# Don't clear the todo list - keep it for potential continuation
+					return ask_continue
+
+		final_response = (
+			f"Fertig! Ich habe alle {completed_count} Schritte abgeschlossen."
+			if is_german
+			else f"Done! I completed all {completed_count} steps."
+		)
+
+		# Speak the completion message
+		await self._speak(final_response)
+		self._ledger.append(f"Assistant: {final_response}")
+
+		# Brief listen to allow human to add more tasks or interrupt
+		self._emit("state", component="advisor", state="brief_listen_after_completion")
+		brief_text = await self._listen_briefly()
+		if brief_text and not self._is_bad_transcript(brief_text):
+			self._emit(
+				"brief_listen_result",
+				component="advisor",
+				chars=len(brief_text),
+				preview=brief_text[:100],
+			)
+			# Human said something - handle it as a new request
+			self._ledger.append(f"Human: {brief_text}")
+
+			# Check for stop words first
+			if self._matches_stop_word(brief_text):
+				self._emit("interrupt", component="advisor", kind="stop_word", transcript=brief_text)
+				self._llm_todo.clear()
+				return None  # Caller will not speak anything
+
+			# Check if it's a continuation or new request
+			# If user says something like "ja", "weiter", "continue" - check for pending tasks
+			low = brief_text.lower().strip()
+			if low in {"ja", "yes", "weiter", "continue", "mach weiter", "go on", "ok", "okay"}:
+				# User wants to continue - but we already completed everything
+				no_more = (
+					"Alle Aufgaben sind erledigt. Was möchtest du als nächstes?"
+					if is_german
+					else "All tasks are done. What would you like next?"
+				)
+				await self._speak(no_more)
+				self._ledger.append(f"Assistant: {no_more}")
+				self._llm_todo.clear()
+				return None
+
+			# User said something else - treat it as a new request
+			# Re-plan and execute with the new request
+			self._llm_todo.clear()
+			self._emit("state", component="advisor", state="follow_up_request")
+			return await self._plan_and_execute_tasks_llm(brief_text)
+		else:
+			self._emit(
+				"brief_listen_result",
+				component="advisor",
+				chars=0,
+				preview=None,
+				reason="no_speech_or_bad_transcript",
+			)
+
+		# Clear the todo list
+		self._llm_todo.clear()
+
+		return None  # Already spoke the final response
+
+	async def _plan_and_execute_tasks_legacy(self, user_request: str) -> str | None:
+		"""Legacy task execution using TaskPlanner (fallback)."""
+		if self._task_planner is None or self._todo is None:
+			return None
+
+		self._emit("state", component="advisor", state="task_planning_start")
+
+		# Step 1: Plan tasks using LLM
+		try:
+			planned_tasks = await self._task_planner.plan_tasks(
+				user_request,
+				language=self.settings.response_language,
+			)
+		except Exception as exc:
+			self._emit("task_planning_error", component="advisor.task_planner", error=str(exc))
+			return None
+
+		if not planned_tasks:
+			self._emit("task_planning_empty", component="advisor.task_planner")
+			return None
+
+		self._emit(
+			"task_planning_done",
+			component="advisor.task_planner",
+			task_count=len(planned_tasks),
+			tasks=[t.get("title") for t in planned_tasks],
+		)
+
+		# Step 2: Set up todo list with the planned tasks
+		task_titles = [t.get("title", "") for t in planned_tasks if t.get("title")]
+		mission = user_request[:100] + ("..." if len(user_request) > 100 else "")
+		self._todo.set_mission(mission, tasks=task_titles)
+
+		# Store action hints for each task (by title)
+		action_hints: dict[str, dict[str, Any]] = {}
+		for t in planned_tasks:
+			title = t.get("title", "")
+			hint = t.get("action_hint")
+			if title and hint:
+				action_hints[title] = hint
+
+		# Announce the plan
+		lang = self.settings.response_language
+		is_german = str(lang).lower().startswith("de")
+		plan_announcement = (
+			f"Okay, ich habe {len(task_titles)} Schritte geplant. Los geht's!"
+			if is_german
+			else f"Okay, I've planned {len(task_titles)} steps. Let's go!"
+		)
+		await self._speak(plan_announcement)
+		self._ledger.append(f"Assistant: {plan_announcement}")
+
+		# Step 3: Execute tasks one by one
+		completed_count = 0
+		task_results: list[dict[str, Any]] = []
+
+		while self._todo.has_open_tasks():
+			current_task = self._todo.next_task()
+			if current_task is None:
+				break
+
+			task_id = current_task.get("id")
+			task_title = str(current_task.get("title") or "")
+
+			self._emit(
+				"task_execution_start",
+				component="advisor",
+				task_id=task_id,
+				task_title=task_title,
+			)
+
+			# Get the action hint for this task
+			action_hint = action_hints.get(task_title)
+			task_result: dict[str, Any] = {"task_id": task_id, "title": task_title, "ok": True}
+
+			try:
+				if action_hint:
+					# Execute the pre-planned action
+					action_type = str(action_hint.get("type") or "").lower()
+
+					if action_type == "observe":
+						# Special case: observe and describe
+						question = str(action_hint.get("question") or "Beschreibe was du siehst.")
+						obs = await self._observe(question)
+						if obs:
+							await self._speak(obs)
+							self._ledger.append(f"Assistant: {obs}")
+						task_result["observation"] = obs
+
+					elif action_type in {"head_set_angles", "set_head_angles", "look"}:
+						# Head movement - possibly with observe_after
+						pan = action_hint.get("pan_deg")
+						tilt = action_hint.get("tilt_deg")
+						observe_after = bool(action_hint.get("observe_after", False))
+
+						# Execute head movement
+						pan_i = int(pan) if pan is not None else None
+						tilt_i = int(tilt) if tilt is not None else None
+						if pan_i is not None:
+							pan_i = max(-90, min(90, pan_i))
+						if tilt_i is not None:
+							tilt_i = max(-35, min(35, tilt_i))
+						await self._head_set_angles(pan_deg=pan_i, tilt_deg=tilt_i)
+
+						# Wait for head to settle
+						await asyncio.sleep(1.0)
+
+						# If observe_after, take a picture and describe
+						if observe_after:
+							question = str(action_hint.get("observe_question") or action_hint.get("question") or "Beschreibe was du siehst.")
+							obs = await self._observe(question)
+							if obs:
+								await self._speak(obs)
+								self._ledger.append(f"Assistant: {obs}")
+							task_result["observation"] = obs
+
+					elif action_type in {"guarded_drive", "drive", "move"}:
+						# Execute drive with await_completion
+						action_results = await self._execute_planned_actions([action_hint])
+						task_result["action_results"] = action_results
+
+					elif action_type == "speak":
+						# Just speak
+						text = str(action_hint.get("text") or "")
+						if text:
+							await self._speak(text)
+							self._ledger.append(f"Assistant: {text}")
+						task_result["spoken"] = text
+
+					else:
+						# Regular action - execute via _execute_planned_actions
+						action_results = await self._execute_planned_actions([action_hint])
+						task_result["action_results"] = action_results
+				else:
+					# No action hint - ask the brain what to do for this task
+					response, need_observe, actions = await self._decide_and_respond(
+						human_text=f"Führe diese Aufgabe aus: {task_title}",
+						observation=None,
+						memory_hint=None,
+					)
+					if actions:
+						action_results = await self._execute_planned_actions(actions)
+						task_result["action_results"] = action_results
+					if need_observe:
+						obs = await self._observe(f"Für die Aufgabe: {task_title}")
+						if obs:
+							await self._speak(obs)
+							self._ledger.append(f"Assistant: {obs}")
+						task_result["observation"] = obs
+					elif response:
+						await self._speak(response)
+						self._ledger.append(f"Assistant: {response}")
+						task_result["response"] = response
+
+				# Mark task as done
+				self._todo.complete_task(task_id)
+				completed_count += 1
+				self._emit(
+					"task_execution_done",
+					component="advisor",
+					task_id=task_id,
+					task_title=task_title,
+				)
+
+				# Pause between tasks
+				await asyncio.sleep(0.3)
+
+			except Exception as exc:
+				task_result["ok"] = False
+				task_result["error"] = str(exc)
+				self._emit(
+					"task_execution_error",
+					component="advisor",
+					task_id=task_id,
+					task_title=task_title,
+					error=str(exc),
+				)
+				# Mark as done anyway to avoid infinite loop
+				self._todo.complete_task(task_id)
+
+			task_results.append(task_result)
+			self._ledger.append(f"[task] {task_result}")
+
+		# Step 4: Final summary
+		self._emit(
+			"task_execution_complete",
+			component="advisor",
+			total_tasks=len(task_titles),
+			completed=completed_count,
+		)
+
+		final_response = (
+			f"Fertig! Ich habe alle {completed_count} Schritte abgeschlossen."
+			if is_german
+			else f"Done! I completed all {completed_count} steps."
+		)
+		return final_response
 
 	async def _interaction_step(self) -> None:
 		self._emit("state", component="advisor", state="interaction_start")
@@ -1231,9 +3010,38 @@ class AdvisorAgent:
 		if self._matches_stop_word(text):
 			self._emit("interrupt", component="advisor", kind="stop_word", transcript=text)
 			await self._speaker_stop()
+			# Best-effort: also stop robot motion and head scan jobs.
+			try:
+				await self._safety_stop()
+			except Exception:
+				pass
+			try:
+				await self._head_stop()
+			except Exception:
+				pass
 			return
 
 		self._ledger.append(f"Human: {text}")
+
+		# Fast path: local todo commands.
+		todo_response = await self._try_handle_todo_command(text)
+		if todo_response is not None:
+			self._emit("state", component="advisor", state="interaction_todo")
+			await self._speak(todo_response)
+			self._ledger.append(f"Assistant: {todo_response}")
+			await self._maybe_summarize_and_reset()
+			self._emit("state", component="advisor", state="interaction_end")
+			return
+
+		# Fast path: handle simple robot commands without involving the LLM.
+		cmd_response = await self._try_handle_robot_command(text)
+		if cmd_response is not None:
+			self._emit("state", component="advisor", state="interaction_command")
+			await self._speak(cmd_response)
+			self._ledger.append(f"Assistant: {cmd_response}")
+			await self._maybe_summarize_and_reset()
+			self._emit("state", component="advisor", state="interaction_end")
+			return
 		# If user explicitly asks for a conversation summary, do it directly.
 		if self._wants_conversation_summary(text):
 			summary = await self._summarize_conversation_for_user()
@@ -1243,6 +3051,19 @@ class AdvisorAgent:
 			await self._maybe_summarize_and_reset()
 			self._emit("state", component="advisor", state="interaction_end")
 			return
+
+		# NEW: Check if this is a multi-step request that needs task planning
+		if self._is_multi_step_request(text):
+			self._emit("state", component="advisor", state="interaction_multi_step")
+			final_response = await self._plan_and_execute_tasks(text)
+			if final_response is not None:
+				await self._speak(final_response)
+				self._ledger.append(f"Assistant: {final_response}")
+				await self._maybe_summarize_and_reset()
+				self._emit("state", component="advisor", state="interaction_end")
+				return
+			# If planning failed, fall through to normal flow
+
 		await self._maybe_summarize_and_reset()
 
 		wants_vision = self._wants_vision(text)
@@ -1259,17 +3080,69 @@ class AdvisorAgent:
 		mem_hint = await self._memorizer_recall(text)
 		if mem_hint:
 			self._ledger.append(f"[recall] {mem_hint}")
-		response, need_observe = await self._decide_and_respond(human_text=text, observation=obs, memory_hint=mem_hint)
+		response, need_observe, actions = await self._decide_and_respond(human_text=text, observation=obs, memory_hint=mem_hint)
+
+		# If the brain proposed safe actions, execute them before speaking.
+		# Special handling for memory_recall: if present, get memory and re-decide with results
+		memory_recall_result: str | None = None
+		if actions:
+			self._emit("planned_actions", component="advisor", count=len(actions), actions=actions)
+			
+			# Check for memory_recall actions first - execute them and get results
+			for action in actions:
+				atype = str(action.get("type") or "").strip().lower()
+				if atype == "memory_recall":
+					query = str(action.get("query") or "").strip()
+					if query:
+						self._emit("memory_recall_triggered", component="advisor", query=query)
+						memory_recall_result = await self._memorizer_recall_direct(query)
+						if memory_recall_result:
+							self._ledger.append(f"[memory_recall] {memory_recall_result[:200]}...")
+			
+			# If we got memory results, re-decide with that information
+			if memory_recall_result:
+				combined_mem_hint = mem_hint or ""
+				if combined_mem_hint:
+					combined_mem_hint += "\n\n"
+				combined_mem_hint += f"Memory search results:\n{memory_recall_result}"
+				
+				self._emit("state", component="advisor", state="interaction_think_with_memory")
+				response, need_observe, remaining_actions = await self._decide_and_respond(
+					human_text=text, 
+					observation=obs, 
+					memory_hint=combined_mem_hint
+				)
+				# Execute remaining non-memory actions
+				non_memory_actions = [a for a in actions if str(a.get("type") or "").strip().lower() not in ("memory_recall",)]
+				if non_memory_actions:
+					action_results = await self._execute_planned_actions(non_memory_actions)
+					self._ledger.append(f"[actions] {action_results}")
+			else:
+				# No memory results, execute all actions normally
+				action_results = await self._execute_planned_actions(actions)
+				self._ledger.append(f"[actions] {action_results}")
 
 		# If the brain asked for an observation and we haven't taken one yet, do it once.
 		if need_observe is True and not (obs and obs.strip()):
 			self._emit("state", component="advisor", state="interaction_observe_assist")
 			obs = await self._observe(f"Help answer the human request: {text}")
-			response, _ = await self._decide_and_respond(human_text=text, observation=obs, memory_hint=mem_hint)
+			response, _, _ = await self._decide_and_respond(human_text=text, observation=obs, memory_hint=mem_hint)
 
 		response = response.strip()
 		if not response:
 			response = "I heard you, but I didn't get enough to answer. Could you say that again?"
+
+		# Optional: always speak the next todo task (keeps the human aligned).
+		if self.settings.todo.enabled and self.settings.todo.mention_next_in_response and self._todo is not None:
+			try:
+				nxt = self._todo.next_task()
+			except Exception:
+				nxt = None
+			if nxt is not None and str(nxt.get("title") or "").strip():
+				prefix = "Nächster Schritt:" if str(self.settings.response_language).lower().startswith("de") else "Next:"
+				hint = f"{prefix} {str(nxt.get('title')).strip()}"
+				if hint.lower() not in response.lower():
+					response = response.rstrip() + "\n\n" + hint
 
 		self._emit("state", component="advisor", state="interaction_speak")
 		await self._speak(response)
@@ -1285,6 +3158,80 @@ class AdvisorAgent:
 		await self._maybe_summarize_and_reset()
 		self._emit("state", component="advisor", state="interaction_end")
 
+	async def _try_handle_todo_command(self, text: str) -> str | None:
+		cfg = self.settings.todo
+		agent = self._todo
+		if not bool(cfg.enabled) or agent is None:
+			return None
+		low = (text or "").strip().lower()
+		if not low:
+			return None
+
+		# Status / next.
+		if low in {"todo", "todos", "todo status", "status", "tasks", "aufgaben", "aufgaben status", "liste"}:
+			return agent.status_text()
+		if low in {"next", "next task", "nächste", "nächste aufgabe", "was als nächstes", "was kommt als nächstes"}:
+			nxt = agent.next_task()
+			if nxt is None:
+				return "Keine offenen Aufgaben." if str(self.settings.response_language).lower().startswith("de") else "No open tasks."
+			return f"Nächster Schritt: {nxt.get('title')}" if str(self.settings.response_language).lower().startswith("de") else f"Next: {nxt.get('title')}"
+
+		# Mark done (optionally with an id).
+		done_m = re.search(r"\b(done|erledigt|fertig|abgehakt)\b(?:\s+#?(\d+))?", low)
+		if done_m:
+			tid_s = done_m.group(2)
+			updated = None
+			if tid_s:
+				updated = agent.complete_task(int(tid_s), note=None)
+			else:
+				updated = agent.complete_current_or_next(note=None)
+			if updated is None:
+				return "Ich habe gerade keine offene Aufgabe zum Abhaken." if str(self.settings.response_language).lower().startswith("de") else "I don't have an open task to mark done."
+			nxt = agent.next_task()
+			if nxt is None:
+				return "Erledigt. Keine offenen Aufgaben mehr." if str(self.settings.response_language).lower().startswith("de") else "Done. No open tasks left."
+			return (
+				f"Erledigt. Nächster Schritt: {nxt.get('title')}"
+				if str(self.settings.response_language).lower().startswith("de")
+				else f"Done. Next: {nxt.get('title')}"
+			)
+
+		# Clear.
+		if any(k in low for k in ("clear todo", "clear todos", "todos löschen", "liste leeren", "aufgaben löschen", "clear tasks")):
+			agent.clear()
+			return "Okay, ich habe die Todo-Liste geleert." if str(self.settings.response_language).lower().startswith("de") else "Okay, I cleared the todo list."
+
+		# Add task.
+		add_m = re.match(r"^(?:todo\s+)?(?:add|hinzufügen|füge hinzu|aufgabe hinzufügen)\s*[:\-]?\s*(.+)$", low)
+		if add_m:
+			title = (add_m.group(1) or "").strip()
+			if not title:
+				return None
+			agent.add_task(title)
+			nxt = agent.next_task()
+			if nxt is not None:
+				return (
+					f"Okay. Nächster Schritt: {nxt.get('title')}"
+					if str(self.settings.response_language).lower().startswith("de")
+					else f"Okay. Next: {nxt.get('title')}"
+				)
+			return "Okay." 
+
+		# Replan from a freeform list (if the user speaks a list).
+		if any(x in text for x in ("\n", "- ", "* ")) or re.search(r"\b\d+\s*[\.)]", text):
+			if any(k in low for k in ("plan", "replan", "neuer plan", "todo")):
+				agent.set_from_freeform_text(text)
+				nxt = agent.next_task()
+				if nxt is None:
+					return "Plan aktualisiert. Keine offenen Aufgaben." if str(self.settings.response_language).lower().startswith("de") else "Plan updated. No open tasks."
+				return (
+					f"Plan aktualisiert. Nächster Schritt: {nxt.get('title')}"
+					if str(self.settings.response_language).lower().startswith("de")
+					else f"Plan updated. Next: {nxt.get('title')}"
+				)
+
+		return None
+
 	async def _alone_step(self) -> None:
 		now = time.time()
 		if (now - self._last_alone_think_ts) < float(self.settings.think_interval_seconds or 0.0):
@@ -1297,6 +3244,24 @@ class AdvisorAgent:
 		self._last_alone_think_ts = now
 		self._emit("state", component="advisor", state="alone_start")
 
+		# Check if we should use autonomous todo generation
+		use_autonomous_todo = (
+			self.settings.todo.autonomous_mode_enabled
+			and self._llm_todo is not None
+			and self._llm_todo.is_enabled()
+		)
+
+		if use_autonomous_todo:
+			# Use autonomous todo generation instead of simple observe + think
+			await self._alone_step_autonomous()
+		else:
+			# Original behavior: observe and think out loud
+			await self._alone_step_simple()
+
+		self._emit("state", component="advisor", state="alone_end")
+
+	async def _alone_step_simple(self) -> None:
+		"""Original alone mode: observe and think out loud."""
 		obs = await self._observe(self.settings.observation_question)
 		self._ledger.append(f"[alone] observation: {obs}")
 		await self._maybe_summarize_and_reset()
@@ -1326,7 +3291,193 @@ class AdvisorAgent:
 			await self._speak(thought)
 			self._ledger.append(f"[alone] thought: {thought}")
 			await self._maybe_summarize_and_reset()
-		self._emit("state", component="advisor", state="alone_end")
+
+		# Optional: a small, safety-guarded exploration step.
+		if bool(self.settings.alone_explore_enabled):
+			try:
+				st = await self._speaker_status()
+				if bool(isinstance(st, dict) and st.get("speaking")):
+					self._emit("state", component="advisor", state="alone_explore_skip_speaking")
+				else:
+					self._emit("state", component="advisor", state="alone_explore")
+					dir_res = await self._observe_direction("Pick a safe direction to move a little. Avoid obstacles.")
+					action = str((dir_res or {}).get("action") or "") if isinstance(dir_res, dict) else ""
+					steer_deg, duration_s = self._drive_plan_from_observe_action(
+						action,
+						near_s=float(self.settings.alone_explore_duration_s),
+						far_s=float(self.settings.alone_explore_far_duration_s),
+					)
+					res = await self._safety_guarded_drive(
+						speed=int(self.settings.alone_explore_speed),
+						steer_deg=int(steer_deg),
+						duration_s=float(duration_s),
+						threshold_cm=float(self.settings.alone_explore_threshold_cm),
+					)
+					self._ledger.append(f"[alone] explore action={action!r} steer={steer_deg} dur={duration_s} res={res}")
+					await self._maybe_summarize_and_reset()
+					if self.settings.alone_explore_speak:
+						if res is None:
+							await self._speak("Ich kann mich gerade nicht bewegen.")
+						elif bool(isinstance(res, dict) and res.get("blocked")):
+							await self._speak("Ich bleibe stehen, weil es nicht sicher ist.")
+			except Exception as exc:
+				self._emit("alone_explore_error", component="advisor", error=str(exc))
+
+	async def _alone_step_autonomous(self) -> None:
+		"""Autonomous alone mode: generate and execute random todos."""
+		self._emit("state", component="advisor", state="alone_autonomous_start")
+
+		# First, observe the environment to provide context
+		obs = await self._observe(self.settings.observation_question)
+		self._ledger.append(f"[alone] observation: {obs}")
+
+		# Generate autonomous tasks based on the observation
+		try:
+			context = f"Aktuelle Beobachtung: {obs}" if obs else None
+			tasks = await self._llm_todo.generate_autonomous_tasks(context)
+
+			if not tasks:
+				self._emit("state", component="advisor", state="alone_autonomous_no_tasks")
+				# Fallback to simple mode
+				await self._alone_step_simple()
+				return
+
+			self._emit(
+				"alone_autonomous_tasks_generated",
+				component="advisor.llm_todo",
+				task_count=len(tasks),
+				tasks=[t.get("title") for t in tasks],
+			)
+
+			# Execute the autonomous tasks (usually just 1-3)
+			lang = self.settings.response_language
+			is_german = str(lang).lower().startswith("de")
+
+			for task in tasks[:3]:  # Limit to 3 tasks per alone step
+				if not self._llm_todo.has_pending_tasks():
+					break
+
+				next_task = await self._llm_todo.get_next_task()
+				if next_task is None:
+					break
+
+				task_id = next_task.get("id")
+				task_title = str(next_task.get("title") or "")
+				action = next_task.get("action", {})
+
+				self._emit(
+					"alone_autonomous_task_start",
+					component="advisor.llm_todo",
+					task_id=task_id,
+					task_title=task_title,
+				)
+
+				# Execute the action
+				task_result = await self._execute_autonomous_action(action)
+
+				# Mark task as done
+				await self._llm_todo.mark_task_done(task_id, task_result)
+
+				self._emit(
+					"alone_autonomous_task_done",
+					component="advisor.llm_todo",
+					task_id=task_id,
+					task_title=task_title,
+					result=task_result[:100] if task_result else None,
+				)
+
+				# Small pause between tasks
+				await asyncio.sleep(0.5)
+
+			# Clear the autonomous todo list
+			self._llm_todo.clear()
+
+			self._emit("state", component="advisor", state="alone_autonomous_complete")
+
+		except Exception as exc:
+			self._emit("alone_autonomous_error", component="advisor", error=str(exc))
+			# Fallback to simple mode on error
+			await self._alone_step_simple()
+
+	async def _execute_autonomous_action(self, action: dict[str, Any]) -> str:
+		"""Execute a single autonomous action and return the result."""
+		action_type = str(action.get("type") or "").lower()
+		task_result = ""
+
+		try:
+			if action_type == "observe":
+				question = str(action.get("question") or "Beschreibe was du siehst.")
+				obs = await self._observe(question)
+				if obs:
+					await self._speak(obs)
+					self._ledger.append(f"[alone] autonomous observe: {obs}")
+				task_result = obs or "Keine Beobachtung"
+
+			elif action_type in {"head_set_angles", "set_head_angles", "look"}:
+				pan = action.get("pan_deg")
+				tilt = action.get("tilt_deg")
+				observe_after = bool(action.get("observe_after", False))
+
+				pan_i = int(pan) if pan is not None else None
+				tilt_i = int(tilt) if tilt is not None else None
+				if pan_i is not None:
+					pan_i = max(-90, min(90, pan_i))
+				if tilt_i is not None:
+					tilt_i = max(-35, min(35, tilt_i))
+
+				await self._head_set_angles(pan_deg=pan_i, tilt_deg=tilt_i)
+				await asyncio.sleep(1.0)
+
+				if observe_after:
+					question = str(action.get("observe_question") or action.get("question") or "Was siehst du?")
+					obs = await self._observe(question)
+					if obs:
+						await self._speak(obs)
+						self._ledger.append(f"[alone] autonomous observe: {obs}")
+					task_result = obs or "Keine Beobachtung"
+				else:
+					task_result = f"Kopf bewegt: pan={pan_i}, tilt={tilt_i}"
+
+			elif action_type in {"guarded_drive", "drive", "move"}:
+				speed = int(action.get("speed") or 20)
+				steer_deg = int(action.get("steer_deg") or 0)
+				duration_s = float(action.get("duration_s") or 0.5)
+
+				speed = max(-100, min(100, speed))
+				steer_deg = max(-45, min(45, steer_deg))
+				duration_s = max(0.1, min(3.0, duration_s))  # Shorter limit for autonomous
+
+				res = await self._safety_guarded_drive(
+					speed=speed,
+					steer_deg=steer_deg,
+					duration_s=duration_s,
+					threshold_cm=float(self.settings.alone_explore_threshold_cm),
+					await_completion=True,
+				)
+
+				if res is None:
+					task_result = "Konnte nicht fahren"
+				elif isinstance(res, dict) and res.get("blocked"):
+					task_result = "Fahrt blockiert (Hindernis)"
+				else:
+					task_result = f"Gefahren: speed={speed}, steer={steer_deg}, {duration_s}s"
+
+				self._ledger.append(f"[alone] autonomous drive: {task_result}")
+
+			elif action_type == "speak":
+				text = str(action.get("text") or "")
+				if text:
+					await self._speak(text)
+					self._ledger.append(f"[alone] autonomous speak: {text}")
+				task_result = text
+
+			else:
+				task_result = f"Unbekannte autonome Aktion: {action_type}"
+
+		except Exception as exc:
+			task_result = f"Fehler: {exc}"
+
+		return task_result
 
 	async def run_forever(self, *, max_iterations: int | None = None) -> None:
 		"""Run the advisor loop.
@@ -1350,13 +3501,14 @@ class AdvisorAgent:
 
 				try:
 					self._emit("iteration", component="advisor", iteration=iters)
-					active = False
+					raw_active = False
 					rms = 0
 					backend = None
 					if self._dry_run:
-						active = False
+						raw_active = False
 					elif time.time() < float(self._force_interaction_until_ts or 0.0):
-						active = True
+						raw_active = True
+						self._sound_active_streak = int(self.settings.sound_active_windows_required or 1)
 						self._emit(
 							"mode_hint",
 							component="advisor",
@@ -1370,11 +3522,11 @@ class AdvisorAgent:
 							window_seconds=self.settings.sound_window_seconds,
 							arecord_device=self.settings.sound_arecord_device,
 						)
-						active = bool(res.active)
+						raw_active = bool(res.active)
 						rms = int(res.rms)
 						backend = str(res.backend)
 						reason = getattr(res, "reason", None)
-						self._emit("sound", component="advisor.sound", backend=backend, rms=rms, active=active, reason=reason)
+						self._emit("sound", component="advisor.sound", backend=backend, rms=rms, active=raw_active, reason=reason)
 						if (reason or backend == "none") and self.settings.sound_fallback_to_interaction_on_error:
 							self._emit(
 								"sound_fallback",
@@ -1383,11 +3535,30 @@ class AdvisorAgent:
 								backend=backend,
 								reason=reason,
 							)
-							active = True
+							raw_active = True
+							self._sound_active_streak = int(self.settings.sound_active_windows_required or 1)
 					else:
 						# If sound detection is disabled, default to interaction mode.
-						active = True
+						raw_active = True
+						self._sound_active_streak = int(self.settings.sound_active_windows_required or 1)
 						self._emit("sound", component="advisor.sound", backend=None, rms=None, active=True, disabled=True)
+
+					# Require N consecutive active windows before interacting.
+					req = int(self.settings.sound_active_windows_required or 1)
+					req = max(1, req)
+					if raw_active:
+						self._sound_active_streak = min(self._sound_active_streak + 1, req)
+					else:
+						self._sound_active_streak = 0
+					active = bool(raw_active and (self._sound_active_streak >= req))
+					if raw_active and not active and req > 1:
+						self._emit(
+							"sound_gate",
+							component="advisor.sound",
+							gate="streak",
+							required=req,
+							streak=self._sound_active_streak,
+						)
 
 					if active:
 						# If someone interrupts while the robot is speaking, stop playback before listening.

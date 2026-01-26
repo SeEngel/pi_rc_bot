@@ -1,0 +1,16 @@
+## Safety service configuration
+
+safety:
+  dry_run: false
+  estop_default_on: false
+
+  # Where to reach the other services (HTTP API ports)
+  move_base_url: http://127.0.0.1:8005
+  proximity_base_url: http://127.0.0.1:8007
+
+  # Default obstacle threshold (cm)
+  obstacle_threshold_cm: 35
+
+service:
+  host: 0.0.0.0
+  port: 8009
