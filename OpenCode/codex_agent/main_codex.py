@@ -1288,6 +1288,584 @@ async def list_jobs():
     )
 
 
+# ── POST /tool_inventory ────────────────────────────────────────
+
+class ToolInfo(BaseModel):
+    tool_name: str = Field(description="Name of the tool folder")
+    exists: bool = Field(description="Whether server.py exists on disk")
+    port: int = Field(default=0, description="API port")
+    mcp_port: int = Field(default=0, description="MCP port")
+    process_alive: bool = Field(default=False, description="Whether the process is running")
+    healthy: bool = Field(default=False, description="Whether /healthz returns ok")
+    has_errors: bool = Field(default=False, description="Whether server.log has errors")
+    status: str = Field(default="unknown", description="One of: healthy, stopped, broken, missing")
+
+
+class ToolInventoryResponse(BaseModel):
+    ok: bool = True
+    total_tools: int = 0
+    tools: list[ToolInfo] = []
+
+
+@app.post("/tool_inventory", response_model=ToolInventoryResponse)
+async def tool_inventory():
+    """Return a detailed inventory of every tool in my_tools/.
+
+    For each tool reports whether:
+    - The code exists on disk (server.py present)
+    - The process is alive (pid file check)
+    - The healthz endpoint responds
+    - The server.log has errors
+
+    Status summary:
+    - "healthy"  — running + healthz ok + no errors
+    - "stopped"  — code exists but process not running (needs start)
+    - "broken"   — process dead or unhealthy or has errors (needs repair)
+    - "missing"  — directory exists but no server.py (needs build)
+    """
+    if not MY_TOOLS_DIR.exists():
+        return ToolInventoryResponse()
+
+    tools: list[ToolInfo] = []
+
+    for tool_dir in sorted(MY_TOOLS_DIR.iterdir()):
+        if not tool_dir.is_dir() or tool_dir.name.startswith(("_", ".")):
+            continue
+
+        name = tool_dir.name
+        server_py = tool_dir / "server.py"
+        port_file = tool_dir / "port.txt"
+
+        if not server_py.exists():
+            tools.append(ToolInfo(tool_name=name, exists=False, status="missing"))
+            continue
+
+        port = int(port_file.read_text().strip()) if port_file.exists() else 0
+        mcp_port = port + 600 if port else 0
+
+        info = _read_tool(name)
+        if "error" in info:
+            tools.append(ToolInfo(
+                tool_name=name, exists=True, port=port, mcp_port=mcp_port,
+                status="broken",
+            ))
+            continue
+
+        process_alive = info.get("process_alive", False)
+        healthy = info.get("healthy", False)
+        has_errors = info.get("has_errors", False)
+
+        if healthy and not has_errors:
+            status = "healthy"
+        elif not process_alive:
+            status = "stopped"
+        else:
+            status = "broken"
+
+        tools.append(ToolInfo(
+            tool_name=name,
+            exists=True,
+            port=port,
+            mcp_port=mcp_port,
+            process_alive=process_alive,
+            healthy=healthy,
+            has_errors=has_errors,
+            status=status,
+        ))
+
+    return ToolInventoryResponse(
+        total_tools=len(tools),
+        tools=tools,
+    )
+
+
+# ── POST /ensure_all_tools ─────────────────────────────────────
+
+class EnsureAllToolsResponse(BaseModel):
+    ok: bool = True
+    started: list[str] = Field(default_factory=list, description="Tools that were started successfully")
+    repair_jobs: dict[str, str] = Field(default_factory=dict, description="tool_name → job_id for tools sent to repair")
+    already_healthy: list[str] = Field(default_factory=list, description="Tools that were already running fine")
+    failed: list[str] = Field(default_factory=list, description="Tools that failed to start and couldn't be repaired")
+    registered: list[str] = Field(default_factory=list, description="Tools re-registered with main OpenCode")
+    summary: str = ""
+
+
+@app.post("/ensure_all_tools", response_model=EnsureAllToolsResponse)
+async def ensure_all_tools():
+    """Ensure every tool in my_tools/ is running and healthy.
+
+    This is the main "boot recovery" endpoint.  Called by the supervisor
+    after a fresh OS reboot (or when main.py restarts).
+
+    For each tool:
+    1. If healthy → skip (already good).
+    2. If stopped (code exists, process dead, no errors) → start it + register.
+    3. If broken (errors in log, unhealthy) → attempt restart first.
+       If still broken after restart → queue a repair job (AI-powered).
+    4. If missing (no server.py) → skip (needs build_tool, not auto-repair).
+
+    Returns immediately with results for start/skip, plus job_ids for
+    any async repair jobs that were queued.
+    """
+    if not MY_TOOLS_DIR.exists():
+        return EnsureAllToolsResponse(summary="my_tools/ directory does not exist")
+
+    started: list[str] = []
+    repair_jobs: dict[str, str] = {}
+    already_healthy: list[str] = []
+    failed: list[str] = []
+    registered: list[str] = []
+
+    tool_dirs = sorted(
+        d for d in MY_TOOLS_DIR.iterdir()
+        if d.is_dir() and not d.name.startswith(("_", "."))
+    )
+
+    for tool_dir in tool_dirs:
+        name = tool_dir.name
+        server_py = tool_dir / "server.py"
+
+        if not server_py.exists():
+            LOG.info("ensure_all_tools: %s — no server.py, skipping (needs build)", name)
+            continue
+
+        info = _read_tool(name)
+        if "error" in info:
+            LOG.warning("ensure_all_tools: %s — read error: %s", name, info["error"])
+            failed.append(name)
+            continue
+
+        port = info["port"]
+        mcp_port = info["mcp_port"]
+
+        # Case 1: already healthy
+        if info["healthy"] and not info["has_errors"]:
+            LOG.info("ensure_all_tools: %s — already healthy on port %d", name, port)
+            already_healthy.append(name)
+            # Still re-register (OpenCode might have restarted too)
+            if _re_register_tool(name, mcp_port):
+                registered.append(name)
+            continue
+
+        # Case 2: stopped — just start it
+        if not info["process_alive"] and not info["has_errors"]:
+            LOG.info("ensure_all_tools: %s — stopped, starting on port %d", name, port)
+            ok = _restart_tool(name, port)
+            if ok:
+                started.append(name)
+                if _re_register_tool(name, mcp_port):
+                    registered.append(name)
+            else:
+                # Start failed — check if there are errors now, then repair
+                LOG.warning("ensure_all_tools: %s — start failed, queuing repair", name)
+                job = _create_job(JobKind.REPAIR, name)
+                job.log(f"Auto-repair queued after failed start — tool={name}")
+                thread = threading.Thread(
+                    target=_run_repair_sync,
+                    args=(job, name),
+                    daemon=True,
+                )
+                thread.start()
+                repair_jobs[name] = job.job_id
+            continue
+
+        # Case 3: broken — try restart first, then repair if needed
+        LOG.info("ensure_all_tools: %s — broken (alive=%s, healthy=%s, errors=%s), trying restart",
+                 name, info["process_alive"], info["healthy"], info["has_errors"])
+        ok = _restart_tool(name, port)
+        if ok:
+            started.append(name)
+            if _re_register_tool(name, mcp_port):
+                registered.append(name)
+        else:
+            # Restart didn't help — queue AI repair
+            LOG.warning("ensure_all_tools: %s — restart failed, queuing AI repair", name)
+            job = _create_job(JobKind.REPAIR, name)
+            job.log(f"Auto-repair queued after failed restart — tool={name}")
+            thread = threading.Thread(
+                target=_run_repair_sync,
+                args=(job, name),
+                daemon=True,
+            )
+            thread.start()
+            repair_jobs[name] = job.job_id
+
+    parts = []
+    if already_healthy:
+        parts.append(f"{len(already_healthy)} already healthy")
+    if started:
+        parts.append(f"{len(started)} started: {', '.join(started)}")
+    if repair_jobs:
+        parts.append(f"{len(repair_jobs)} sent to repair: {', '.join(repair_jobs.keys())}")
+    if failed:
+        parts.append(f"{len(failed)} failed: {', '.join(failed)}")
+    if registered:
+        parts.append(f"{len(registered)} registered with OpenCode")
+    summary = " | ".join(parts) if parts else "No tools found"
+
+    LOG.info("ensure_all_tools result: %s", summary)
+
+    return EnsureAllToolsResponse(
+        started=started,
+        repair_jobs=repair_jobs,
+        already_healthy=already_healthy,
+        failed=failed,
+        registered=registered,
+        summary=summary,
+    )
+
+
+# ── POST /fulfill_capability ───────────────────────────────────
+
+def _build_tool_inventory_for_ai() -> str:
+    """Build a human-readable summary of all existing tools for the AI to reason about."""
+    if not MY_TOOLS_DIR.exists():
+        return "(no my_tools/ directory — no tools exist yet)"
+
+    sections: list[str] = []
+    for tool_dir in sorted(MY_TOOLS_DIR.iterdir()):
+        if not tool_dir.is_dir() or tool_dir.name.startswith(("_", ".")):
+            continue
+        name = tool_dir.name
+        server_py = tool_dir / "server.py"
+        port_file = tool_dir / "port.txt"
+
+        if not server_py.exists():
+            sections.append(f"### {name}\n- Status: EMPTY (no server.py)\n- Can be used for a new build.\n")
+            continue
+
+        port = int(port_file.read_text().strip()) if port_file.exists() else 0
+        source = server_py.read_text("utf-8", errors="replace")
+
+        # Extract endpoint info from source — look for @app.post and class definitions
+        endpoints: list[str] = []
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("@app.post(") or stripped.startswith("@app.get("):
+                endpoints.append(stripped)
+            elif stripped.startswith("class ") and "Request" in stripped:
+                endpoints.append(stripped)
+
+        info = _read_tool(name)
+        status = "healthy" if info.get("healthy") else ("running" if info.get("process_alive") else "stopped")
+
+        section = f"### {name}\n"
+        section += f"- Port: {port}, Status: {status}\n"
+        section += f"- Endpoints: {', '.join(endpoints[:10]) if endpoints else '(none found)'}\n"
+        section += f"- Source length: {len(source)} chars\n"
+        # Include the first ~80 lines (imports + models + endpoint signatures) for context
+        source_preview = "\n".join(source.splitlines()[:80])
+        section += f"- Source preview:\n```python\n{source_preview}\n```\n"
+        sections.append(section)
+
+    if not sections:
+        return "(no tools found in my_tools/)"
+
+    return "\n".join(sections)
+
+
+def _build_fulfill_prompt(capability: str, inventory: str, context: str) -> str:
+    return textwrap.dedent(f"""\
+        [FULFILL CAPABILITY REQUEST]
+
+        The robot supervisor needs a capability. Your job is to decide the best
+        course of action and then EXECUTE it (write code, not just talk about it).
+
+        ## Requested capability
+        {capability}
+
+        ## Additional context from the supervisor
+        {context}
+
+        ## Existing tools in my_tools/
+        {inventory}
+
+        ## Your decision process
+        Analyze the request and the existing tools, then decide ONE of:
+
+        1. **EXISTS** — A tool already provides exactly this capability.
+           → Respond: `DECISION: EXISTS | tool=<name> | reason=<why it already works>`
+           → Do nothing else.
+
+        2. **EXTEND** — An existing tool is close but needs new endpoints or features.
+           → Respond first: `DECISION: EXTEND | tool=<name> | reason=<what needs adding>`
+           → Then WRITE the updated server.py with the new functionality added.
+           → Use bash: `cat > <tool_dir>/server.py << 'PYEOF' ... PYEOF`
+           → PRESERVE all existing endpoints — only ADD new ones.
+           → Preserve the bootstrap section at the bottom unchanged.
+           → Verify syntax: `python3 -c "import ast; ast.parse(open('<path>').read())"`
+           → Do NOT start the server.
+           → End with: `EXTENDED: <description of what was added>`
+
+        3. **BUILD** — No existing tool covers this. Build a new one.
+           → Respond first: `DECISION: BUILD | tool=<suggested_name> | reason=<why new>`
+           → Then follow the standard BUILD procedure from your instructions.
+           → End with: `BUILT: <description>`
+
+        ## Rules
+        - Be pragmatic. If an existing tool is 80%+ there, EXTEND it — don't rebuild.
+        - When extending, preserve ALL existing functionality. Only add.
+        - Tool names: lowercase, underscores, e.g. 'web_search'.
+        - Python only, uv add for packages, httpx for HTTP.
+        - FastAPI + FastMCP pattern. Every POST endpoint = MCP tool.
+        - DO NOT start servers or register them.
+    """)
+
+
+class FulfillCapabilityRequest(BaseModel):
+    capability: str = Field(description="Description of what the robot needs — be specific about the desired functionality")
+    context: str = Field(default="", description="Optional extra context (e.g. what the human asked the robot to do)")
+
+
+class FulfillCapabilityResponse(BaseModel):
+    ok: bool = True
+    decision: str = Field(default="", description="One of: exists, extend, build, error")
+    tool_name: str = Field(default="", description="The tool that fulfills (or will fulfill) the capability")
+    port: int = Field(default=0, description="Port of the tool")
+    mcp_port: int = Field(default=0, description="MCP port of the tool")
+    action_taken: str = Field(default="", description="What was done: nothing, extended, built")
+    started: bool = Field(default=False, description="Whether the tool was (re)started")
+    registered: bool = Field(default=False, description="Whether it was registered with main OpenCode")
+    healthy: bool = Field(default=False, description="Whether it's healthy after the action")
+    summary: str = ""
+    job_id: str = Field(default="", description="Job ID if async work was queued")
+
+
+def _run_fulfill_sync(job: Job, capability: str, context: str) -> None:
+    """Background worker — asks AI to decide and act, then restarts/registers."""
+    try:
+        job.state = JobState.RUNNING
+
+        # 1. Build inventory of existing tools
+        job.phase = "scanning existing tools"
+        job.log("Scanning existing tools for AI decision…")
+        inventory = _build_tool_inventory_for_ai()
+
+        # 2. Ask AI to decide
+        job.phase = "AI deciding: exists / extend / build"
+        job.log("Sending capability request to code AI…")
+        prompt = _build_fulfill_prompt(capability, inventory, context)
+        try:
+            client = _get_client()
+            client.new_session()  # fresh session for clean reasoning
+            reply = client.send(prompt)
+            LOG.info("Fulfill AI reply: %s", reply[:500])
+            for tc in client.last_tool_calls:
+                job.log(tc)
+            if reply.strip():
+                job.log(f"AI says: {reply[:400]}")
+        except Exception as exc:
+            job.phase = "AI error"
+            job.log(f"AI failed: {exc}")
+            job.state = JobState.FAILED
+            job.result = {"ok": False, "decision": "error", "summary": f"AI failed: {exc}"}
+            job.finished_at = time.time()
+            return
+
+        # 3. Parse the decision
+        reply_upper = reply.upper()
+        decision = "unknown"
+        tool_name = ""
+
+        if "DECISION: EXISTS" in reply_upper:
+            decision = "exists"
+            # Extract tool name from reply
+            m = re.search(r"DECISION:\s*EXISTS\s*\|\s*tool\s*=\s*(\S+)", reply, re.IGNORECASE)
+            if m:
+                tool_name = m.group(1).strip().rstrip("|").strip()
+        elif "DECISION: EXTEND" in reply_upper or "EXTENDED:" in reply_upper:
+            decision = "extend"
+            m = re.search(r"DECISION:\s*EXTEND\s*\|\s*tool\s*=\s*(\S+)", reply, re.IGNORECASE)
+            if m:
+                tool_name = m.group(1).strip().rstrip("|").strip()
+        elif "DECISION: BUILD" in reply_upper or "BUILT:" in reply_upper:
+            decision = "build"
+            m = re.search(r"DECISION:\s*BUILD\s*\|\s*tool\s*=\s*(\S+)", reply, re.IGNORECASE)
+            if m:
+                tool_name = m.group(1).strip().rstrip("|").strip()
+        elif "FAILED:" in reply_upper or "UNFIXABLE:" in reply_upper:
+            decision = "error"
+
+        job.log(f"Decision: {decision}, tool: {tool_name or '(unknown)'}")
+
+        # 4. Handle EXISTS — nothing to do
+        if decision == "exists":
+            info = _read_tool(tool_name) if tool_name else {}
+            port = info.get("port", 0)
+            mcp_port = info.get("mcp_port", 0)
+            healthy = info.get("healthy", False)
+
+            # Make sure it's registered (might not be after reboot)
+            registered = False
+            if mcp_port and healthy:
+                registered = _re_register_tool(tool_name, mcp_port)
+
+            job.phase = "done"
+            job.state = JobState.DONE
+            job.result = {
+                "ok": True, "decision": "exists", "tool_name": tool_name,
+                "port": port, "mcp_port": mcp_port, "action_taken": "nothing",
+                "started": False, "registered": registered, "healthy": healthy,
+                "summary": f"Tool '{tool_name}' already provides this capability.",
+            }
+            job.finished_at = time.time()
+            return
+
+        # 5. Handle EXTEND or BUILD — AI should have written code
+        if decision in ("extend", "build"):
+            action = "extended" if decision == "extend" else "built"
+
+            # For BUILD, create directory + port.txt if needed
+            if decision == "build" and tool_name:
+                tool_dir = MY_TOOLS_DIR / tool_name
+                tool_dir.mkdir(parents=True, exist_ok=True)
+                port_file = tool_dir / "port.txt"
+                if not port_file.exists():
+                    port = _next_free_port()
+                    port_file.write_text(str(port))
+                    job.log(f"Created tool dir and assigned port {port}")
+
+            if not tool_name:
+                # Try to find tool name from the AI's output (look for paths)
+                m = re.search(r"my_tools/(\w+)/server\.py", reply)
+                if m:
+                    tool_name = m.group(1)
+                    job.log(f"Inferred tool name from AI output: {tool_name}")
+
+            if not tool_name:
+                job.phase = "error"
+                job.log("Could not determine tool name from AI response")
+                job.state = JobState.FAILED
+                job.result = {"ok": False, "decision": decision, "summary": "AI did not specify a tool name"}
+                job.finished_at = time.time()
+                return
+
+            info = _read_tool(tool_name)
+            port = info.get("port", 0) if "error" not in info else 0
+            mcp_port = port + 600 if port else 0
+
+            # Verify server.py exists and has valid syntax
+            server_py = MY_TOOLS_DIR / tool_name / "server.py"
+            if not server_py.exists():
+                job.phase = "error"
+                job.log(f"AI said {action} but server.py not found at {server_py}")
+                job.state = JobState.FAILED
+                job.result = {"ok": False, "decision": decision, "tool_name": tool_name,
+                              "summary": f"AI said {action} but didn't write server.py"}
+                job.finished_at = time.time()
+                return
+
+            job.phase = "verifying syntax"
+            job.log("Verifying Python syntax…")
+            try:
+                import ast
+                ast.parse(server_py.read_text("utf-8"))
+                job.log("✅ Syntax OK")
+            except SyntaxError as exc:
+                job.log(f"⚠️ Syntax error: {exc} — attempting repair…")
+                repair_info = _read_tool(tool_name)
+                try:
+                    repair_reply = client.send(_build_repair_prompt(repair_info))
+                    for tc in client.last_tool_calls:
+                        job.log(tc)
+                except Exception:
+                    pass
+                try:
+                    ast.parse(server_py.read_text("utf-8"))
+                    job.log("✅ Syntax OK after repair")
+                except SyntaxError as exc2:
+                    job.phase = "syntax error"
+                    job.log(f"❌ Still broken: {exc2}")
+                    job.state = JobState.FAILED
+                    job.result = {"ok": False, "decision": decision, "tool_name": tool_name,
+                                  "summary": f"Syntax error unfixable: {exc2}"}
+                    job.finished_at = time.time()
+                    return
+
+            # Restart the tool
+            job.phase = "restarting"
+            job.log(f"Restarting {tool_name} on port {port}…")
+            started = _restart_tool(tool_name, port) if port else False
+            if started:
+                job.log("✅ Server started")
+            else:
+                job.log("❌ Server failed to start")
+
+            # Register with main OpenCode
+            registered = False
+            if started and mcp_port:
+                job.phase = "registering"
+                registered = _re_register_tool(tool_name, mcp_port)
+                if registered:
+                    job.log("✅ Registered with OpenCode")
+
+            # Health check
+            healthy = False
+            if started:
+                try:
+                    r = requests.get(f"http://127.0.0.1:{port}/healthz", timeout=5)
+                    healthy = r.ok
+                except Exception:
+                    pass
+
+            job.phase = "done" if healthy else "done (unhealthy)"
+            job.state = JobState.DONE if healthy else JobState.FAILED
+            job.result = {
+                "ok": True, "decision": decision, "tool_name": tool_name,
+                "port": port, "mcp_port": mcp_port, "action_taken": action,
+                "started": started, "registered": registered, "healthy": healthy,
+                "summary": f"{action.capitalize()} '{tool_name}' — {'✅ healthy' if healthy else '❌ unhealthy'}",
+            }
+            job.finished_at = time.time()
+            job.log(f"Fulfill finished in {job.elapsed()}s — {action} '{tool_name}' ({'healthy' if healthy else 'unhealthy'})")
+            return
+
+        # 6. Unknown / error decision
+        job.phase = "error"
+        job.state = JobState.FAILED
+        job.result = {"ok": False, "decision": decision, "summary": f"AI decision unclear: {reply[:300]}"}
+        job.finished_at = time.time()
+
+    except Exception as exc:
+        job.phase = "unexpected error"
+        job.log(f"Unexpected error: {exc}")
+        job.state = JobState.FAILED
+        job.result = {"ok": False, "decision": "error", "summary": f"Unexpected error: {exc}"}
+        job.finished_at = time.time()
+
+
+@app.post("/fulfill_capability", response_model=FulfillCapabilityResponse)
+async def fulfill_capability(req: FulfillCapabilityRequest):
+    """Smart capability fulfillment — AI decides whether to reuse, extend, or build.
+
+    Send a description of what capability the robot needs. The codex agent will:
+    1. Scan all existing tools and their endpoints.
+    2. Ask its AI to decide: does a tool already cover this? Should one be extended?
+       Or should a new one be built from scratch?
+    3. Execute the decision (write code, restart, register).
+
+    Runs **asynchronously** — returns a job_id immediately.
+    Poll ``/build_status`` with the job_id to track progress.
+    """
+    job = _create_job(JobKind.BUILD, req.capability[:40])
+    job.log(f"Fulfill capability queued: {req.capability[:200]}")
+
+    thread = threading.Thread(
+        target=_run_fulfill_sync,
+        args=(job, req.capability, req.context),
+        daemon=True,
+    )
+    thread.start()
+
+    return FulfillCapabilityResponse(
+        ok=True,
+        decision="pending",
+        summary=f"Analyzing capability request — job_id={job.job_id}. Poll build_status for progress.",
+        job_id=job.job_id,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Codex Agent MCP Server")
     parser.add_argument("--port", type=int, default=8012, help="HTTP API port")

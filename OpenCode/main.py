@@ -956,6 +956,81 @@ def check_my_tools_health(cfg: dict) -> list[str]:
     return broken
 
 
+# ──────────────────────────── ensure tools via codex agent ───────
+
+def _ensure_tools_via_codex(cfg: dict, poll_repair_timeout: float = 120.0) -> bool:
+    """Call the codex agent's /ensure_all_tools to start/repair all my_tools.
+
+    Returns True if the call succeeded (even if some tools need async repair).
+    Returns False if the codex agent is unreachable.
+    """
+    try:
+        r = requests.post(
+            f"http://127.0.0.1:{CODEX_API_PORT}/ensure_all_tools",
+            timeout=60,
+        )
+        if not r.ok:
+            LOG.warning("ensure_all_tools returned %d: %s", r.status_code, r.text[:200])
+            return False
+
+        data = r.json()
+        LOG.info("ensure_all_tools result: %s", data.get("summary", ""))
+
+        already = data.get("already_healthy", [])
+        started = data.get("started", [])
+        repair_jobs = data.get("repair_jobs", {})
+        failed = data.get("failed", [])
+        registered = data.get("registered", [])
+
+        if already:
+            LOG.info("  ✅ Already healthy: %s", ", ".join(already))
+        if started:
+            LOG.info("  🚀 Started: %s", ", ".join(started))
+        if registered:
+            LOG.info("  📝 Registered with OpenCode: %s", ", ".join(registered))
+        if failed:
+            LOG.warning("  ❌ Failed: %s", ", ".join(failed))
+
+        # If there are repair jobs, poll them until done or timeout
+        if repair_jobs:
+            LOG.info("  🔧 Repair jobs queued: %s", repair_jobs)
+            deadline = time.monotonic() + poll_repair_timeout
+            pending = dict(repair_jobs)  # tool_name → job_id
+
+            while pending and time.monotonic() < deadline:
+                time.sleep(5)
+                for tool_name, job_id in list(pending.items()):
+                    try:
+                        sr = requests.post(
+                            f"http://127.0.0.1:{CODEX_API_PORT}/build_status",
+                            json={"job_id": job_id},
+                            timeout=10,
+                        )
+                        if sr.ok:
+                            status = sr.json()
+                            state = status.get("state", "")
+                            phase = status.get("phase", "")
+                            if state in ("done", "failed"):
+                                result = status.get("result", {})
+                                healthy = result.get("healthy_after", False)
+                                LOG.info("  Repair %s: %s (%s) — healthy=%s",
+                                         tool_name, state, phase, healthy)
+                                del pending[tool_name]
+                            else:
+                                LOG.debug("  Repair %s: %s (%s)…", tool_name, state, phase)
+                    except Exception as exc:
+                        LOG.warning("  Repair status poll failed for %s: %s", tool_name, exc)
+
+            if pending:
+                LOG.warning("  ⏰ Repair still pending after timeout: %s", list(pending.keys()))
+
+        return True
+
+    except Exception as exc:
+        LOG.warning("ensure_all_tools call failed: %s", exc)
+        return False
+
+
 # ──────────────────────────── main loop ──────────────────────────
 
 def run_forever(cfg: dict) -> None:
@@ -981,12 +1056,24 @@ def run_forever(cfg: dict) -> None:
         LOG.info("OpenCode server already running at %s", client.base)
 
     # Auto-start any custom MCP tools in my_tools/
-    _start_my_tools(cfg)
-
-    # Auto-start the codex agent MCP server
+    # First start codex agent, then let it handle tool recovery
     _start_codex_agent()
-    if _wait_for_codex_agent():
+    codex_ready = _wait_for_codex_agent()
+    if codex_ready:
         _register_codex_agent_with_opencode(cfg)
+
+    # Use codex agent's /ensure_all_tools for smart recovery (start stopped,
+    # repair broken, re-register all).  Falls back to simple _start_my_tools
+    # if codex agent isn't available.
+    if codex_ready:
+        LOG.info("Codex agent available — using /ensure_all_tools for smart recovery…")
+        ok = _ensure_tools_via_codex(cfg)
+        if not ok:
+            LOG.warning("ensure_all_tools failed — falling back to simple start")
+            _start_my_tools(cfg)
+    else:
+        LOG.info("Codex agent not available — using simple _start_my_tools")
+        _start_my_tools(cfg)
 
     def send_prompt(prompt: str) -> str:
         resp = client.send(prompt)
