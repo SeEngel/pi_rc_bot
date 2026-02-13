@@ -1,8 +1,8 @@
 # ──────────────────────────────────────────────
-#  Repair Agent — configuration
+#  Codex Agent — configuration
 # ──────────────────────────────────────────────
 
-# Repair agent's own OpenCode instance (separate from main agent)
+# Codex agent's own OpenCode instance (separate from main agent)
 opencode:
   host: "127.0.0.1"
   port: 4097

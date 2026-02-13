@@ -300,7 +300,7 @@ class OpenCodeClient:
     """Thin wrapper around the OpenCode headless HTTP server API."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 4096,
-                 timeout: int = 120, agent: str = "robot",
+                 timeout: int = 180, agent: str = "robot",
                  model: str | None = None):
         self.base = f"http://{host}:{port}"
         self.timeout = timeout
@@ -551,7 +551,7 @@ def prefetch_observe(cfg: dict) -> str:
     """
     observe_url = _deep_get(cfg, "mcp", "observe", default="http://127.0.0.1:8003")
     try:
-        r = requests.post(f"{observe_url}/observe", timeout=15)
+        r = requests.post(f"{observe_url}/observe", timeout=30)
         if r.ok:
             data = r.json()
             text = data.get("text", "").strip()
@@ -573,7 +573,7 @@ def prefetch_memory(cfg: dict, query: str, top_n: int = 3) -> str:
         r = requests.post(
             f"{memory_url}/get_top_n_memory",
             json={"content": query, "top_n": top_n},
-            timeout=10,
+            timeout=20,
         )
         if r.ok:
             data = r.json()
@@ -624,8 +624,8 @@ MY_TOOLS_DIR = BASE_DIR / "my_tools"
 MY_TOOLS_BASE_PORT = 9100
 _my_tools_procs: list[subprocess.Popen] = []
 
-REPAIR_AGENT_DIR = BASE_DIR / "repair_agent"
-_repair_agent_proc: subprocess.Popen | None = None
+CODEX_AGENT_DIR = BASE_DIR / "codex_agent"
+_codex_agent_proc: subprocess.Popen | None = None
 
 
 def _start_my_tools(cfg: dict) -> None:
@@ -741,61 +741,61 @@ def _stop_my_tools() -> None:
                 pf.unlink(missing_ok=True)
 
 
-# ──────────────────────────── repair agent ───────────────────────
+# ──────────────────────────── codex agent ────────────────────────
 
-REPAIR_API_PORT = 8012
-REPAIR_MCP_PORT = 8612
+CODEX_API_PORT = 8012
+CODEX_MCP_PORT = 8612
 
 
-def _start_repair_agent() -> None:
-    """Launch the repair agent MCP server as a child process.
+def _start_codex_agent() -> None:
+    """Launch the codex agent MCP server as a child process.
 
-    The repair agent is a FastAPI+FastMCP server that the main agent can
-    call as ``robot_repair`` → ``diagnose`` / ``repair`` / ``scan_all``.
+    The codex agent is a FastAPI+FastMCP server that the main agent can
+    call as ``robot_codex`` → ``build_tool`` / ``repair`` / ``diagnose`` / ``scan_all``.
     Under the hood it runs its own OpenCode instance (port 4097) for
-    AI-powered code fixing.
+    AI-powered code generation and fixing.
     """
-    global _repair_agent_proc
+    global _codex_agent_proc
 
-    repair_script = REPAIR_AGENT_DIR / "main_repair.py"
-    if not repair_script.exists():
-        LOG.warning("Repair agent not found at %s — skipping", repair_script)
+    codex_script = CODEX_AGENT_DIR / "main_codex.py"
+    if not codex_script.exists():
+        LOG.warning("Codex agent not found at %s — skipping", codex_script)
         return
 
     # Check if already running
-    if _repair_agent_proc is not None:
+    if _codex_agent_proc is not None:
         try:
-            _repair_agent_proc.poll()
-            if _repair_agent_proc.returncode is None:
-                LOG.info("Repair agent already running (pid %d)", _repair_agent_proc.pid)
+            _codex_agent_proc.poll()
+            if _codex_agent_proc.returncode is None:
+                LOG.info("Codex agent already running (pid %d)", _codex_agent_proc.pid)
                 return
         except Exception:
             pass
 
-    log_file = REPAIR_AGENT_DIR / "repair_supervisor.log"
+    log_file = CODEX_AGENT_DIR / "codex_supervisor.log"
     log_fh = open(log_file, "w", encoding="utf-8")
 
-    _repair_agent_proc = subprocess.Popen(
-        [sys.executable, str(repair_script), "--port", str(REPAIR_API_PORT)],
-        cwd=str(REPAIR_AGENT_DIR),
+    _codex_agent_proc = subprocess.Popen(
+        [sys.executable, str(codex_script), "--port", str(CODEX_API_PORT)],
+        cwd=str(CODEX_AGENT_DIR),
         stdout=log_fh,
         stderr=subprocess.STDOUT,
     )
-    _repair_agent_proc._log_fh = log_fh  # type: ignore[attr-defined]
+    _codex_agent_proc._log_fh = log_fh  # type: ignore[attr-defined]
     LOG.info(
-        "Started repair agent MCP server (pid %d) on port %d (MCP: %d)",
-        _repair_agent_proc.pid, REPAIR_API_PORT, REPAIR_MCP_PORT,
+        "Started codex agent MCP server (pid %d) on port %d (MCP: %d)",
+        _codex_agent_proc.pid, CODEX_API_PORT, CODEX_MCP_PORT,
     )
 
 
-def _stop_repair_agent() -> None:
-    """Stop the repair agent child process."""
-    global _repair_agent_proc
-    if _repair_agent_proc is None:
+def _stop_codex_agent() -> None:
+    """Stop the codex agent child process."""
+    global _codex_agent_proc
+    if _codex_agent_proc is None:
         return
-    proc = _repair_agent_proc
-    _repair_agent_proc = None
-    LOG.info("Stopping repair agent (pid %d)…", proc.pid)
+    proc = _codex_agent_proc
+    _codex_agent_proc = None
+    LOG.info("Stopping codex agent (pid %d)…", proc.pid)
     try:
         proc.terminate()
         try:
@@ -804,7 +804,7 @@ def _stop_repair_agent() -> None:
             proc.kill()
             proc.wait(timeout=5)
     except Exception as exc:
-        LOG.error("Error stopping repair agent: %s", exc)
+        LOG.error("Error stopping codex agent: %s", exc)
     finally:
         fh = getattr(proc, "_log_fh", None)
         if fh:
@@ -814,46 +814,46 @@ def _stop_repair_agent() -> None:
                 pass
 
 
-def _wait_for_repair_agent(retries: int = 15, delay: float = 2.0) -> bool:
-    """Block until the repair agent's /healthz responds."""
-    url = f"http://127.0.0.1:{REPAIR_API_PORT}/healthz"
+def _wait_for_codex_agent(retries: int = 15, delay: float = 2.0) -> bool:
+    """Block until the codex agent's /healthz responds."""
+    url = f"http://127.0.0.1:{CODEX_API_PORT}/healthz"
     for i in range(retries):
         try:
             r = requests.get(url, timeout=3)
             if r.ok:
-                LOG.info("Repair agent healthy at port %d", REPAIR_API_PORT)
+                LOG.info("Codex agent healthy at port %d", CODEX_API_PORT)
                 return True
         except Exception:
             pass
-        LOG.info("Waiting for repair agent (%d/%d)…", i + 1, retries)
+        LOG.info("Waiting for codex agent (%d/%d)…", i + 1, retries)
         time.sleep(delay)
-    LOG.warning("Repair agent not reachable after %d attempts", retries)
+    LOG.warning("Codex agent not reachable after %d attempts", retries)
     return False
 
 
-def _register_repair_agent_with_opencode(cfg: dict) -> None:
-    """Hot-register robot_repair MCP server with the main OpenCode instance."""
+def _register_codex_agent_with_opencode(cfg: dict) -> None:
+    """Hot-register robot_codex MCP server with the main OpenCode instance."""
     oc_cfg = cfg.get("opencode", {})
     oc_base = f"http://{oc_cfg.get('host', '127.0.0.1')}:{oc_cfg.get('port', 4096)}"
     try:
         r = requests.post(
             f"{oc_base}/mcp",
             json={
-                "name": "robot_repair",
+                "name": "robot_codex",
                 "config": {
                     "type": "remote",
-                    "url": f"http://127.0.0.1:{REPAIR_MCP_PORT}/mcp",
+                    "url": f"http://127.0.0.1:{CODEX_MCP_PORT}/mcp",
                     "enabled": True,
                 },
             },
             timeout=10,
         )
         if r.ok:
-            LOG.info("Hot-registered robot_repair MCP at port %d with OpenCode", REPAIR_MCP_PORT)
+            LOG.info("Hot-registered robot_codex MCP at port %d with OpenCode", CODEX_MCP_PORT)
         else:
-            LOG.warning("Failed to register robot_repair: %d %s", r.status_code, r.text[:200])
+            LOG.warning("Failed to register robot_codex: %d %s", r.status_code, r.text[:200])
     except Exception as exc:
-        LOG.warning("Failed to register robot_repair with OpenCode: %s", exc)
+        LOG.warning("Failed to register robot_codex with OpenCode: %s", exc)
 
 
 # ──────────────────────────── my_tools health check ──────────────
@@ -909,10 +909,10 @@ def run_forever(cfg: dict) -> None:
     # Auto-start any custom MCP tools in my_tools/
     _start_my_tools(cfg)
 
-    # Auto-start the repair agent MCP server
-    _start_repair_agent()
-    if _wait_for_repair_agent():
-        _register_repair_agent_with_opencode(cfg)
+    # Auto-start the codex agent MCP server
+    _start_codex_agent()
+    if _wait_for_codex_agent():
+        _register_codex_agent_with_opencode(cfg)
 
     def send_prompt(prompt: str) -> str:
         resp = client.send(prompt)
@@ -963,8 +963,16 @@ def run_forever(cfg: dict) -> None:
                 with ThreadPoolExecutor(max_workers=2) as pool:
                     f_obs = pool.submit(prefetch_observe, cfg)
                     f_mem = pool.submit(prefetch_memory, cfg, transcript)
-                    obs = f_obs.result(timeout=15)
-                    mem = f_mem.result(timeout=15)
+                    try:
+                        obs = f_obs.result(timeout=30)
+                    except Exception as exc:
+                        LOG.warning("Prefetch observe timed out / failed: %s", exc)
+                        obs = "(observe unavailable)"
+                    try:
+                        mem = f_mem.result(timeout=30)
+                    except Exception as exc:
+                        LOG.warning("Prefetch memory timed out / failed: %s", exc)
+                        mem = "(no memories found)"
                 LOG.debug("Prefetch took %.1fs", time.monotonic() - t0)
 
                 # Check if any custom tools are broken
@@ -975,7 +983,7 @@ def run_forever(cfg: dict) -> None:
                         "\n\n## ⚠️ BROKEN TOOLS\n"
                         f"The following custom tools have errors: {', '.join(broken_tools)}\n"
                         "Tell the human: 'Ein Tool hat einen Fehler, ich kümmere mich darum!' "
-                        "Then call robot_repair → repair with the tool_name to fix it. "
+                        "Then call robot_codex → repair with the tool_name to fix it. "
                         "After the repair, retry the action.\n"
                     )
 
@@ -990,6 +998,23 @@ def run_forever(cfg: dict) -> None:
 
                 turn_count += 1
 
+                # ── Post-interaction listen window ──
+                # Stay attentive for a few seconds after responding so the
+                # human can continue the conversation without waiting 12s.
+                post_listen_sec = _deep_get(
+                    cfg, "interaction", "post_reply_listen_seconds", default=6.0
+                )
+                LOG.info("👂 Post-interaction listen window (%.1fs)…", post_listen_sec)
+                post_deadline = time.monotonic() + post_listen_sec
+                heard_more = False
+                while RUNNING and time.monotonic() < post_deadline:
+                    if is_sound_active(cfg):
+                        LOG.info("🎤 Human speaking again — re-entering interaction")
+                        heard_more = True
+                        break
+                if heard_more:
+                    continue  # jump straight back to top → sound_active path
+
             else:
                 # ════════ ALONE MODE ════════
                 LOG.debug("😶 Quiet — alone mode")
@@ -1000,8 +1025,16 @@ def run_forever(cfg: dict) -> None:
                     f_obs = pool.submit(prefetch_observe, cfg)
                     # Memory query uses a generic context since obs isn't ready yet
                     f_mem = pool.submit(prefetch_memory, cfg, "what is around me, environment, exploration")
-                    obs = f_obs.result(timeout=15)
-                    mem = f_mem.result(timeout=15)
+                    try:
+                        obs = f_obs.result(timeout=30)
+                    except Exception as exc:
+                        LOG.warning("Prefetch observe timed out / failed: %s", exc)
+                        obs = "(observe unavailable)"
+                    try:
+                        mem = f_mem.result(timeout=30)
+                    except Exception as exc:
+                        LOG.warning("Prefetch memory timed out / failed: %s", exc)
+                        mem = "(no memories found)"
                 LOG.debug("Prefetch took %.1fs", time.monotonic() - t0)
 
                 # Check if any custom tools are broken
@@ -1011,8 +1044,8 @@ def run_forever(cfg: dict) -> None:
                     alone_p += (
                         "\n\n## ⚠️ BROKEN TOOLS\n"
                         f"The following custom tools have errors: {', '.join(broken_tools)}\n"
-                        "Call robot_repair → repair with the tool_name to fix them. "
-                        "Or call robot_repair → scan_all first to get details.\n"
+                        "Call robot_codex → repair with the tool_name to fix them. "
+                        "Or call robot_codex → scan_all first to get details.\n"
                     )
 
                 try:
@@ -1045,7 +1078,7 @@ def run_forever(cfg: dict) -> None:
     # cleanup
     LOG.info("═══ Robot supervisor stopping… ═══")
     client.abort()
-    _stop_repair_agent()
+    _stop_codex_agent()
     _stop_my_tools()
     stop_opencode_serve()
     LOG.info("═══ Robot supervisor stopped ═══")

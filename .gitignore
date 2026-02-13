@@ -8,3 +8,6 @@ services/memory/data
 .pytest_cache/
 
 OpenCode/opencode_serve.log
+OpenCode/repair_agent/opencode_serve.log
+OpenCode/repair_agent/repair_supervisor.log
+*.log

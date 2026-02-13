@@ -7,7 +7,7 @@ opencode:
   host: "127.0.0.1"
   port: 4096
   # seconds to wait for a response from OpenCode before timing out
-  request_timeout: 60
+  request_timeout: 180
 
 # ── Sound-activity detection ────────────────
 sound:
@@ -39,13 +39,16 @@ interaction:
   # discard transcripts shorter than this
   min_transcript_chars: 3
   # max listen rounds (keeps listening while human talks)
-  max_listen_rounds: 6
+  max_listen_rounds: 10
   # silence timeout for the first listen call (seconds)
-  listen_pause_first: 3.0
-  # silence timeout for follow-up listen calls (shorter = snappier)
-  listen_pause_continue: 2.0
+  listen_pause_first: 5.0
+  # silence timeout for follow-up listen calls
+  listen_pause_continue: 3.0
   # HTTP timeout per listen call
   listen_timeout: 30
+  # how long to stay attentive after the robot finishes replying (seconds)
+  # — keeps the conversation flowing without the 12s alone-mode gap
+  post_reply_listen_seconds: 6.0
   # stop words that end the interaction (case-insensitive)
   stop_words:
     - "stop"

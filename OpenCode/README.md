@@ -18,7 +18,7 @@
 │                                       │ HTTP                         │
 │  Lifecycle managed by main.py:        ▼                              │
 │  • opencode serve :4096        ┌─────────────────────────────┐      │
-│  • repair agent   :8012/8612   │   OpenCode #1  (Go binary)  │      │
+│  • codex agent   :8012/8612   │   OpenCode #1  (Go binary)  │      │
 │  • my_tools/*     :9100+       │   port 4096                 │      │
 │                                │                             │      │
 │                                │   opencode.json config:     │      │
@@ -36,7 +36,7 @@
    └────────────┘ └────────────┘ └──────────┘ └────────────┘ │    :8609 │
                                                              └──────────┘
    ┌──────────────┐  ┌──────────────────────────────────────────────┐
-   │move_adv :8611│  │ robot_repair :8612  (FastAPI + FastMCP)      │
+   │move_adv :8611│  │ robot_codex :8612  (FastAPI + FastMCP)      │
    └──────────────┘  │   ↕ internally uses OpenCode #2 (:4097)     │
                      │   tools: diagnose / repair / scan_all        │
    ┌─────────────┐   └──────────────────────────────────────────────┘
@@ -74,9 +74,9 @@ Your Python code **never calls OpenAI directly** — it always goes through Open
 | Instance | Port | Config dir | Model | Purpose |
 |---|---|---|---|---|
 | **#1 (main brain)** | `4096` | `OpenCode/` | `gpt-4.1-mini` | Robot agent — talks to 7 MCP services, thinks, moves, speaks |
-| **#2 (repair AI)** | `4097` | `OpenCode/repair_agent/` | `gpt-5.2` | Repair technician — only has `bash` + `edit` tools, fixes broken code |
+| **#2 (codex AI)** | `4097` | `OpenCode/codex_agent/` | `gpt-5.2` | Codex technician — only has `bash` + `edit` tools, fixes broken code |
 
-OpenCode #1 is started by `main.py`.  OpenCode #2 is started internally by the repair agent (`main_repair.py`).
+OpenCode #1 is started by `main.py`.  OpenCode #2 is started internally by the codex agent (`main_codex.py`).
 
 ---
 
@@ -110,14 +110,14 @@ OpenCode #1 is started by `main.py`.  OpenCode #2 is started internally by the r
 10. main.py logs it, waits for next cycle
 ```
 
-### Repair Agent (when main agent calls `robot_repair → repair`)
+### Codex Agent (when main agent calls `robot_codex → repair`)
 
 ```
-1.  OpenCode #1 gets LLM tool-call: robot_repair → repair(tool_name="my_weather")
+1.  OpenCode #1 gets LLM tool-call: robot_codex → repair(tool_name="my_weather")
          │
-2.  OpenCode #1 sends MCP request to :8612 (main_repair.py)
+2.  OpenCode #1 sends MCP request to :8612 (main_codex.py)
          │
-3.  main_repair.py reads my_weather/server.py source + server.log
+3.  main_codex.py reads my_weather/server.py source + server.log
          │
 4.  Builds repair prompt with source code + error logs
          │
@@ -129,7 +129,7 @@ OpenCode #1 is started by `main.py`.  OpenCode #2 is started internally by the r
          │
 7.  LLM uses bash/edit tools to fix the file → responds "FIXED: ..."
          │
-8.  main_repair.py restarts the tool process, re-registers with OpenCode #1
+8.  main_codex.py restarts the tool process, re-registers with OpenCode #1
          │
 9.  Returns result back through MCP → OpenCode #1 → LLM → main.py
 ```
@@ -164,10 +164,10 @@ When you run `uv run python OpenCode/main.py`, this happens in order:
 3.  Wait for /global/health → healthy
 4.  Start my_tools/* servers (from my_tools/ subdirectories)
 5.  Register my_tools with OpenCode #1 (POST /mcp for each)
-6.  Start repair agent (python repair_agent/main_repair.py --port 8012)
-     └─ repair agent internally starts OpenCode #2 on port 4097
-7.  Wait for repair agent /healthz → ok
-8.  Register robot_repair with OpenCode #1 (POST /mcp)
+6.  Start codex agent (python codex_agent/main_codex.py --port 8012)
+     └─ codex agent internally starts OpenCode #2 on port 4097
+7.  Wait for codex agent /healthz → ok
+8.  Register robot_codex with OpenCode #1 (POST /mcp)
 9.  Enter main loop:
      ├─ Sound detected? → Interaction mode (listen → prompt → respond)
      └─ No sound?       → Alone mode (every 12s: observe → think → act)
@@ -221,14 +221,14 @@ export OPENAI_API_KEY="sk-..."
 
 ### One command (recommended)
 
-`main.py` auto-starts everything — OpenCode, repair agent, custom tools:
+`main.py` auto-starts everything — OpenCode, codex agent, custom tools:
 
 ```bash
 # Terminal 1: Start all robot MCP services
 cd /home/engelbot/Desktop/pi_rc_bot
 bash services/main.sh
 
-# Terminal 2: Start the supervisor (starts OpenCode + repair agent automatically)
+# Terminal 2: Start the supervisor (starts OpenCode + codex agent automatically)
 cd /home/engelbot/Desktop/pi_rc_bot
 uv run python OpenCode/main.py
 ```
@@ -261,13 +261,13 @@ uv run python OpenCode/main.py --dry-run
 
 Defines which MCP servers OpenCode #1 connects to, model selection, agent persona, and tool permissions.
 
-### `OpenCode/repair_agent/config.yaml` — Repair agent settings
+### `OpenCode/codex_agent/config.yaml` — Codex agent settings
 
 | Setting | Default | Description |
 |---|---|---|
-| `opencode.port` | `4097` | Repair agent's own OpenCode port |
-| `server.api_port` | `8012` | Repair agent HTTP REST port |
-| `server.mcp_port` | `8612` | Repair agent MCP protocol port |
+| `opencode.port` | `4097` | Codex agent's own OpenCode port |
+| `server.api_port` | `8012` | Codex agent HTTP REST port |
+| `server.mcp_port` | `8612` | Codex agent MCP protocol port |
 | `main_opencode_port` | `4096` | Main OpenCode port (for re-registration) |
 | `log_tail_lines` | `80` | Lines of server.log to read for diagnosis |
 
@@ -288,7 +288,7 @@ Defines which MCP servers OpenCode #1 connects to, model selection, agent person
 | Port | Protocol | Service |
 |---|---|---|
 | `4096` | HTTP | OpenCode #1 (main brain) |
-| `4097` | HTTP | OpenCode #2 (repair AI) |
+| `4097` | HTTP | OpenCode #2 (codex AI) |
 | `8001` | HTTP | speak (REST) |
 | `8002` | HTTP | listen (REST) |
 | `8003` | HTTP | observe (REST) |
@@ -299,14 +299,14 @@ Defines which MCP servers OpenCode #1 connects to, model selection, agent person
 | `8008` | HTTP | perception (REST) |
 | `8009` | HTTP | safety (REST) |
 | `8011` | HTTP | move_advisor (REST) |
-| `8012` | HTTP | repair agent (REST) |
+| `8012` | HTTP | codex agent (REST) |
 | `8601` | MCP/SSE | speak |
 | `8606` | MCP/SSE | head |
 | `8607` | MCP/SSE | proximity |
 | `8608` | MCP/SSE | perception |
 | `8609` | MCP/SSE | safety |
 | `8611` | MCP/SSE | move_advisor |
-| `8612` | MCP/SSE | robot_repair |
+| `8612` | MCP/SSE | robot_codex |
 | `9100+` | HTTP+MCP | my_tools/* (agent-created) |
 
 > Robot services expose **both** HTTP REST (80xx) and MCP/SSE (86xx) on separate ports.  The supervisor uses direct HTTP for prefetching (faster); OpenCode uses MCP for tool-calling.
@@ -322,10 +322,10 @@ Defines which MCP servers OpenCode #1 connects to, model selection, agent person
 | `AGENTS.md` | System prompt — robot personality, two workstreams, tool-building instructions, repair tools |
 | `config.yaml` | Supervisor config — sound detection, timing, MCP URLs for direct HTTP |
 | `.env` | API key (`OPENAI_API_KEY=...`) — auto-loaded by OpenCode |
-| `repair_agent/main_repair.py` | Repair MCP server (FastAPI + FastMCP) — `diagnose`, `repair`, `scan_all` tools |
-| `repair_agent/opencode.json` | OpenCode #2 config — `repair` agent, bash + edit only, no MCP servers |
-| `repair_agent/AGENTS.md` | Repair technician system prompt |
-| `repair_agent/config.yaml` | Repair agent config — ports, timeouts, log settings |
+| `codex_agent/main_codex.py` | Repair MCP server (FastAPI + FastMCP) — `diagnose`, `repair`, `scan_all` tools |
+| `codex_agent/opencode.json` | OpenCode #2 config — `repair` agent, bash + edit only, no MCP servers |
+| `codex_agent/AGENTS.md` | Codex technician system prompt |
+| `codex_agent/config.yaml` | Codex agent config — ports, timeouts, log settings |
 | `my_tools/` | Directory for agent-created custom MCP tools |
 | `my_tools/_template/server.py` | FastAPI + FastMCP scaffold for new tools |
 | `my_tools/manage.py` | CLI to create/list/delete custom tools |
@@ -353,7 +353,7 @@ When the microphone picks up sound (RMS > threshold):
 
 ### Self-Repair
 
-If a custom tool in `my_tools/` goes down, `check_my_tools_health()` detects it and injects a broken-tools warning into the next prompt.  The LLM then calls `robot_repair → repair(tool_name="...")` which triggers the full AI-powered repair cycle.
+If a custom tool in `my_tools/` goes down, `check_my_tools_health()` detects it and injects a broken-tools warning into the next prompt.  The LLM then calls `robot_codex → repair(tool_name="...")` which triggers the full AI-powered repair cycle.
 
 ### Self-Extending (my_tools)
 
@@ -369,7 +369,7 @@ After every 10 turns, the supervisor creates a fresh OpenCode session to prevent
 
 ### Graceful Shutdown
 
-`SIGTERM` or `SIGINT` → stops the main loop → terminates all child processes (OpenCode #1, repair agent, my_tools).
+`SIGTERM` or `SIGINT` → stops the main loop → terminates all child processes (OpenCode #1, codex agent, my_tools).
 
 ---
 
@@ -382,7 +382,7 @@ mkdir -p ~/.config/systemd/user
 
 cat > ~/.config/systemd/user/robot-brain.service << 'EOF'
 [Unit]
-Description=OpenCode Robot Brain (supervisor + OpenCode + repair agent)
+Description=OpenCode Robot Brain (supervisor + OpenCode + codex agent)
 After=network.target
 
 [Service]
@@ -412,7 +412,7 @@ systemctl --user start robot-brain
 | "OpenCode server not reachable" | Check logs: `cat OpenCode/opencode_serve.log` |
 | Sound detection always returns 0 | Test mic: `arecord -d 1 -f S16_LE -r 16000 /tmp/test.wav && aplay /tmp/test.wav` |
 | MCP tools fail | Check services: `curl http://127.0.0.1:8001/healthz` |
-| Repair agent not starting | Check logs: `cat OpenCode/repair_agent/repair_supervisor.log` |
+| Codex agent not starting | Check logs: `cat OpenCode/codex_agent/codex_supervisor.log` |
 | "No module named requests" | `cd /home/engelbot/Desktop/pi_rc_bot && uv sync` |
 | OpenCode can't find config | Verify `opencode.json` exists in working dir |
 | API key not found | Ensure `OpenCode/.env` contains `OPENAI_API_KEY=sk-...` |

@@ -34,7 +34,7 @@
       "url": "http://127.0.0.1:8611/mcp",
       "enabled": true
     },
-    "robot_repair": {
+    "robot_codex": {
       "type": "remote",
       "url": "http://127.0.0.1:8612/mcp",
       "enabled": true
@@ -43,8 +43,6 @@
 
   "permission": {
     "*": "allow",
-    "bash": "allow",
-    "edit": "allow",
     "webfetch": "allow"
   },
 
@@ -60,8 +58,7 @@
         "robot_perception_*": true,
         "robot_safety_*": true,
         "robot_move_advisor_*": true,
-        "robot_repair_*": true,
-        "bash": true,
+        "robot_codex_*": true,
         "webfetch": true,
         "websearch": true
       }

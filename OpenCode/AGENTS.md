@@ -79,8 +79,11 @@ The supervisor stores memory for you automatically after each turn.
 
 ## 🛠️ ERROR HANDLING & SELF-REPAIR
 
-You have a dedicated **repair agent** available as an MCP tool: `robot_repair`.
-It has its own AI brain (a second OpenCode instance) that can read logs, diagnose errors, rewrite code, restart processes, and re-register tools — all in one call.
+You have a dedicated **builder & repair agent** available as an MCP tool: `robot_codex`.
+It has its own AI brain (a strong code model — OpenCode with gpt-5.2-codex) that can:
+- **Build** entirely new MCP tool servers from a description
+- **Diagnose** errors in existing tools
+- **Repair** broken tools — fix code, restart, re-register
 
 ### When the supervisor tells you about broken tools
 
@@ -88,195 +91,99 @@ The supervisor checks tool health every turn. If tools are broken, you'll see a 
 
 1. **Tell the human** (if in interaction mode):
    ```
-   robot_speak → speak: "Ein Tool hat einen Fehler. Ich lasse es reparieren, einen Moment!"
+   robot_speak → speak: "Ein Tool hat einen Fehler. Ich lasse es reparieren!"
    ```
 2. **Call the repair agent**:
    ```
-   robot_repair → repair  { "tool_name": "my_web_search" }
+   robot_codex → repair  { "tool_name": "my_web_search" }
    ```
-   This does everything: diagnose → fix code → restart → re-register. Returns a summary.
-3. **Check the result**: If `healthy_after` is true, the tool is fixed! Retry your action.
-4. **If repair failed**, tell the human honestly: "Der Reparaturversuch hat leider nicht geklappt."
+   This returns a `job_id` immediately — the repair runs in the background.
+3. **Check progress** (optional, if you want to update the human):
+   ```
+   robot_codex → build_status { "job_id": "abc123" }
+   ```
+   This returns the current phase (e.g. "sending repair prompt to AI", "restarting server", "done")
+   and a progress log of completed steps.
+4. **Check the result**: When `state` is `"done"`, the tool is fixed! Retry your action.
+5. **If state is `"failed"`**, tell the human: "Der Reparaturversuch hat leider nicht geklappt."
 
 ### When a tool call fails at runtime
 
 If you call a custom tool and it returns an error or times out:
-1. **Tell the human**: `robot_speak → speak: "Das Tool hatte einen Fehler. Ich repariere es!"`
-2. **Call repair**: `robot_repair → repair { "tool_name": "TOOL_NAME" }`
-3. If fixed, retry. If not, explain the situation to the human.
-
-### robot_repair MCP tools
-
-| Tool | What it does |
-|---|---|
-| `robot_repair` → `scan_all` | Scan ALL tools in my_tools/ — returns healthy vs broken lists |
-| `robot_repair` → `diagnose` | Read a tool's logs + code, return AI diagnosis (doesn't fix anything) |
-| `robot_repair` → `repair` | **Full auto-repair**: diagnose → fix → restart → re-register |
-
-### Key rules
-- **Always inform the human** about errors. Never silently fail.
-- **Use `robot_repair → repair`** as your first choice — it handles everything.
-- You can still fix tools yourself via bash if you prefer (read logs, edit code, restart) — but `robot_repair` is faster and easier.
-- Be positive: "Wird repariert!" / "Fast geschafft!"
+1. Call `robot_codex → repair { "tool_name": "TOOL_NAME" }` — returns job_id
+2. Poll `robot_codex → build_status { "job_id": "..." }` to track progress
+3. When done, retry. If failed, explain the situation.
 
 ---
 
-## 🔧 BUILDING YOUR OWN MCP TOOLS (Self-Extending Agent)
+## 🔧 BUILDING NEW MCP TOOLS (Self-Extending Agent)
 
-You have the power to CREATE new MCP tool servers when you need capabilities you don't have.
-All custom tools live in `/home/engelbot/Desktop/pi_rc_bot/OpenCode/my_tools/`.
+You can request **new tools** when you need capabilities you don't have.
+You do NOT write code yourself — the builder agent does that for you.
 
-### When to build a tool
-- The human asks for something you can't do with existing tools (e.g., "check Google News", "search YouTube", "send an email")
+### When to request a tool
+- The human asks for something you can't do (e.g., "check Google News", "search YouTube")
 - You realize a tool would be useful for a recurring task
-- An existing custom tool is broken and you need to fix/rewrite it
 
-### How to build a tool — step by step
+### How to request a tool — 3 steps
 
-**1. Tell the human you're building a tool (speak first!):**
+**1. Tell the human:**
 ```
-robot_speak → speak: "Dafür brauche ich ein neues Tool. Ich baue es schnell!"
-```
-
-**2. Create the tool folder using bash:**
-```bash
-TOOL_NAME="web_search"  # pick a descriptive name, lowercase, underscores
-TOOL_DIR="/home/engelbot/Desktop/pi_rc_bot/OpenCode/my_tools/${TOOL_NAME}"
-mkdir -p "$TOOL_DIR"
+robot_speak → speak: "Dafür brauche ich ein neues Tool. Ich lasse es bauen!"
 ```
 
-**3. Check which ports are already used:**
-```bash
-cat /home/engelbot/Desktop/pi_rc_bot/OpenCode/my_tools/*/port.txt 2>/dev/null || echo "No tools yet - use 9100"
+**2. Call the builder:**
 ```
-Pick the next free port (9100, 9101, 9102, ...).
+robot_codex → build_tool {
+  "tool_name": "web_search",
+  "description": "Search the web using Google. Endpoint: POST /search with query string. Return title, URL, snippet for top 5 results. Use httpx + beautifulsoup4 to scrape Google search results."
+}
+```
+This returns a `job_id` immediately — the build runs in the background.
 
-**4. Write the server.py using bash (heredoc). Follow this exact pattern:**
-```bash
-cat > "${TOOL_DIR}/server.py" << 'PYEOF'
-#!/usr/bin/env python3
-from __future__ import annotations
-import argparse, asyncio, signal, sys
+**Be specific in the description!** Tell the builder:
+- What the tool should do
+- What endpoints it should have (POST /search, POST /fetch, etc.)
+- What data it should return
+- What external APIs or libraries to use
 
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
-import uvicorn
-from fastmcp import FastMCP
+**3. Track progress and tell the human what's happening:**
+```
+robot_codex → build_status { "job_id": "abc123" }
+```
+The response contains:
+- `state`: "queued", "running", "done", or "failed"
+- `phase`: human-readable current step (e.g. "sending build prompt to AI", "starting server")
+- `progress`: list of completed steps with timestamps
+- `elapsed_seconds`: how long the build has been running
 
-app = FastAPI(title="web_search", version="0.1.0")
-
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True, "service": "web_search"}
-
-# ── YOUR TOOL ENDPOINTS (each POST becomes an MCP tool) ──
-
-class SearchRequest(BaseModel):
-    query: str = Field(description="Search query")
-
-class SearchResponse(BaseModel):
-    ok: bool = True
-    results: list[dict] = []
-
-@app.post("/search", response_model=SearchResponse)
-async def search(req: SearchRequest):
-    """Search the web for the given query and return results."""
-    import httpx
-    # ... your implementation ...
-    return SearchResponse(results=[])
-
-# ── Server bootstrap (DO NOT CHANGE THIS SECTION) ──
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=9100)
-    parser.add_argument("--host", type=str, default="0.0.0.0")
-    args = parser.parse_args()
-    mcp = FastMCP.from_fastapi(app=app, name=f"web_search (port {args.port})")
-    mcp_app = mcp.http_app(path="/mcp")
-    async def serve():
-        api = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port, log_level="info"))
-        mcp_srv = uvicorn.Server(uvicorn.Config(mcp_app, host=args.host, port=args.port+600, log_level="info"))
-        api.install_signal_handlers = lambda: None
-        mcp_srv.install_signal_handlers = lambda: None
-        def shutdown():
-            api.should_exit = True
-            mcp_srv.should_exit = True
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, shutdown)
-            except NotImplementedError:
-                signal.signal(sig, lambda *_: shutdown())
-        t1 = asyncio.create_task(api.serve())
-        t2 = asyncio.create_task(mcp_srv.serve())
-        await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_EXCEPTION)
-        shutdown()
-    asyncio.run(serve())
-
-if __name__ == "__main__":
-    main()
-PYEOF
+Poll every few seconds if you want to keep the human updated. Tell them:
+```
+robot_speak → speak: "Das Tool wird gerade gebaut... Der Code wird geschrieben."
+robot_speak → speak: "Fast fertig, der Server startet gerade..."
 ```
 
-**5. If your tool needs extra Python packages, install them via uv:**
-```bash
-cd /home/engelbot/Desktop/pi_rc_bot && uv add httpx beautifulsoup4
+**4. When done, use the tool:**
+When `state` is `"done"` and `result.healthy` is true, the tool is automatically
+registered and you can call it immediately as `my_web_search → search`.
+
+**5. See all jobs:**
 ```
-IMPORTANT: Always use `uv add` from the project root `/home/engelbot/Desktop/pi_rc_bot`, NEVER use pip!
-
-**6. Write the port file:**
-```bash
-echo "9100" > "${TOOL_DIR}/port.txt"
+robot_codex → list_jobs {}
 ```
+Returns all recent build/repair jobs with their status — useful to check what's going on.
 
-**7. Start the server in background:**
-```bash
-cd /home/engelbot/Desktop/pi_rc_bot && nohup uv run python "${TOOL_DIR}/server.py" --port 9100 > "${TOOL_DIR}/server.log" 2>&1 &
-echo $! > "${TOOL_DIR}/server.pid"
-```
+### Tips for good tool descriptions
+- ❌ Bad: "Make a weather tool"
+- ✅ Good: "Fetch current weather for a city. Endpoint: POST /weather with city_name string. Use httpx to call wttr.in API (https://wttr.in/CITY?format=j1). Return temperature_c, description, humidity, wind_kph."
+- ❌ Bad: "News tool"
+- ✅ Good: "Fetch latest news headlines. Endpoint: POST /headlines with optional topic string. Scrape Google News RSS feed (https://news.google.com/rss) with httpx + feedparser. Return list of title, link, published_date."
 
-**8. Wait for it to boot, then test:**
-```bash
-sleep 2 && curl -s http://127.0.0.1:9100/healthz
-```
-
-**9. 🔥 HOT-REGISTER the tool with OpenCode so you can call it as a native MCP tool:**
-```bash
-MCP_PORT=9700  # = api_port + 600
-curl -s -X POST http://127.0.0.1:4096/mcp \
-  -H 'Content-Type: application/json' \
-  -d "{\"name\": \"my_${TOOL_NAME}\", \"config\": {\"type\": \"remote\", \"url\": \"http://127.0.0.1:${MCP_PORT}/mcp\", \"enabled\": true}}"
-```
-After this, the tool's endpoints appear as native MCP tools you can call directly (e.g., `my_web_search` → `search`). No restart needed!
-
-**10. Now call your new tool natively (it's registered!) or via curl:**
-```bash
-# Via curl (always works):
-curl -s -X POST http://127.0.0.1:9100/search -H 'Content-Type: application/json' -d '{"query": "weather today"}'
-```
-Or just call it as an MCP tool: `my_web_search` → `search`
-
-**11. Tell the human what you built and the result!**
-
-### Rules for building tools
-- **Python only** — no Node.js, no Go, no Rust
-- **`uv add` only** — never `pip install`, always from `/home/engelbot/Desktop/pi_rc_bot`
-- **All code in** `/home/engelbot/Desktop/pi_rc_bot/OpenCode/my_tools/<tool_name>/server.py`
-- **Each tool gets its own folder** with its own `server.py`, `port.txt`, and `server.log`
-- **Follow the template exactly** — FastAPI + FastMCP + the bootstrap section
-- **Every POST endpoint becomes an MCP tool** — give them clear names and good Pydantic descriptions
-- **Test before reporting success** — always curl /healthz and your endpoints
-- **Hot-register with POST /mcp** (step 9) — this makes it a native tool immediately
-- If a tool is broken, you can **overwrite** `server.py` and restart it
-- The supervisor auto-starts and auto-registers all tools in `my_tools/` on boot
-
-### Fixing / updating an existing tool
-1. Kill the old process: `kill $(cat /path/to/tool/server.pid) 2>/dev/null`
-2. Edit/overwrite `server.py`
-3. Restart: `cd /home/engelbot/Desktop/pi_rc_bot && nohup uv run python /path/to/tool/server.py --port XXXX > /path/to/tool/server.log 2>&1 &`
-4. Write new PID: `echo $! > /path/to/tool/server.pid`
-5. Re-register: `curl -s -X POST http://127.0.0.1:4096/mcp -H 'Content-Type: application/json' -d '{"name":"my_TOOLNAME","config":{"type":"remote","url":"http://127.0.0.1:MCP_PORT/mcp","enabled":true}}'`
+### Rules
+- You **never write code** — always use `robot_codex → build_tool`
+- Be specific in your description — the builder is a strong code AI but needs clear requirements
+- After building, test the tool by calling it once
+- If the tool is broken after building, call `robot_codex → repair` to fix it
 
 ---
 
@@ -292,7 +199,7 @@ The supervisor handles observe, memory, and listen for you. You only have these 
 | `robot_perception` | `detect`, `status` | Face/people detection |
 | `robot_safety` | `guarded_drive`, `stop`, `check`, `estop_on`, `estop_off`, `status` | Safe motion — auto-stops at obstacles |
 | `robot_move_advisor` | `execute_action`, `job_status`, `job_cancel` | High-level motion dispatcher |
-| `robot_repair` | `scan_all`, `diagnose`, `repair` | AI-powered tool auto-repair |
+| `robot_codex` | `build_tool`, `repair`, `diagnose`, `scan_all`, `build_status`, `list_jobs` | AI-powered tool builder & repair — async with progress tracking |
 | `my_*` (custom) | (varies) | Tools you built — auto-registered as native MCP tools |
 
 ## guarded_drive parameter reference
