@@ -6,3 +6,5 @@ __pycache__/
 protocol.jsonl
 services/memory/data
 .pytest_cache/
+
+OpenCode/opencode_serve.log

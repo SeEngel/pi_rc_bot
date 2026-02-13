@@ -36,6 +36,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -617,6 +618,270 @@ def has_stop_word(text: str, cfg: dict) -> bool:
     return any(w.lower() in lower for w in stop_words)
 
 
+# ──────────────────────────── my_tools auto-start ────────────────
+
+MY_TOOLS_DIR = BASE_DIR / "my_tools"
+MY_TOOLS_BASE_PORT = 9100
+_my_tools_procs: list[subprocess.Popen] = []
+
+REPAIR_AGENT_DIR = BASE_DIR / "repair_agent"
+_repair_agent_proc: subprocess.Popen | None = None
+
+
+def _start_my_tools(cfg: dict) -> None:
+    """Auto-start all custom MCP tool servers found in my_tools/."""
+    if not MY_TOOLS_DIR.exists():
+        return
+    tool_dirs = sorted(
+        d for d in MY_TOOLS_DIR.iterdir()
+        if d.is_dir() and not d.name.startswith(("_", ".")) and (d / "server.py").exists()
+    )
+    for i, tool_dir in enumerate(tool_dirs):
+        port_file = tool_dir / "port.txt"
+        port = int(port_file.read_text().strip()) if port_file.exists() else MY_TOOLS_BASE_PORT + i
+        mcp_port = port + 600
+
+        # Check if already running
+        pid_file = tool_dir / "server.pid"
+        if pid_file.exists():
+            try:
+                old_pid = int(pid_file.read_text().strip())
+                os.kill(old_pid, 0)  # check alive
+                LOG.info("my_tools/%s already running (pid %d) on port %d", tool_dir.name, old_pid, port)
+                continue
+            except (OSError, ValueError):
+                pid_file.unlink(missing_ok=True)
+
+        log_file = tool_dir / "server.log"
+        log_fh = open(log_file, "a", encoding="utf-8")  # append so repair agent can read errors
+        proc = subprocess.Popen(
+            [sys.executable, str(tool_dir / "server.py"), "--port", str(port)],
+            cwd=str(tool_dir),
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+        )
+        proc._log_fh = log_fh  # type: ignore[attr-defined]
+        pid_file.write_text(str(proc.pid))
+        _my_tools_procs.append(proc)
+        LOG.info("Started my_tools/%s on port %d (MCP: %d), pid=%d", tool_dir.name, port, mcp_port, proc.pid)
+
+    # Give servers a moment to boot, then hot-register with OpenCode
+    if tool_dirs:
+        time.sleep(2)
+        _register_my_tools_with_opencode(cfg, tool_dirs)
+
+
+def _register_my_tools_with_opencode(cfg: dict, tool_dirs: list[Path] | None = None) -> None:
+    """Hot-register custom MCP tool servers with the running OpenCode instance.
+
+    Uses the OpenCode server API:  POST /mcp  { name, config }
+    This makes tools immediately available to the model without restarting.
+    """
+    oc_cfg = cfg.get("opencode", {})
+    oc_base = f"http://{oc_cfg.get('host', '127.0.0.1')}:{oc_cfg.get('port', 4096)}"
+
+    if tool_dirs is None:
+        if not MY_TOOLS_DIR.exists():
+            return
+        tool_dirs = sorted(
+            d for d in MY_TOOLS_DIR.iterdir()
+            if d.is_dir() and not d.name.startswith(("_", ".")) and (d / "server.py").exists()
+        )
+
+    for i, tool_dir in enumerate(tool_dirs):
+        port_file = tool_dir / "port.txt"
+        port = int(port_file.read_text().strip()) if port_file.exists() else MY_TOOLS_BASE_PORT + i
+        mcp_port = port + 600
+        name = f"my_{tool_dir.name}"
+
+        try:
+            r = requests.post(
+                f"{oc_base}/mcp",
+                json={
+                    "name": name,
+                    "config": {
+                        "type": "remote",
+                        "url": f"http://127.0.0.1:{mcp_port}/mcp",
+                        "enabled": True,
+                    },
+                },
+                timeout=10,
+            )
+            if r.ok:
+                LOG.info("Hot-registered MCP '%s' at port %d with OpenCode", name, mcp_port)
+            else:
+                LOG.warning("Failed to register MCP '%s': %d %s", name, r.status_code, r.text[:200])
+        except Exception as exc:
+            LOG.warning("Failed to register MCP '%s' with OpenCode: %s", name, exc)
+
+
+def _stop_my_tools() -> None:
+    """Stop all managed my_tools processes."""
+    for proc in _my_tools_procs:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        fh = getattr(proc, "_log_fh", None)
+        if fh:
+            try:
+                fh.close()
+            except Exception:
+                pass
+    _my_tools_procs.clear()
+    # Also clean up pid files
+    if MY_TOOLS_DIR.exists():
+        for d in MY_TOOLS_DIR.iterdir():
+            if d.is_dir():
+                pf = d / "server.pid"
+                pf.unlink(missing_ok=True)
+
+
+# ──────────────────────────── repair agent ───────────────────────
+
+REPAIR_API_PORT = 8012
+REPAIR_MCP_PORT = 8612
+
+
+def _start_repair_agent() -> None:
+    """Launch the repair agent MCP server as a child process.
+
+    The repair agent is a FastAPI+FastMCP server that the main agent can
+    call as ``robot_repair`` → ``diagnose`` / ``repair`` / ``scan_all``.
+    Under the hood it runs its own OpenCode instance (port 4097) for
+    AI-powered code fixing.
+    """
+    global _repair_agent_proc
+
+    repair_script = REPAIR_AGENT_DIR / "main_repair.py"
+    if not repair_script.exists():
+        LOG.warning("Repair agent not found at %s — skipping", repair_script)
+        return
+
+    # Check if already running
+    if _repair_agent_proc is not None:
+        try:
+            _repair_agent_proc.poll()
+            if _repair_agent_proc.returncode is None:
+                LOG.info("Repair agent already running (pid %d)", _repair_agent_proc.pid)
+                return
+        except Exception:
+            pass
+
+    log_file = REPAIR_AGENT_DIR / "repair_supervisor.log"
+    log_fh = open(log_file, "w", encoding="utf-8")
+
+    _repair_agent_proc = subprocess.Popen(
+        [sys.executable, str(repair_script), "--port", str(REPAIR_API_PORT)],
+        cwd=str(REPAIR_AGENT_DIR),
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+    )
+    _repair_agent_proc._log_fh = log_fh  # type: ignore[attr-defined]
+    LOG.info(
+        "Started repair agent MCP server (pid %d) on port %d (MCP: %d)",
+        _repair_agent_proc.pid, REPAIR_API_PORT, REPAIR_MCP_PORT,
+    )
+
+
+def _stop_repair_agent() -> None:
+    """Stop the repair agent child process."""
+    global _repair_agent_proc
+    if _repair_agent_proc is None:
+        return
+    proc = _repair_agent_proc
+    _repair_agent_proc = None
+    LOG.info("Stopping repair agent (pid %d)…", proc.pid)
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    except Exception as exc:
+        LOG.error("Error stopping repair agent: %s", exc)
+    finally:
+        fh = getattr(proc, "_log_fh", None)
+        if fh:
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+def _wait_for_repair_agent(retries: int = 15, delay: float = 2.0) -> bool:
+    """Block until the repair agent's /healthz responds."""
+    url = f"http://127.0.0.1:{REPAIR_API_PORT}/healthz"
+    for i in range(retries):
+        try:
+            r = requests.get(url, timeout=3)
+            if r.ok:
+                LOG.info("Repair agent healthy at port %d", REPAIR_API_PORT)
+                return True
+        except Exception:
+            pass
+        LOG.info("Waiting for repair agent (%d/%d)…", i + 1, retries)
+        time.sleep(delay)
+    LOG.warning("Repair agent not reachable after %d attempts", retries)
+    return False
+
+
+def _register_repair_agent_with_opencode(cfg: dict) -> None:
+    """Hot-register robot_repair MCP server with the main OpenCode instance."""
+    oc_cfg = cfg.get("opencode", {})
+    oc_base = f"http://{oc_cfg.get('host', '127.0.0.1')}:{oc_cfg.get('port', 4096)}"
+    try:
+        r = requests.post(
+            f"{oc_base}/mcp",
+            json={
+                "name": "robot_repair",
+                "config": {
+                    "type": "remote",
+                    "url": f"http://127.0.0.1:{REPAIR_MCP_PORT}/mcp",
+                    "enabled": True,
+                },
+            },
+            timeout=10,
+        )
+        if r.ok:
+            LOG.info("Hot-registered robot_repair MCP at port %d with OpenCode", REPAIR_MCP_PORT)
+        else:
+            LOG.warning("Failed to register robot_repair: %d %s", r.status_code, r.text[:200])
+    except Exception as exc:
+        LOG.warning("Failed to register robot_repair with OpenCode: %s", exc)
+
+
+# ──────────────────────────── my_tools health check ──────────────
+
+
+def check_my_tools_health(cfg: dict) -> list[str]:
+    """Quick healthcheck on all running my_tools.  Returns list of broken tool names."""
+    broken: list[str] = []
+    if not MY_TOOLS_DIR.exists():
+        return broken
+    for tool_dir in sorted(MY_TOOLS_DIR.iterdir()):
+        if not tool_dir.is_dir() or tool_dir.name.startswith(("_", ".")):
+            continue
+        if not (tool_dir / "server.py").exists():
+            continue
+        port_file = tool_dir / "port.txt"
+        if not port_file.exists():
+            continue
+        port = int(port_file.read_text().strip())
+        try:
+            r = requests.get(f"http://127.0.0.1:{port}/healthz", timeout=3)
+            if not r.ok:
+                broken.append(tool_dir.name)
+        except Exception:
+            broken.append(tool_dir.name)
+    return broken
+
+
 # ──────────────────────────── main loop ──────────────────────────
 
 def run_forever(cfg: dict) -> None:
@@ -640,6 +905,14 @@ def run_forever(cfg: dict) -> None:
         client.wait_for_server(retries=30, delay=2.0)
     else:
         LOG.info("OpenCode server already running at %s", client.base)
+
+    # Auto-start any custom MCP tools in my_tools/
+    _start_my_tools(cfg)
+
+    # Auto-start the repair agent MCP server
+    _start_repair_agent()
+    if _wait_for_repair_agent():
+        _register_repair_agent_with_opencode(cfg)
 
     def send_prompt(prompt: str) -> str:
         resp = client.send(prompt)
@@ -685,14 +958,29 @@ def run_forever(cfg: dict) -> None:
                     turn_count += 1
                     continue
 
-                # Pre-fetch observe + memory in parallel-ish (both fast HTTP)
+                # Pre-fetch observe + memory truly in parallel
                 t0 = time.monotonic()
-                obs = prefetch_observe(cfg)
-                mem = prefetch_memory(cfg, transcript)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    f_obs = pool.submit(prefetch_observe, cfg)
+                    f_mem = pool.submit(prefetch_memory, cfg, transcript)
+                    obs = f_obs.result(timeout=15)
+                    mem = f_mem.result(timeout=15)
                 LOG.debug("Prefetch took %.1fs", time.monotonic() - t0)
 
+                # Check if any custom tools are broken
+                broken_tools = check_my_tools_health(cfg)
+                interact_p = interaction_prompt(transcript, obs, mem)
+                if broken_tools:
+                    interact_p += (
+                        "\n\n## ⚠️ BROKEN TOOLS\n"
+                        f"The following custom tools have errors: {', '.join(broken_tools)}\n"
+                        "Tell the human: 'Ein Tool hat einen Fehler, ich kümmere mich darum!' "
+                        "Then call robot_repair → repair with the tool_name to fix it. "
+                        "After the repair, retry the action.\n"
+                    )
+
                 try:
-                    reply = send_prompt(interaction_prompt(transcript, obs, mem))
+                    reply = send_prompt(interact_p)
                     LOG.info("Interaction reply (first 200 chars): %s", reply[:200])
                     # Store memory on behalf of the agent
                     summary = f"[INTERACTION] Human: {transcript[:200]} | Scene: {obs[:150]} | Reply: {reply[:200]}"
@@ -706,14 +994,29 @@ def run_forever(cfg: dict) -> None:
                 # ════════ ALONE MODE ════════
                 LOG.debug("😶 Quiet — alone mode")
 
-                # Pre-fetch observe + memory (saves ~15-20s per cycle)
+                # Pre-fetch observe + memory truly in parallel
                 t0 = time.monotonic()
-                obs = prefetch_observe(cfg)
-                mem = prefetch_memory(cfg, obs[:200])  # query memory with what we see
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    f_obs = pool.submit(prefetch_observe, cfg)
+                    # Memory query uses a generic context since obs isn't ready yet
+                    f_mem = pool.submit(prefetch_memory, cfg, "what is around me, environment, exploration")
+                    obs = f_obs.result(timeout=15)
+                    mem = f_mem.result(timeout=15)
                 LOG.debug("Prefetch took %.1fs", time.monotonic() - t0)
 
+                # Check if any custom tools are broken
+                broken_tools = check_my_tools_health(cfg)
+                alone_p = alone_prompt(obs, mem)
+                if broken_tools:
+                    alone_p += (
+                        "\n\n## ⚠️ BROKEN TOOLS\n"
+                        f"The following custom tools have errors: {', '.join(broken_tools)}\n"
+                        "Call robot_repair → repair with the tool_name to fix them. "
+                        "Or call robot_repair → scan_all first to get details.\n"
+                    )
+
                 try:
-                    reply = send_prompt(alone_prompt(obs, mem))
+                    reply = send_prompt(alone_p)
                     LOG.info("Alone reply (first 200 chars): %s", reply[:200])
                     # Store memory on behalf of the agent
                     summary = f"[ALONE] Scene: {obs[:200]} | Thought: {reply[:200]}"
@@ -742,6 +1045,8 @@ def run_forever(cfg: dict) -> None:
     # cleanup
     LOG.info("═══ Robot supervisor stopping… ═══")
     client.abort()
+    _stop_repair_agent()
+    _stop_my_tools()
     stop_opencode_serve()
     LOG.info("═══ Robot supervisor stopped ═══")
 

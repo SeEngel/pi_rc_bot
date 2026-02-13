@@ -7,7 +7,7 @@ opencode:
   host: "127.0.0.1"
   port: 4096
   # seconds to wait for a response from OpenCode before timing out
-  request_timeout: 120
+  request_timeout: 60
 
 # ── Sound-activity detection ────────────────
 sound:

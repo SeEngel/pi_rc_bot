@@ -1,0 +1,22 @@
+# ──────────────────────────────────────────────
+#  Repair Agent — configuration
+# ──────────────────────────────────────────────
+
+# Repair agent's own OpenCode instance (separate from main agent)
+opencode:
+  host: "127.0.0.1"
+  port: 4097
+  request_timeout: 90
+
+# Repair agent MCP server ports
+server:
+  api_port: 8012       # HTTP REST
+  mcp_port: 8612       # MCP protocol  (api_port + 600)
+
+# How many tail lines to read from each server.log
+log_tail_lines: 80
+
+# Port for the main agent's OpenCode (to hot-register repaired tools)
+main_opencode_port: 4096
+
+log_level: "INFO"

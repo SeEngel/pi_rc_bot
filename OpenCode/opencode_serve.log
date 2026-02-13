@@ -1,9 +1,2 @@
 Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.
 opencode server listening on http://127.0.0.1:4096
-Resolving dependencies
-Resolved, downloaded and extracted [2]
-error: Package "pyright" with tag "latest" not found, but package exists
-error: pyright@ failed to resolve
-Resolving dependencies
-Resolved, downloaded and extracted [6]
-Saved lockfile
