@@ -115,8 +115,13 @@ should_start_service() {
 			# Split-brain mode: start everything (including move_advisor).
 			return 0
 			;;
+		open_code)
+			# OpenCode mode: same services as split_brain_move.
+			# The OpenCode supervisor runs separately (pi_rc_opencode.service).
+			return 0
+			;;
 		*)
-			echo "unknown workflow_mode in services/config.yaml: '$workflow_mode' (expected legacy|split_brain_move)" >&2
+			echo "unknown workflow_mode in services/config.yaml: '$workflow_mode' (expected legacy|split_brain_move|open_code)" >&2
 			exit 2
 			;;
 	esac

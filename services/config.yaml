@@ -2,7 +2,8 @@
 #
 # Controls which set of services `services/main.sh` starts.
 #
-# - legacy: start the existing service set (no move_advisor)
-# - split_brain_move: start legacy services + move_advisor (move-cluster entry point)
+# - legacy:           monolithic services + legacy advisor agent
+# - split_brain_move: brain services + move cluster + split-brain advisor agent
+# - open_code:        brain services + move cluster + OpenCode supervisor (recommended)
 
-workflow_mode: split_brain_move
+workflow_mode: open_code

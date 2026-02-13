@@ -106,6 +106,7 @@ SERVICES=(
 )
 
 # Add move_advisor only in split_brain_move mode.
+# In open_code mode, the OpenCode supervisor handles movement decisions directly.
 if [[ "$workflow_mode" == "split_brain_move" ]]; then
 	SERVICES+=("move_advisor")
 	echo "workflow_mode=split_brain_move: including move_advisor service"
