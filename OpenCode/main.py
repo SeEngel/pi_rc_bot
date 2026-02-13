@@ -1181,10 +1181,12 @@ def run_forever(cfg: dict) -> None:
                 # If the human speaks, we get a transcript; if not, empty.
                 # max_wait_for_speech_seconds ensures we don't block for
                 # the full record_seconds if nobody talks.
+                # Timeout budget: wait_for_speech (6s) + speech+silence (up to ~4s)
+                #   + OpenAI transcription (~5s) + listener_lock margin (~5s) = ~20s
                 post_transcript = _listen_once(
                     _deep_get(cfg, "mcp", "listen", default="http://127.0.0.1:8002"),
                     pause_seconds=2.0,  # silence-after-speech timeout
-                    timeout=post_listen_sec + 5,
+                    timeout=post_listen_sec + 15,
                     max_wait_for_speech_seconds=post_listen_sec,
                 )
                 if post_transcript and len(post_transcript) >= _deep_get(
