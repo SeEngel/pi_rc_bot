@@ -5,3 +5,4 @@ __pycache__/
 *.out
 protocol.jsonl
 services/memory/data
+.pytest_cache/

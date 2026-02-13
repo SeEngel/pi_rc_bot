@@ -2766,20 +2766,23 @@ class AdvisorAgent:
 		human_text: str,
 		observation: str | None,
 		memory_hint: str | None,
-	) -> tuple[str, bool | None, list[dict[str, Any]]]:
+	) -> tuple[str, bool | None, list[dict[str, Any]], bool]:
 		"""Streaming version of _decide_and_respond that speaks text as it arrives.
 		
 		This method streams the LLM response and sends text chunks to TTS as they arrive,
 		significantly reducing the time to first audio. The full response is still accumulated
 		for parsing actions and need_observe.
 		
-		Returns the same tuple as _decide_and_respond: (response_text, need_observe, actions)
+		Returns (response_text, need_observe, actions, speech_streamed).
+		``speech_streamed`` is True when at least some speech was actually sent to
+		TTS during streaming; False when the TTS stream was suppressed (e.g. because
+		the model used the old JSON-envelope format).
 		"""
 		if self._dry_run:
 			# Minimal, deterministic behavior for test runs.
 			if observation and observation.strip():
-				return (f"(dry_run) Based on what I see: {observation.strip()}", None, [])
-			return (f"(dry_run) I heard: {human_text.strip()}", None, [])
+				return (f"(dry_run) Based on what I see: {observation.strip()}", None, [], False)
+			return (f"(dry_run) I heard: {human_text.strip()}", None, [], False)
 
 		brain = await self._ensure_brain()
 
@@ -2855,6 +2858,14 @@ class AdvisorAgent:
 		separator_seen = False
 		pending_speech_chunk = ""  # Buffer to reduce HTTP calls
 		chunk_send_threshold = 40  # Send to TTS every ~40 chars (faster first response)
+		# The separator string that divides speech from JSON metadata.
+		_SEPARATOR = "---JSON---"
+		# We hold back a tail of this length to avoid sending a partial separator to TTS.
+		_SEP_GUARD_LEN = len(_SEPARATOR) - 1  # 9 chars
+		# If the first non-whitespace char of the response is '{' or '[' then the
+		# model is using the old JSON-envelope format — suppress all TTS streaming
+		# so we don't speak raw JSON.
+		_json_envelope_detected = False
 		
 		# Create a persistent HTTP session for all chunk requests (much faster)
 		import aiohttp
@@ -2877,35 +2888,110 @@ class AdvisorAgent:
 					
 					full_response += chunk_text
 					
+					# Early detection: if the response starts with '{' or '['
+					# the model is using the old JSON-envelope format.  Suppress
+					# all TTS chunk streaming to avoid speaking raw JSON.
+					if not _json_envelope_detected and not separator_seen:
+						first_char = full_response.lstrip()[:1]
+						if first_char in ("{", "["):
+							_json_envelope_detected = True
+							self._emit(
+								"streaming_json_envelope_detected",
+								component="advisor.brain",
+								first_char=first_char,
+							)
+					
 					# Check for JSON separator
 					if not separator_seen:
 						# Look for the separator in accumulated text
-						if "---JSON---" in full_response:
+						if _SEPARATOR in full_response:
 							separator_seen = True
-							parts = full_response.split("---JSON---", 1)
+							parts = full_response.split(_SEPARATOR, 1)
 							speech_text = parts[0].strip()
 							json_part = parts[1] if len(parts) > 1 else ""
 							
-							# Send any remaining buffered speech text before separator
-							if pending_speech_chunk.strip():
-								await self._speak_stream_chunk(session_id, pending_speech_chunk, http_session)
-								pending_speech_chunk = ""
+							# Figure out what part of the pending buffer is actually
+							# speech (before the separator) and send only that.
+							if pending_speech_chunk and not _json_envelope_detected:
+								pre_sep = pending_speech_chunk.split(_SEPARATOR, 1)[0].strip()
+								if pre_sep:
+									await self._speak_stream_chunk(session_id, pre_sep, http_session)
+							pending_speech_chunk = ""
 						else:
 							# Still in speech section - buffer chunks to reduce HTTP calls
 							pending_speech_chunk += chunk_text
 							speech_text = full_response.strip()
 							
-							# Send when buffer is big enough
-							if len(pending_speech_chunk) >= chunk_send_threshold:
-								await self._speak_stream_chunk(session_id, pending_speech_chunk, http_session)
-								pending_speech_chunk = ""
+							if not _json_envelope_detected:
+								# Detect inline JSON: if we see a '{' preceded by
+								# whitespace/newline, the model is probably appending
+								# JSON without the separator.  Hold everything from
+								# that '{' onward and stop sending to TTS.
+								brace_idx = -1
+								for _marker in ("\n{", " {"):
+									idx = pending_speech_chunk.find(_marker)
+									if idx != -1:
+										brace_idx = idx
+										break
+								if brace_idx != -1:
+									# Send only the text before the brace
+									pre_brace = pending_speech_chunk[:brace_idx].strip()
+									if pre_brace:
+										await self._speak_stream_chunk(session_id, pre_brace, http_session)
+									# Keep everything from the brace onward in the
+									# buffer — it will NOT be sent to TTS.  The
+									# post-loop logic will decide what to do with it.
+									pending_speech_chunk = pending_speech_chunk[brace_idx:]
+									# Suppress further TTS sends for this stream.
+									_json_envelope_detected = True
+									self._emit(
+										"streaming_inline_json_detected",
+										component="advisor.brain",
+										brace_offset=brace_idx,
+									)
+									continue
+								
+								# Before flushing, hold back a tail guard so we never
+								# send a partial separator (e.g. "---J") to TTS.
+								flushable = pending_speech_chunk
+								held_back = ""
+								if len(flushable) > _SEP_GUARD_LEN:
+									held_back = flushable[-_SEP_GUARD_LEN:]
+									flushable = flushable[:-_SEP_GUARD_LEN]
+								else:
+									# Entire buffer is shorter than guard — keep it all.
+									flushable = ""
+									held_back = pending_speech_chunk
+								
+								# Send when flushable portion is big enough
+								if len(flushable) >= chunk_send_threshold:
+									await self._speak_stream_chunk(session_id, flushable, http_session)
+									pending_speech_chunk = held_back
 					else:
 						# In JSON section, accumulate for parsing
 						json_part += chunk_text
 				
-				# Send any remaining buffered speech
-				if pending_speech_chunk.strip():
-					await self._speak_stream_chunk(session_id, pending_speech_chunk, http_session)
+				# Stream finished.  Flush remaining speech buffer, but ONLY the
+				# part before the separator (if separator was found mid-buffer) or
+				# the full buffer if the separator was never found.
+				# Never flush if we detected a JSON-envelope response.
+				if not _json_envelope_detected and pending_speech_chunk.strip() and not separator_seen:
+					# No separator found at all — we need to check whether the
+					# accumulated text is actually valid JSON (fallback format).
+					# If it is, do NOT send it to TTS.
+					trimmed = full_response.strip()
+					looks_like_json = (
+						(trimmed.startswith("{") and trimmed.endswith("}"))
+						or (trimmed.startswith("[") and trimmed.endswith("]"))
+					)
+					if not looks_like_json:
+						await self._speak_stream_chunk(session_id, pending_speech_chunk, http_session)
+				elif not _json_envelope_detected and pending_speech_chunk.strip() and separator_seen:
+					# Separator was found, but there was still pending text.
+					# Only send the pre-separator portion.
+					pre_sep = pending_speech_chunk.split(_SEPARATOR, 1)[0].strip()
+					if pre_sep:
+						await self._speak_stream_chunk(session_id, pre_sep, http_session)
 			
 			except Exception as exc:
 				self._emit(
@@ -2955,12 +3041,55 @@ class AdvisorAgent:
 				)
 
 		# If no separator was found, try to parse as original JSON format
+		speech_was_streamed: bool | None = None  # will be set below
 		if not separator_seen:
 			decision = self._parse_decision_json(full_response)
 			if decision is not None and decision.response_text is not None:
-				return (decision.response_text, decision.need_observe, decision.actions)
-			# Fallback: treat entire output as speech
-			speech_text = full_response.strip()
+				# JSON-envelope or inline JSON: chunks that were already streamed
+				# may contain raw JSON text.  Stop any in-progress playback so the
+				# user doesn't hear it, then let the caller do a clean _speak().
+				if not _json_envelope_detected:
+					# We actually sent bad chunks — kill playback.
+					self._emit(
+						"streaming_json_leaked",
+						component="advisor.brain",
+						reason="no_separator_json_parsed",
+					)
+					await self._speaker_stop()
+				return (decision.response_text, decision.need_observe, decision.actions, False)
+			# Fallback: treat entire output as speech.
+			# But first strip any trailing JSON object that the model may have
+			# appended without a separator (e.g. "Antwort text {\"need_observe\": ...}").
+			cleaned = full_response.strip()
+			trailing_json_start = cleaned.rfind("\n{")
+			if trailing_json_start == -1:
+				trailing_json_start = cleaned.rfind(" {")
+			if trailing_json_start > 0:
+				candidate_json = cleaned[trailing_json_start:].strip()
+				try:
+					json.loads(candidate_json)
+					# It's valid JSON — strip it from speech text
+					cleaned = cleaned[:trailing_json_start].strip()
+					self._emit(
+						"streaming_stripped_trailing_json",
+						component="advisor.brain",
+						stripped_chars=len(candidate_json),
+					)
+					# Also stop playback since the streamed chunks contained JSON
+					await self._speaker_stop()
+					speech_text = cleaned
+					# Caller must re-speak the clean text
+					speech_was_streamed = False
+				except (json.JSONDecodeError, ValueError):
+					pass
+			if not speech_text:
+				speech_text = cleaned
+
+		# speech_streamed is True only when we actually sent chunks and the
+		# model did NOT use the JSON-envelope format.
+		# (The trailing-JSON cleanup above may have already set this to False.)
+		if speech_was_streamed is None:
+			speech_was_streamed = not _json_envelope_detected and bool(speech_text)
 
 		self._emit(
 			"decision",
@@ -2969,9 +3098,10 @@ class AdvisorAgent:
 			has_observation=bool(observation and observation.strip()),
 			response_preview=speech_text[:100] if speech_text else "(empty)",
 			streaming=True,
+			speech_streamed=speech_was_streamed,
 		)
 
-		return (speech_text or full_response.strip(), need_observe, actions)
+		return (speech_text or full_response.strip(), need_observe, actions, speech_was_streamed)
 
 	def _is_multi_step_request(self, text: str) -> bool:
 		"""Check if a user request might need multi-step task planning."""
@@ -3770,11 +3900,13 @@ class AdvisorAgent:
 		
 		if use_streaming:
 			self._emit("state", component="advisor", state="interaction_think_streaming")
-			response, need_observe, actions = await self._decide_and_respond_streaming(
+			response, need_observe, actions, speech_already_streamed = await self._decide_and_respond_streaming(
 				human_text=text, observation=obs, memory_hint=mem_hint
 			)
-			# Note: With streaming, speech has already been sent during generation
-			speech_already_streamed = True
+			# If speech was streamed, wait for the speaker to finish before
+			# continuing (prevents parallel audio and self-listening).
+			if speech_already_streamed and self.settings.wait_for_speech_finish:
+				await self._wait_for_speech_completion(context="after_streaming")
 		else:
 			response, need_observe, actions = await self._decide_and_respond(
 				human_text=text, observation=obs, memory_hint=mem_hint
@@ -3875,6 +4007,12 @@ class AdvisorAgent:
 			await self._speak(response)
 		else:
 			self._emit("state", component="advisor", state="interaction_speak_streamed")
+			# Wait for the streamed speech to finish playing before returning
+			# to the loop. Without this, the next iteration may start listening
+			# while the robot is still speaking (self-listening) or fire a new
+			# speak call that overlaps with the current one (parallel audio).
+			if self.settings.wait_for_speech_finish:
+				await self._wait_for_speech_completion(context="after_streaming")
 		self._ledger.append(f"Assistant: {response}")
 
 		# Ask memorizer to decide whether to store this user utterance (best-effort, non-blocking).

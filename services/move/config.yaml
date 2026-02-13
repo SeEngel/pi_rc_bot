@@ -14,7 +14,7 @@ move:
   max_speed: 100
 
   # Default duration for `drive` if omitted.
-  default_duration_s: 0.6
+  default_duration_s: 2.0
 
 service:
   host: 0.0.0.0

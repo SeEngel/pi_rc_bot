@@ -1,0 +1,71 @@
+# ─────────────────────────────────────────────
+#  OpenCode Robot Supervisor — configuration
+# ─────────────────────────────────────────────
+
+# OpenCode headless server
+opencode:
+  host: "127.0.0.1"
+  port: 4096
+  # seconds to wait for a response from OpenCode before timing out
+  request_timeout: 120
+
+# ── Sound-activity detection ────────────────
+sound:
+  # RMS threshold – values above this count as "active"
+  threshold_rms: 1000
+  # how many consecutive active windows are needed before we switch to
+  # interaction mode (1 = react faster, 2 = fewer false positives)
+  active_windows_required: 1
+  # length of each sampling window (seconds)
+  window_seconds: 0.3
+  # pause between polls (seconds)
+  poll_interval_seconds: 0.15
+  # preferred backend: "sounddevice" or "arecord"
+  backend: "sounddevice"
+  # sample rate for audio capture
+  sample_rate: 16000
+  # number of audio channels
+  channels: 1
+
+# ── Alone mode ──────────────────────────────
+alone:
+  # seconds between autonomous think cycles
+  think_interval_seconds: 12.0
+  # max characters for spoken thoughts
+  max_thought_chars: 240
+
+# ── Interaction mode ────────────────────────
+interaction:
+  # discard transcripts shorter than this
+  min_transcript_chars: 3
+  # max listen rounds (keeps listening while human talks)
+  max_listen_rounds: 6
+  # silence timeout for the first listen call (seconds)
+  listen_pause_first: 3.0
+  # silence timeout for follow-up listen calls (shorter = snappier)
+  listen_pause_continue: 2.0
+  # HTTP timeout per listen call
+  listen_timeout: 30
+  # stop words that end the interaction (case-insensitive)
+  stop_words:
+    - "stop"
+    - "stopp"
+    - "halt"
+    - "genug"
+
+# ── MCP service URLs (for direct HTTP if needed) ──
+mcp:
+  speak:     "http://127.0.0.1:8001"
+  listen:    "http://127.0.0.1:8002"
+  observe:   "http://127.0.0.1:8003"
+  memory:    "http://127.0.0.1:8004"
+  move:      "http://127.0.0.1:8005"
+  head:      "http://127.0.0.1:8006"
+  proximity: "http://127.0.0.1:8007"
+  perception: "http://127.0.0.1:8008"
+  safety:    "http://127.0.0.1:8009"
+  move_advisor: "http://127.0.0.1:8011"
+
+# ── General ─────────────────────────────────
+response_language: "de-DE"
+log_level: "INFO"
