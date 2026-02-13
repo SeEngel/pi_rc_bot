@@ -1,7 +1,7 @@
 {
   "$schema": "https://opencode.ai/config.json",
 
-  "model": "openai/gpt-4.1-mini",
+  "model": "openai/gpt-5.2",
 
   "mcp": {
     "robot_speak": {
@@ -27,6 +27,21 @@
     "robot_safety": {
       "type": "remote",
       "url": "http://127.0.0.1:8609/mcp",
+      "enabled": true
+    },
+    "robot_listen": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8602/mcp",
+      "enabled": true
+    },
+    "robot_observe": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8603/mcp",
+      "enabled": true
+    },
+    "robot_memory": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8604/mcp",
       "enabled": true
     },
     "robot_move_advisor": {
@@ -57,6 +72,9 @@
         "robot_proximity_*": true,
         "robot_perception_*": true,
         "robot_safety_*": true,
+        "robot_listen_*": true,
+        "robot_observe_*": true,
+        "robot_memory_*": true,
         "robot_move_advisor_*": true,
         "robot_codex_*": true,
         "webfetch": true,

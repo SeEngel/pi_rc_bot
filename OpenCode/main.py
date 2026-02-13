@@ -433,12 +433,14 @@ def alone_prompt(observation: str, memories: str) -> str:
         ## Your task (up to 4 tool calls)
         1. Think about what you see + remember. Are you following a plan? Continue it!
         2. Say a SHORT thought out loud → robot_speak → speak (under 240 chars).
-        3. **DRIVE somewhere interesting!** Use guarded_drive with speed 40-70, duration 2-5s.
-           Chain multiple drives to cover real ground. Explore the room. Be bold!
-        4. Do NOT call robot_observe or robot_memory — the data is above.
+        3. **DRIVE somewhere interesting!** Use guarded_drive with speed 20-40, duration 1-3s.
+           One drive per turn is fine — no need to chain many. Explore at a calm pace.
+        4. Do NOT call robot_observe — the scene data is above.
+        5. You CAN call robot_memory → get_top_n_memory or store_memory if you need
+           specific information beyond what's shown above.
 
-        The supervisor will store a memory for you after this turn.
-        Be adventurous. Drive far. Don't just sit there!
+        The supervisor will also store a basic memory for you after this turn.
+        Be curious and explore, but at a relaxed pace.
     """)
 
 
@@ -457,13 +459,18 @@ def interaction_prompt(transcript: str, observation: str, memories: str) -> str:
         ## Your task (up to 5 tool calls)
         1. Decide what to do based on what the human said.
         2. If they gave you a GOAL (go somewhere, explore, find something):
-           - Make a plan. Start executing it NOW with multiple guarded_drive calls.
-           - Use speed 40-70, duration 2-5s per drive. Chain 2-3 drives per turn.
+           - Make a plan. Start executing it NOW with a guarded_drive call.
+           - Use speed 20-40, duration 1-3s per drive. One drive per turn is enough.
            - Do NOT ask for permission. Just GO and report what happened.
-        3. Reply out loud → robot_speak → speak.
-        4. Do NOT call robot_observe or robot_memory — the data is above.
+        3. If the human asks about something you should REMEMBER or recall:
+           - Call robot_memory → get_top_n_memory with a relevant query to search your memories.
+           - Use the results to answer the human's question.
+        4. If you want to remember something specific with custom tags:
+           - Call robot_memory → store_memory with the content and tags.
+        5. Reply out loud → robot_speak → speak.
+        6. Do NOT call robot_observe — the scene data is above.
 
-        The supervisor will store a memory for you after this turn.
+        The supervisor will also store a basic memory for you after this turn.
         Respond in the language the human used (default: German / de-DE).
         When given a goal: ACT FIRST, talk second. Be bold!
     """)
@@ -471,12 +478,20 @@ def interaction_prompt(transcript: str, observation: str, memories: str) -> str:
 
 # ──────────────────────────── listen via MCP ─────────────────────
 
-def _listen_once(listen_url: str, pause_seconds: float, timeout: float) -> str:
-    """Single call to the listen service.  Returns transcript text (may be empty)."""
+def _listen_once(listen_url: str, pause_seconds: float, timeout: float, max_wait_for_speech_seconds: float | None = None) -> str:
+    """Single call to the listen service.  Returns transcript text (may be empty).
+
+    Parameters:
+      max_wait_for_speech_seconds: If set, the listen service will give up after
+        this many seconds if no speech is detected (avoids long blocking waits).
+    """
     try:
+        payload: dict = {"speech_pause_seconds": pause_seconds}
+        if max_wait_for_speech_seconds is not None:
+            payload["max_wait_for_speech_seconds"] = max_wait_for_speech_seconds
         r = requests.post(
             f"{listen_url}/listen",
-            json={"speech_pause_seconds": pause_seconds},
+            json=payload,
             timeout=timeout,
         )
         if r.ok:
@@ -608,6 +623,65 @@ def post_store_memory(cfg: dict, content: str, tags: list[str]) -> bool:
     except Exception as exc:
         LOG.warning("Post-store memory failed: %s", exc)
     return False
+
+
+# ──────────────────────────── speak-guard helpers ────────────────
+
+_last_speech_ended: float = 0.0  # monotonic timestamp
+
+
+def is_robot_speaking(cfg: dict) -> bool:
+    """Check if the robot's TTS is currently playing."""
+    speak_url = _deep_get(cfg, "mcp", "speak", default="http://127.0.0.1:8001")
+    try:
+        r = requests.get(f"{speak_url}/status", timeout=3)
+        if r.ok:
+            return r.json().get("speaking", False)
+    except Exception:
+        pass
+    return False
+
+
+def wait_for_speech_done(cfg: dict, timeout: float = 30.0, grace: float = 2.0) -> None:
+    """Block until the robot stops speaking, then apply a cooldown.
+
+    This prevents the microphone from picking up the robot's own voice.
+
+    The *grace* period (default 2s) handles the race condition where the
+    AI response triggers a speak tool call but the TTS subprocess hasn't
+    started yet — without it, the very first poll sees speaking=false and
+    we'd start listening while the robot is about to speak.
+    """
+    global _last_speech_ended
+    cooldown = _deep_get(cfg, "sound", "speech_cooldown_seconds", default=0.4)
+    deadline = time.monotonic() + timeout
+
+    # Phase 1: wait up to *grace* seconds for TTS to start.
+    # If it doesn't start within that window, assume no speech is coming.
+    grace_deadline = time.monotonic() + grace
+    was_speaking = False
+    while time.monotonic() < grace_deadline:
+        if is_robot_speaking(cfg):
+            was_speaking = True
+            break
+        time.sleep(0.1)
+
+    # Phase 2: if TTS started, wait for it to finish.
+    if was_speaking:
+        while time.monotonic() < deadline:
+            if is_robot_speaking(cfg):
+                time.sleep(0.1)
+            else:
+                break
+        _last_speech_ended = time.monotonic()
+        LOG.debug("Robot finished speaking — cooldown %.1fs", cooldown)
+        time.sleep(cooldown)
+
+
+def is_in_speech_cooldown(cfg: dict) -> bool:
+    """Return True if we're still in the post-speech cooldown window."""
+    cooldown = _deep_get(cfg, "sound", "speech_cooldown_seconds", default=0.4)
+    return (time.monotonic() - _last_speech_ended) < cooldown
 
 
 # ──────────────────────────── stop-word check ────────────────
@@ -933,6 +1007,11 @@ def run_forever(cfg: dict) -> None:
                 LOG.info("Rotating session after %d turns", turn_count)
                 client.new_session()
 
+            # ── Wait for robot to finish speaking before checking sound ──
+            if is_robot_speaking(cfg) or is_in_speech_cooldown(cfg):
+                LOG.debug("🔇 Robot speaking or cooldown — skipping sound check")
+                wait_for_speech_done(cfg)
+
             # ── Check for sound ──
             sound_active = is_sound_active(cfg)
 
@@ -999,21 +1078,97 @@ def run_forever(cfg: dict) -> None:
                 turn_count += 1
 
                 # ── Post-interaction listen window ──
-                # Stay attentive for a few seconds after responding so the
-                # human can continue the conversation without waiting 12s.
+                # Wait for TTS to finish, then immediately start listening.
+                # The listen service has its own energy-threshold detection,
+                # so we skip is_sound_active() here to eliminate ~0.5-0.8s
+                # latency — the human can start talking right away.
+                wait_for_speech_done(cfg)
+
                 post_listen_sec = _deep_get(
                     cfg, "interaction", "post_reply_listen_seconds", default=6.0
                 )
-                LOG.info("👂 Post-interaction listen window (%.1fs)…", post_listen_sec)
-                post_deadline = time.monotonic() + post_listen_sec
-                heard_more = False
-                while RUNNING and time.monotonic() < post_deadline:
-                    if is_sound_active(cfg):
-                        LOG.info("🎤 Human speaking again — re-entering interaction")
-                        heard_more = True
-                        break
-                if heard_more:
-                    continue  # jump straight back to top → sound_active path
+                LOG.info("👂 Post-interaction — immediate listen (%.1fs window)…", post_listen_sec)
+
+                # Direct listen call: the listen service records up to
+                # post_listen_sec and uses its own silence detection.
+                # If the human speaks, we get a transcript; if not, empty.
+                # max_wait_for_speech_seconds ensures we don't block for
+                # the full record_seconds if nobody talks.
+                post_transcript = _listen_once(
+                    _deep_get(cfg, "mcp", "listen", default="http://127.0.0.1:8002"),
+                    pause_seconds=2.0,  # silence-after-speech timeout
+                    timeout=post_listen_sec + 5,
+                    max_wait_for_speech_seconds=post_listen_sec,
+                )
+                if post_transcript and len(post_transcript) >= _deep_get(
+                    cfg, "interaction", "min_transcript_chars", default=3
+                ):
+                    LOG.info("🎤 Human continued: %s", post_transcript[:120])
+                    # Feed back into interaction — push this transcript
+                    # through the same path as a new sound_active detection
+                    # by jumping back to the top of the loop. We stuff
+                    # the transcript into a variable that the loop checks.
+                    _post_interaction_transcript = post_transcript
+                else:
+                    _post_interaction_transcript = None
+
+                if not _post_interaction_transcript:
+                    # Nobody spoke — go back to top of main loop to
+                    # re-check sound (don't fall through to alone mode).
+                    continue
+
+                if _post_interaction_transcript:
+                    # Re-enter interaction with the already-captured transcript
+                    transcript = _post_interaction_transcript
+
+                    if has_stop_word(transcript, cfg):
+                        LOG.info("Stop word detected in post-listen: %s", transcript[:60])
+                        try:
+                            send_prompt(
+                                f'[INTERACTION] The human said: "{transcript}"\n'
+                                "They want you to stop. Acknowledge briefly via robot_speak → speak."
+                            )
+                            post_store_memory(cfg, f"[INTERACTION] Human said stop: {transcript[:200]}", ["interaction", "stop"])
+                        except Exception as exc:
+                            LOG.error("Stop-word response failed: %s", exc)
+                        turn_count += 1
+                        continue
+
+                    t0 = time.monotonic()
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        f_obs = pool.submit(prefetch_observe, cfg)
+                        f_mem = pool.submit(prefetch_memory, cfg, transcript)
+                        try:
+                            obs = f_obs.result(timeout=30)
+                        except Exception as exc:
+                            LOG.warning("Prefetch observe timed out / failed: %s", exc)
+                            obs = "(observe unavailable)"
+                        try:
+                            mem = f_mem.result(timeout=30)
+                        except Exception as exc:
+                            LOG.warning("Prefetch memory timed out / failed: %s", exc)
+                            mem = "(no memories found)"
+                    LOG.debug("Post-listen prefetch took %.1fs", time.monotonic() - t0)
+
+                    broken_tools = check_my_tools_health(cfg)
+                    interact_p = interaction_prompt(transcript, obs, mem)
+                    if broken_tools:
+                        interact_p += (
+                            "\n\n## ⚠️ BROKEN TOOLS\n"
+                            f"The following custom tools have errors: {', '.join(broken_tools)}\n"
+                            "Tell the human: 'Ein Tool hat einen Fehler, ich kümmere mich darum!' "
+                            "Then call robot_codex → repair with the tool_name to fix it. "
+                            "After the repair, retry the action.\n"
+                        )
+                    try:
+                        reply = send_prompt(interact_p)
+                        LOG.info("Post-listen interaction reply: %s", reply[:200])
+                        summary = f"[INTERACTION] Human: {transcript[:200]} | Scene: {obs[:150]} | Reply: {reply[:200]}"
+                        post_store_memory(cfg, summary, ["interaction", "human"])
+                    except Exception as exc:
+                        LOG.error("Post-listen interaction failed: %s", exc)
+                    turn_count += 1
+                    continue  # loop back for another post-interaction listen
 
             else:
                 # ════════ ALONE MODE ════════
@@ -1059,11 +1214,17 @@ def run_forever(cfg: dict) -> None:
 
                 turn_count += 1
 
+                # Wait for TTS to finish before checking for human sound
+                wait_for_speech_done(cfg)
+
                 # Wait before next think cycle, checking for sound frequently
                 deadline = time.monotonic() + think_interval
                 while RUNNING and time.monotonic() < deadline:
                     # is_sound_active already samples for ~0.3s, so no
                     # extra sleep needed — just loop continuously.
+                    if is_robot_speaking(cfg) or is_in_speech_cooldown(cfg):
+                        time.sleep(0.3)
+                        continue
                     if is_sound_active(cfg):
                         LOG.debug("Sound interrupted alone wait")
                         break

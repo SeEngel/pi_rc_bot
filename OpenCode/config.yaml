@@ -26,6 +26,11 @@ sound:
   sample_rate: 16000
   # number of audio channels
   channels: 1
+  # seconds to wait after robot finishes speaking before listening
+  # (prevents the microphone from picking up the robot's own voice)
+  # Keep this low — the listen service has its own energy threshold (900 RMS)
+  # that already filters residual robot audio.
+  speech_cooldown_seconds: 0.4
 
 # ── Alone mode ──────────────────────────────
 alone:
@@ -41,9 +46,9 @@ interaction:
   # max listen rounds (keeps listening while human talks)
   max_listen_rounds: 10
   # silence timeout for the first listen call (seconds)
-  listen_pause_first: 5.0
+  listen_pause_first: 2.0
   # silence timeout for follow-up listen calls
-  listen_pause_continue: 3.0
+  listen_pause_continue: 1.5
   # HTTP timeout per listen call
   listen_timeout: 30
   # how long to stay attentive after the robot finishes replying (seconds)

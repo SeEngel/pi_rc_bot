@@ -6,7 +6,9 @@
 opencode:
   host: "127.0.0.1"
   port: 4097
-  request_timeout: 90
+  # Build/repair prompts require multiple AI round-trips (write code → verify → fix → start).
+  # gpt-5.2 can easily take 2-3 minutes for complex builds.
+  request_timeout: 300
 
 # Repair agent MCP server ports
 server:

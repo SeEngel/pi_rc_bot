@@ -23,7 +23,7 @@
 │                                │                             │      │
 │                                │   opencode.json config:     │      │
 │                                │   • model: gpt-4.1-mini     │      │
-│                                │   • 7 MCP servers           │      │
+│                                │   • 10 MCP servers          │      │
 │                                │   • agent: "robot"          │      │
 │                                │   • AGENTS.md system prompt │      │
 │                                └──────────┬──────────────────┘      │
@@ -73,7 +73,7 @@ Your Python code **never calls OpenAI directly** — it always goes through Open
 
 | Instance | Port | Config dir | Model | Purpose |
 |---|---|---|---|---|
-| **#1 (main brain)** | `4096` | `OpenCode/` | `gpt-4.1-mini` | Robot agent — talks to 7 MCP services, thinks, moves, speaks |
+| **#1 (main brain)** | `4096` | `OpenCode/` | `gpt-4.1-mini` | Robot agent — talks to 10 MCP services, thinks, moves, speaks |
 | **#2 (codex AI)** | `4097` | `OpenCode/codex_agent/` | `gpt-5.2` | Codex technician — only has `bash` + `edit` tools, fixes broken code |
 
 OpenCode #1 is started by `main.py`.  OpenCode #2 is started internally by the codex agent (`main_codex.py`).
@@ -250,7 +250,7 @@ uv run python OpenCode/main.py --dry-run
 | Setting | Default | Description |
 |---|---|---|
 | `opencode.port` | `4096` | Main OpenCode server port |
-| `opencode.request_timeout` | `60` | Seconds to wait for LLM response |
+| `opencode.request_timeout` | `180` | Seconds to wait for LLM response |
 | `sound.threshold_rms` | `1000` | RMS threshold for voice detection |
 | `sound.active_windows_required` | `1` | Consecutive active windows before interaction mode |
 | `alone.think_interval_seconds` | `12.0` | Seconds between autonomous think cycles |
@@ -301,6 +301,9 @@ Defines which MCP servers OpenCode #1 connects to, model selection, agent person
 | `8011` | HTTP | move_advisor (REST) |
 | `8012` | HTTP | codex agent (REST) |
 | `8601` | MCP/SSE | speak |
+| `8602` | MCP/SSE | listen |
+| `8603` | MCP/SSE | observe |
+| `8604` | MCP/SSE | memory |
 | `8606` | MCP/SSE | head |
 | `8607` | MCP/SSE | proximity |
 | `8608` | MCP/SSE | perception |
@@ -318,7 +321,7 @@ Defines which MCP servers OpenCode #1 connects to, model selection, agent person
 | File | Purpose |
 |---|---|
 | `main.py` | Python supervisor — lifecycle management, sound detection, prompt building, sends to OpenCode |
-| `opencode.json` | OpenCode #1 project config — 7 MCP servers, `robot` agent, tool permissions |
+| `opencode.json` | OpenCode #1 project config — 10 MCP servers, `robot` agent, tool permissions |
 | `AGENTS.md` | System prompt — robot personality, two workstreams, tool-building instructions, repair tools |
 | `config.yaml` | Supervisor config — sound detection, timing, MCP URLs for direct HTTP |
 | `.env` | API key (`OPENAI_API_KEY=...`) — auto-loaded by OpenCode |
@@ -347,9 +350,10 @@ Every `12` seconds, the supervisor:
 When the microphone picks up sound (RMS > threshold):
 1. Calls the listen MCP service (up to 6 rounds of continuous listening)
 2. Concatenates the full transcript
-3. Pre-fetches memory in parallel
-4. Builds an `[INTERACTION]` prompt with the transcript
-5. Sends it to OpenCode #1 → LLM responds → calls speak MCP → stores memory
+3. Pre-fetches observation and memory in parallel
+4. Builds an `[INTERACTION]` prompt with the transcript + context
+5. Sends it to OpenCode #1 → LLM responds → calls speak MCP
+6. Supervisor stores a memory summary after each turn; the agent can also call `robot_memory` directly for custom queries/tags
 
 ### Self-Repair
 

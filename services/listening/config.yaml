@@ -72,7 +72,9 @@ stt:
     chunk_ms: 50
 
     # Keep a bit of audio from before speech starts.
-    pre_roll_seconds: 0.25
+    # Larger values capture more of the beginning of speech (helps when
+    # there is latency between robot finishing speaking and the listen call).
+    pre_roll_seconds: 0.5
 
     # Audio capture settings (keep defaults unless you know you need to change them)
     # NOTE: Some ALSA devices reject 16000 Hz (paInvalidSampleRate).
