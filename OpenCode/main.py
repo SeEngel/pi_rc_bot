@@ -927,6 +927,34 @@ CODEX_API_PORT = 8012
 CODEX_MCP_PORT = 8612
 
 
+def _enable_thorough_codex() -> None:
+    """Write thorough_mode.enabled=true into the codex agent's config.yaml.
+
+    Called when --thorough-codex is passed on the CLI.  This modifies the
+    config *before* the codex agent process is started, so the agent picks
+    it up naturally on boot.
+    """
+    codex_config = CODEX_AGENT_DIR / "config.yaml"
+    if not codex_config.exists():
+        LOG.warning("Codex config not found at %s — cannot enable thorough mode", codex_config)
+        return
+
+    try:
+        with open(codex_config) as f:
+            cfg = yaml.safe_load(f) or {}
+
+        if "thorough_mode" not in cfg:
+            cfg["thorough_mode"] = {}
+        cfg["thorough_mode"]["enabled"] = True
+
+        with open(codex_config, "w") as f:
+            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+
+        LOG.info("🧠 Thorough codex mode ENABLED — slow intelligent model with continuation support")
+    except Exception as exc:
+        LOG.error("Failed to enable thorough codex mode: %s", exc)
+
+
 def _start_codex_agent() -> None:
     """Launch the codex agent MCP server as a child process.
 
@@ -1465,11 +1493,19 @@ def main() -> None:
                         help="Path to config.yaml")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print config and exit without running")
+    parser.add_argument("--thorough-codex", action="store_true",
+                        help="Enable thorough mode for the codex agent: "
+                             "use a slow intelligent model with multi-turn retry "
+                             "and continuable jobs on timeout")
     args = parser.parse_args()
 
     CONFIG_PATH = Path(args.config)
 
     cfg = load_config()
+
+    # If --thorough-codex is set, update the codex agent config before starting
+    if args.thorough_codex:
+        _enable_thorough_codex()
 
     log_level = cfg.get("log_level", "INFO").upper()
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -88,6 +89,37 @@ def _load_config() -> dict:
 
 _CFG = _load_config()
 
+
+def _thorough_mode() -> bool:
+    """Return True if thorough (slow/intelligent) mode is enabled."""
+    return _deep_get(_CFG, "thorough_mode", "enabled", default=False)
+
+
+def _deep_get(d: dict, *keys, default=None):
+    """Safely traverse nested dicts."""
+    for k in keys:
+        if not isinstance(d, dict):
+            return default
+        d = d.get(k, default)
+    return d
+
+
+def _file_sha256(path: Path) -> str:
+    """Return hex SHA-256 of a file, or empty string if missing."""
+    if not path.exists():
+        return ""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _has_running_job_for(tool_name: str) -> Job | None:
+    """Return a running/queued job for this tool, or None."""
+    with _jobs_lock:
+        for j in _jobs.values():
+            if j.tool_name == tool_name and j.state in (JobState.QUEUED, JobState.RUNNING):
+                return j
+    return None
+
+
 # ──────────────────────────── job tracker ────────────────────────
 
 
@@ -101,6 +133,7 @@ class JobState(str, Enum):
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
+    CONTINUABLE = "continuable"   # timed-out but can be resumed
 
 
 @dataclass
@@ -114,6 +147,12 @@ class Job:
     result: dict[str, Any] = dc_field(default_factory=dict)
     created_at: float = dc_field(default_factory=time.time)
     finished_at: float | None = None
+    # ── continuation context (saved on timeout for /continue_job) ──
+    session_id: str | None = None          # OpenCode session to resume
+    last_prompt: str = ""                  # the prompt that timed out
+    turns_completed: int = 0               # how many AI round-trips done
+    source_hash_before: str = ""           # sha256 of server.py before AI call
+    original_description: str = ""         # for build jobs: the original request
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -730,7 +769,11 @@ class RepairResponse(BaseModel):
 
 
 def _run_repair_sync(job: Job, tool_name: str) -> None:
-    """Background worker for repair — runs in a thread."""
+    """Background worker for repair — runs in a thread.
+
+    In thorough mode: allows multiple AI turns with timeout-per-turn.
+    On timeout, marks job CONTINUABLE so /continue_job can resume.
+    """
     try:
         job.state = JobState.RUNNING
 
@@ -752,45 +795,127 @@ def _run_repair_sync(job: Job, tool_name: str) -> None:
             job.finished_at = time.time()
             return
 
-        # 1. Send to OpenCode for fix
+        thorough = _thorough_mode()
+        max_turns = _deep_get(_CFG, "thorough_mode", "max_turns_per_job", default=3) if thorough else 1
+
+        # Record source hash before AI touches it
+        server_py = MY_TOOLS_DIR / tool_name / "server.py"
+        job.source_hash_before = _file_sha256(server_py)
+
+        # 1. Send to OpenCode for fix (with multi-turn retry in thorough mode)
         job.phase = "sending repair prompt to AI"
-        job.log("Reading logs and source, sending to code AI…")
+        job.log(f"Reading logs and source, sending to code AI… (thorough={thorough}, max_turns={max_turns})")
         prompt = _build_repair_prompt(info)
-        try:
-            client = _get_client()
-            reply = client.send(prompt)
-            LOG.info("Repair AI reply for %s: %s", tool_name, reply[:300])
-            # Log what the AI did (tool calls = bash commands, file edits)
-            for tc in client.last_tool_calls:
-                job.log(tc)
-            # Log the AI's reasoning/conclusion
-            if reply.strip():
-                job.log(f"AI says: {reply[:300]}")
-            else:
-                job.log("AI replied (no text — only tool actions)")
-        except Exception as exc:
-            job.phase = "AI error"
-            job.log(f"Repair AI failed: {exc}")
+        job.last_prompt = prompt
+
+        client = _get_client()
+        reply = ""
+        fix_applied = False
+        timed_out = False
+
+        for turn in range(1, max_turns + 1):
+            job.phase = f"AI turn {turn}/{max_turns}"
+            job.log(f"── AI turn {turn}/{max_turns} ──")
+
+            try:
+                if turn == 1:
+                    reply = client.send(prompt)
+                else:
+                    # Follow-up: re-read state and ask AI to continue
+                    info = _read_tool(tool_name)
+                    follow_up = (
+                        f"The previous fix attempt did not fully resolve the issue.\n"
+                        f"Current error log:\n```\n{info.get('error_block', '')[:2000]}\n```\n"
+                        f"Current server.py:\n```python\n{info.get('source', '')[:4000]}\n```\n"
+                        f"Please continue fixing. Respond with FIXED: or UNFIXABLE:"
+                    )
+                    reply = client.send(follow_up)
+
+                job.turns_completed = turn
+                job.session_id = client._session_id
+
+                LOG.info("Repair AI reply (turn %d) for %s: %s", turn, tool_name, reply[:300])
+                for tc in client.last_tool_calls:
+                    job.log(tc)
+                if reply.strip():
+                    job.log(f"AI says: {reply[:300]}")
+                else:
+                    job.log("AI replied (no text — only tool actions)")
+
+            except requests.exceptions.ReadTimeout:
+                timed_out = True
+                job.last_prompt = prompt if turn == 1 else follow_up  # type: ignore[possibly-undefined]
+                job.session_id = client._session_id
+                job.turns_completed = turn - 1
+                job.log(f"⏱️ AI timed out on turn {turn}")
+                break
+            except Exception as exc:
+                job.phase = "AI error"
+                job.log(f"Repair AI failed: {exc}")
+                job.state = JobState.FAILED
+                job.result = {"ok": False, "tool_name": tool_name, "was_broken": True,
+                              "summary": f"Repair AI failed: {exc}"}
+                job.finished_at = time.time()
+                return
+
+            if "UNFIXABLE" in reply.upper():
+                job.phase = "unfixable"
+                job.log(f"AI says unfixable: {reply[:200]}")
+                job.state = JobState.FAILED
+                job.result = {"ok": True, "tool_name": tool_name, "was_broken": True,
+                              "fix_applied": False, "summary": f"AI says unfixable: {reply[:500]}"}
+                job.finished_at = time.time()
+                return
+
+            if "FIXED" in reply.upper():
+                fix_applied = True
+                job.log("AI reports FIXED")
+                break
+
+            # In single-turn mode, don't loop
+            if not thorough:
+                break
+
+        # If timed out in thorough mode → mark CONTINUABLE
+        if timed_out and thorough:
+            job.phase = "timed out (continuable)"
+            job.log("Marked as CONTINUABLE — use /continue_job to resume")
+            job.state = JobState.CONTINUABLE
+            job.result = {
+                "ok": True, "tool_name": tool_name, "was_broken": True,
+                "fix_applied": False, "timed_out": True, "continuable": True,
+                "turns_completed": job.turns_completed,
+                "summary": f"AI timed out after {job.turns_completed} turn(s) — job can be continued",
+            }
+            job.finished_at = time.time()
+            return
+
+        # If timed out in normal mode → just fail
+        if timed_out:
+            job.phase = "timed out"
+            job.log("AI timed out (non-thorough mode)")
             job.state = JobState.FAILED
             job.result = {"ok": False, "tool_name": tool_name, "was_broken": True,
-                          "summary": f"Repair AI failed: {exc}"}
+                          "summary": "Repair AI timed out"}
             job.finished_at = time.time()
             return
 
-        if "UNFIXABLE" in reply.upper():
-            job.phase = "unfixable"
-            job.log(f"AI says unfixable: {reply[:200]}")
+        # 2. Verify source actually changed before restarting
+        source_hash_after = _file_sha256(server_py)
+        if source_hash_after == job.source_hash_before and not fix_applied:
+            job.phase = "no changes made"
+            job.log("⚠️ AI did not modify server.py — skipping restart")
             job.state = JobState.FAILED
             job.result = {"ok": True, "tool_name": tool_name, "was_broken": True,
-                          "fix_applied": False, "summary": f"AI says unfixable: {reply[:500]}"}
+                          "fix_applied": False, "summary": f"AI did not change server.py. Reply: {reply[:300]}"}
             job.finished_at = time.time()
             return
 
-        fix_applied = "FIXED" in reply.upper()
-        if fix_applied:
-            job.log("AI applied a fix")
+        if source_hash_after != job.source_hash_before:
+            job.log("✅ server.py was modified by AI")
+            fix_applied = True
 
-        # 2. Restart the tool
+        # 3. Restart the tool
         job.phase = "restarting server"
         job.log("Restarting tool server…")
         restarted = _restart_tool(tool_name, info["port"])
@@ -799,7 +924,7 @@ def _run_repair_sync(job: Job, tool_name: str) -> None:
         else:
             job.log("❌ Server failed to restart")
 
-        # 3. Re-register with main OpenCode
+        # 4. Re-register with main OpenCode
         re_registered = False
         if restarted:
             job.phase = "re-registering with OpenCode"
@@ -808,7 +933,7 @@ def _run_repair_sync(job: Job, tool_name: str) -> None:
             if re_registered:
                 job.log("✅ Re-registered")
 
-        # 4. Final health check
+        # 5. Final health check
         job.phase = "health check"
         healthy_after = False
         try:
@@ -821,12 +946,13 @@ def _run_repair_sync(job: Job, tool_name: str) -> None:
         else:
             job.log("❌ Tool still unhealthy after repair attempt")
 
-        # 5. Write repair log
+        # 6. Write repair log
         repair_log = MY_TOOLS_DIR / tool_name / "repair.log"
         try:
             with open(repair_log, "a", encoding="utf-8") as f:
                 f.write(f"\n{'='*60}\n")
                 f.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Turns: {job.turns_completed}, Thorough: {thorough}\n")
                 f.write(f"Result: {'FIXED' if healthy_after else 'ATTEMPTED'}\n")
                 f.write(f"Reply: {reply[:500]}\n")
         except Exception:
@@ -835,6 +961,8 @@ def _run_repair_sync(job: Job, tool_name: str) -> None:
         summary_parts = []
         if fix_applied:
             summary_parts.append("Fix applied by AI")
+        if job.turns_completed > 1:
+            summary_parts.append(f"{job.turns_completed} AI turns")
         if restarted:
             summary_parts.append("process restarted")
         if re_registered:
@@ -851,6 +979,7 @@ def _run_repair_sync(job: Job, tool_name: str) -> None:
             "ok": True, "tool_name": tool_name, "was_broken": True,
             "fix_applied": fix_applied, "restarted": restarted,
             "re_registered": re_registered, "healthy_after": healthy_after,
+            "turns": job.turns_completed,
             "summary": " | ".join(summary_parts),
         }
         job.finished_at = time.time()
@@ -884,6 +1013,17 @@ async def repair(req: RepairRequest):
             summary="Tool is already healthy — nothing to repair.",
         )
 
+    # Prevent duplicate jobs for the same tool
+    existing = _has_running_job_for(req.tool_name)
+    if existing:
+        return RepairResponse(
+            ok=True,
+            tool_name=req.tool_name,
+            was_broken=True,
+            summary=f"A job is already running for this tool — job_id={existing.job_id} ({existing.phase})",
+            job_id=existing.job_id,
+        )
+
     job = _create_job(JobKind.REPAIR, req.tool_name)
     job.log(f"Repair queued — tool={req.tool_name}")
 
@@ -900,6 +1040,275 @@ async def repair(req: RepairRequest):
         was_broken=True,
         summary=f"Repair started — job_id={job.job_id}. Poll build_status for progress.",
         job_id=job.job_id,
+    )
+
+
+# ── POST /continue_job ─────────────────────────────────────────
+
+class ContinueJobRequest(BaseModel):
+    job_id: str = Field(description="ID of a CONTINUABLE job to resume")
+    extra_context: str = Field(default="", description="Optional extra instructions for the AI")
+
+class ContinueJobResponse(BaseModel):
+    ok: bool = True
+    job_id: str = ""
+    resumed: bool = False
+    summary: str = ""
+
+
+def _run_continue_sync(job: Job, extra_context: str) -> None:
+    """Resume a CONTINUABLE job — runs in a thread."""
+    try:
+        job.state = JobState.RUNNING
+        job.phase = "resuming from timeout"
+        job.log(f"Resuming job (previously completed {job.turns_completed} turns)")
+
+        thorough = _thorough_mode()
+        max_turns = _deep_get(_CFG, "thorough_mode", "max_turns_per_job", default=3)
+        remaining = max(1, max_turns - job.turns_completed)
+
+        client = _get_client()
+        # Try to reuse the same session
+        if job.session_id:
+            client._session_id = job.session_id
+            job.log(f"Reusing session {job.session_id[:12]}…")
+        else:
+            client.new_session()
+            job.log("Creating new session (no saved session)")
+
+        tool_name = job.tool_name
+
+        for turn in range(1, remaining + 1):
+            actual_turn = job.turns_completed + turn
+            job.phase = f"AI turn {actual_turn} (continuation {turn}/{remaining})"
+            job.log(f"── continuation turn {turn}/{remaining} ──")
+
+            # Build a context-rich follow-up prompt
+            if job.kind == JobKind.REPAIR:
+                info = _read_tool(tool_name)
+                follow_up = (
+                    f"You were previously fixing tool '{tool_name}' but timed out.\n"
+                    f"Please continue where you left off.\n\n"
+                    f"Current error log:\n```\n{info.get('error_block', '')[:2000]}\n```\n"
+                    f"Current server.py:\n```python\n{info.get('source', '')[:4000]}\n```\n"
+                )
+                if extra_context:
+                    follow_up += f"\nAdditional context: {extra_context}\n"
+                follow_up += "\nRespond with FIXED: or UNFIXABLE:"
+            else:
+                # Build job
+                tool_dir = MY_TOOLS_DIR / tool_name
+                server_py = tool_dir / "server.py"
+                if server_py.exists():
+                    source = server_py.read_text("utf-8")[:4000]
+                    follow_up = (
+                        f"You were building tool '{tool_name}' but timed out.\n"
+                        f"Current server.py:\n```python\n{source}\n```\n"
+                        f"Please continue building. Check syntax, install missing packages.\n"
+                    )
+                else:
+                    follow_up = (
+                        f"You were building tool '{tool_name}' but timed out before creating server.py.\n"
+                        f"Description: {job.original_description}\n"
+                        f"Please create server.py now.\n"
+                    )
+                if extra_context:
+                    follow_up += f"\nAdditional context: {extra_context}\n"
+                follow_up += "\nRespond with BUILT: or FAILED:"
+
+            try:
+                reply = client.send(follow_up)
+                job.turns_completed = actual_turn
+                job.session_id = client._session_id
+
+                LOG.info("Continue AI reply (turn %d) for %s: %s", actual_turn, tool_name, reply[:300])
+                for tc in client.last_tool_calls:
+                    job.log(tc)
+                if reply.strip():
+                    job.log(f"AI says: {reply[:300]}")
+                else:
+                    job.log("AI replied (no text — only tool actions)")
+
+            except requests.exceptions.ReadTimeout:
+                job.log(f"⏱️ AI timed out again on continuation turn {turn}")
+                job.phase = "timed out again (continuable)"
+                job.state = JobState.CONTINUABLE
+                job.result = {
+                    "ok": True, "tool_name": tool_name,
+                    "timed_out": True, "continuable": True,
+                    "turns_completed": job.turns_completed,
+                    "summary": f"AI timed out again after {job.turns_completed} total turn(s)",
+                }
+                job.finished_at = time.time()
+                return
+            except Exception as exc:
+                job.phase = "AI error"
+                job.log(f"AI failed: {exc}")
+                job.state = JobState.FAILED
+                job.result = {"ok": False, "tool_name": tool_name,
+                              "summary": f"AI failed during continuation: {exc}"}
+                job.finished_at = time.time()
+                return
+
+            # Check for completion signals
+            if job.kind == JobKind.REPAIR:
+                if "UNFIXABLE" in reply.upper():
+                    job.state = JobState.FAILED
+                    job.result = {"ok": True, "tool_name": tool_name, "was_broken": True,
+                                  "fix_applied": False, "summary": f"AI says unfixable: {reply[:500]}"}
+                    job.finished_at = time.time()
+                    return
+                if "FIXED" in reply.upper():
+                    break
+            else:
+                if "FAILED" in reply.upper()[:100]:
+                    job.state = JobState.FAILED
+                    job.result = {"ok": True, "tool_name": tool_name,
+                                  "built": False, "summary": f"AI could not build: {reply[:500]}"}
+                    job.finished_at = time.time()
+                    return
+                if "BUILT" in reply.upper()[:100]:
+                    break
+
+        # Now do the post-fix steps (restart, re-register, health check)
+        if job.kind == JobKind.REPAIR:
+            info = _read_tool(tool_name)
+            if "error" in info:
+                job.state = JobState.FAILED
+                job.result = {"ok": False, "tool_name": tool_name, "summary": "Tool not found after continuation"}
+                job.finished_at = time.time()
+                return
+
+            # Verify source changed
+            server_py = MY_TOOLS_DIR / tool_name / "server.py"
+            new_hash = _file_sha256(server_py)
+            if new_hash == job.source_hash_before:
+                job.log("⚠️ server.py unchanged after continuation")
+
+            job.phase = "restarting server"
+            job.log("Restarting tool server…")
+            restarted = _restart_tool(tool_name, info["port"])
+            job.log("✅ Server restarted" if restarted else "❌ Server failed to restart")
+
+            re_registered = False
+            if restarted:
+                job.phase = "re-registering with OpenCode"
+                re_registered = _re_register_tool(tool_name, info["mcp_port"])
+                job.log("✅ Re-registered" if re_registered else "❌ Registration failed")
+
+            healthy_after = False
+            try:
+                r = requests.get(f"http://127.0.0.1:{info['port']}/healthz", timeout=5)
+                healthy_after = r.ok
+            except Exception:
+                pass
+            job.log("✅ Tool is now healthy!" if healthy_after else "❌ Tool still unhealthy")
+
+            job.phase = "done" if healthy_after else "done (still broken)"
+            job.state = JobState.DONE if healthy_after else JobState.FAILED
+            job.result = {
+                "ok": True, "tool_name": tool_name, "was_broken": True,
+                "fix_applied": new_hash != job.source_hash_before,
+                "restarted": restarted, "re_registered": re_registered,
+                "healthy_after": healthy_after, "turns": job.turns_completed,
+                "summary": f"Continuation {'FIXED' if healthy_after else 'STILL BROKEN'} after {job.turns_completed} turns",
+            }
+        else:
+            # Build job post-steps
+            tool_dir = MY_TOOLS_DIR / tool_name
+            server_py = tool_dir / "server.py"
+            port = job.result.get("port", 0)
+            mcp_port = job.result.get("mcp_port", 0)
+
+            if not server_py.exists():
+                job.state = JobState.FAILED
+                job.result = {"ok": False, "tool_name": tool_name,
+                              "summary": "server.py still not created after continuation"}
+                job.finished_at = time.time()
+                return
+
+            # Syntax check
+            try:
+                import ast
+                ast.parse(server_py.read_text("utf-8"))
+                job.log("✅ Syntax OK")
+            except SyntaxError as exc:
+                job.state = JobState.FAILED
+                job.result = {"ok": False, "tool_name": tool_name,
+                              "summary": f"Syntax error after continuation: {exc}"}
+                job.finished_at = time.time()
+                return
+
+            if port:
+                started = _restart_tool(tool_name, port)
+                job.log("✅ Server started" if started else "❌ Server failed to start")
+
+                registered = _re_register_tool(tool_name, mcp_port) if started else False
+                job.log("✅ Registered" if registered else "❌ Registration failed")
+
+                healthy = False
+                if started:
+                    try:
+                        r = requests.get(f"http://127.0.0.1:{port}/healthz", timeout=5)
+                        healthy = r.ok
+                    except Exception:
+                        pass
+                job.log("✅ Healthy" if healthy else "❌ Not healthy")
+
+                job.phase = "done" if healthy else "done (unhealthy)"
+                job.state = JobState.DONE if healthy else JobState.FAILED
+                job.result = {
+                    "ok": True, "tool_name": tool_name, "port": port, "mcp_port": mcp_port,
+                    "built": True, "started": started, "registered": registered,
+                    "healthy": healthy, "turns": job.turns_completed,
+                    "summary": f"Continuation {'SUCCESS' if healthy else 'PARTIAL'} after {job.turns_completed} turns",
+                }
+            else:
+                job.state = JobState.DONE
+                job.result = {"ok": True, "tool_name": tool_name, "built": True,
+                              "turns": job.turns_completed,
+                              "summary": f"Code generated after {job.turns_completed} turns (no port to start)"}
+
+        job.finished_at = time.time()
+        job.log(f"Continuation finished in {job.elapsed()}s")
+
+    except Exception as exc:
+        job.phase = "unexpected error"
+        job.log(f"Unexpected error during continuation: {exc}")
+        job.state = JobState.FAILED
+        job.result = {"ok": False, "tool_name": job.tool_name, "summary": f"Unexpected error: {exc}"}
+        job.finished_at = time.time()
+
+
+@app.post("/continue_job", response_model=ContinueJobResponse)
+async def continue_job(req: ContinueJobRequest):
+    """Resume a CONTINUABLE job that timed out.
+
+    Only jobs in the ``continuable`` state can be continued.
+    The AI resumes in the same OpenCode session with full context.
+    """
+    with _jobs_lock:
+        job = _jobs.get(req.job_id)
+    if job is None:
+        return ContinueJobResponse(ok=False, job_id=req.job_id,
+                                   summary=f"Job {req.job_id} not found")
+    if job.state != JobState.CONTINUABLE:
+        return ContinueJobResponse(ok=False, job_id=req.job_id,
+                                   summary=f"Job is in state '{job.state.value}', not continuable")
+
+    job.finished_at = None  # reset
+    job.log(f"Continuation requested (extra_context: {req.extra_context[:100] if req.extra_context else 'none'})")
+
+    thread = threading.Thread(
+        target=_run_continue_sync,
+        args=(job, req.extra_context),
+        daemon=True,
+    )
+    thread.start()
+
+    return ContinueJobResponse(
+        ok=True, job_id=job.job_id, resumed=True,
+        summary=f"Job resumed — turns so far: {job.turns_completed}. Poll build_status for progress.",
     )
 
 
@@ -1067,42 +1476,121 @@ class BuildToolResponse(BaseModel):
 
 
 def _run_build_tool_sync(job: Job, name: str, description: str, port: int, mcp_port: int, tool_dir: Path) -> None:
-    """Background worker for build_tool — runs in a thread."""
+    """Background worker for build_tool — runs in a thread.
+
+    In thorough mode: allows multiple AI turns with timeout-per-turn.
+    On timeout, marks job CONTINUABLE so /continue_job can resume.
+    """
     try:
         job.state = JobState.RUNNING
+        job.original_description = description
+
+        thorough = _thorough_mode()
+        max_turns = _deep_get(_CFG, "thorough_mode", "max_turns_per_job", default=3) if thorough else 1
 
         # 1. Send build prompt to OpenCode (strong code model)
         job.phase = "sending build prompt to AI"
-        job.log("Sending build prompt to code AI…")
+        job.log(f"Sending build prompt to code AI… (thorough={thorough}, max_turns={max_turns})")
         prompt = _build_tool_prompt(name, description, port, str(tool_dir))
-        try:
-            client = _get_client()
-            client.new_session()  # fresh session for each build
-            reply = client.send(prompt)
-            LOG.info("Build AI reply for %s: %s", name, reply[:400])
-            # Log what the AI did (tool calls = bash commands, file edits)
-            for tc in client.last_tool_calls:
-                job.log(tc)
-            # Log the AI's reasoning/conclusion
-            if reply.strip():
-                job.log(f"AI says: {reply[:300]}")
-            else:
-                job.log("AI replied (no text — only tool actions)")
-        except Exception as exc:
-            job.phase = "AI error"
-            job.log(f"Build AI failed: {exc}")
-            job.state = JobState.FAILED
-            job.result = {"ok": False, "tool_name": name, "port": port, "mcp_port": mcp_port,
-                          "summary": f"Build AI failed: {exc}"}
+        job.last_prompt = prompt
+
+        client = _get_client()
+        client.new_session()  # fresh session for each build
+        reply = ""
+        timed_out = False
+
+        for turn in range(1, max_turns + 1):
+            job.phase = f"AI turn {turn}/{max_turns}"
+            job.log(f"── AI turn {turn}/{max_turns} ──")
+
+            try:
+                if turn == 1:
+                    reply = client.send(prompt)
+                else:
+                    # Follow-up: check what's missing and ask AI to continue
+                    server_py = tool_dir / "server.py"
+                    if server_py.exists():
+                        source = server_py.read_text("utf-8")[:4000]
+                        follow_up = (
+                            f"The build is not complete yet. Current server.py:\n"
+                            f"```python\n{source}\n```\n"
+                            f"Please continue building. Check syntax, install missing packages, "
+                            f"and ensure the server is complete.\n"
+                            f"Respond with BUILT: or FAILED:"
+                        )
+                    else:
+                        follow_up = (
+                            f"server.py was not created yet. Please create it now.\n"
+                            f"Tool: {name}, Port: {port}, Dir: {tool_dir}\n"
+                            f"Description: {description}\n"
+                            f"Respond with BUILT: or FAILED:"
+                        )
+                    reply = client.send(follow_up)
+
+                job.turns_completed = turn
+                job.session_id = client._session_id
+
+                LOG.info("Build AI reply (turn %d) for %s: %s", turn, name, reply[:400])
+                for tc in client.last_tool_calls:
+                    job.log(tc)
+                if reply.strip():
+                    job.log(f"AI says: {reply[:300]}")
+                else:
+                    job.log("AI replied (no text — only tool actions)")
+
+            except requests.exceptions.ReadTimeout:
+                timed_out = True
+                job.last_prompt = prompt if turn == 1 else follow_up  # type: ignore[possibly-undefined]
+                job.session_id = client._session_id
+                job.turns_completed = turn - 1
+                job.log(f"⏱️ AI timed out on turn {turn}")
+                break
+            except Exception as exc:
+                job.phase = "AI error"
+                job.log(f"Build AI failed: {exc}")
+                job.state = JobState.FAILED
+                job.result = {"ok": False, "tool_name": name, "port": port, "mcp_port": mcp_port,
+                              "summary": f"Build AI failed: {exc}"}
+                job.finished_at = time.time()
+                return
+
+            if "FAILED" in reply.upper()[:100]:
+                job.phase = "AI could not build"
+                job.log(f"AI refused to build: {reply[:200]}")
+                job.state = JobState.FAILED
+                job.result = {"ok": True, "tool_name": name, "port": port, "mcp_port": mcp_port,
+                              "built": False, "summary": f"AI could not build: {reply[:500]}"}
+                job.finished_at = time.time()
+                return
+
+            if "BUILT" in reply.upper()[:100]:
+                job.log("AI reports BUILT")
+                break
+
+            # In single-turn mode, don't loop
+            if not thorough:
+                break
+
+        # If timed out in thorough mode → mark CONTINUABLE
+        if timed_out and thorough:
+            job.phase = "timed out (continuable)"
+            job.log("Marked as CONTINUABLE — use /continue_job to resume")
+            job.state = JobState.CONTINUABLE
+            job.result = {
+                "ok": True, "tool_name": name, "port": port, "mcp_port": mcp_port,
+                "built": False, "timed_out": True, "continuable": True,
+                "turns_completed": job.turns_completed,
+                "summary": f"AI timed out after {job.turns_completed} turn(s) — job can be continued",
+            }
             job.finished_at = time.time()
             return
 
-        if "FAILED" in reply.upper()[:100]:
-            job.phase = "AI could not build"
-            job.log(f"AI refused to build: {reply[:200]}")
+        if timed_out:
+            job.phase = "timed out"
+            job.log("AI timed out (non-thorough mode)")
             job.state = JobState.FAILED
-            job.result = {"ok": True, "tool_name": name, "port": port, "mcp_port": mcp_port,
-                          "built": False, "summary": f"AI could not build: {reply[:500]}"}
+            job.result = {"ok": False, "tool_name": name, "port": port, "mcp_port": mcp_port,
+                          "summary": "Build AI timed out"}
             job.finished_at = time.time()
             return
 
@@ -1198,6 +1686,7 @@ def _run_build_tool_sync(job: Job, name: str, description: str, port: int, mcp_p
                 f.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"Description: {description}\n")
                 f.write(f"Port: {port}, MCP: {mcp_port}\n")
+                f.write(f"Turns: {job.turns_completed}, Thorough: {thorough}\n")
                 f.write(f"Result: {'SUCCESS' if healthy else 'PARTIAL'}\n")
                 f.write(f"AI reply: {reply[:500]}\n")
         except Exception:
@@ -1206,6 +1695,8 @@ def _run_build_tool_sync(job: Job, name: str, description: str, port: int, mcp_p
         parts = []
         if built:
             parts.append("✅ Code generated")
+        if job.turns_completed > 1:
+            parts.append(f"{job.turns_completed} AI turns")
         if started:
             parts.append("✅ Server started")
         if registered:
@@ -1221,6 +1712,7 @@ def _run_build_tool_sync(job: Job, name: str, description: str, port: int, mcp_p
         job.result = {
             "ok": True, "tool_name": name, "port": port, "mcp_port": mcp_port,
             "built": built, "started": started, "registered": registered, "healthy": healthy,
+            "turns": job.turns_completed,
             "summary": " | ".join(parts),
         }
         job.finished_at = time.time()
@@ -1245,6 +1737,16 @@ async def build_tool(req: BuildToolRequest):
     name = re.sub(r"[^a-z0-9_]", "_", req.tool_name.lower().strip())
     if not name:
         return BuildToolResponse(ok=False, summary="Invalid tool name")
+
+    # Prevent duplicate jobs for the same tool
+    existing = _has_running_job_for(name)
+    if existing:
+        return BuildToolResponse(
+            ok=True,
+            tool_name=name,
+            summary=f"A job is already running for this tool — job_id={existing.job_id} ({existing.phase})",
+            job_id=existing.job_id,
+        )
 
     tool_dir = MY_TOOLS_DIR / name
     port = _next_free_port()
@@ -1947,17 +2449,28 @@ def main():
     api_port = args.port
     mcp_port = api_port + 600   # 8612
 
-    # Setup logging
+    # Setup logging — use config log_level for console, always DEBUG to file
     log_file = BASE_DIR / "log.out"
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)-7s] %(name)s: %(message)s",
+    cfg_log_level = _CFG.get("log_level", "INFO").upper()
+
+    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)-7s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.FileHandler(log_file, mode="w", encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
+    ))
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(getattr(logging, cfg_log_level, logging.INFO))
+    console_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)-7s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
 
     # Start the dedicated OpenCode instance for AI-powered repairs
     LOG.info("Booting repair agent MCP server on port %d (MCP: %d)", api_port, mcp_port)

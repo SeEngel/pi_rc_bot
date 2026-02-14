@@ -6,9 +6,20 @@
 opencode:
   host: "127.0.0.1"
   port: 4097
-  # Build/repair prompts require multiple AI round-trips (write code → verify → fix → start).
-  # gpt-5.2 can easily take 2-3 minutes for complex builds.
-  request_timeout: 300
+  # Per-request timeout for the AI call.  In thorough mode the AI model
+  # is slow but intelligent — allow up to 10 minutes per turn.
+  request_timeout: 600
+
+# ── Thorough mode ───────────────────────────
+# When enabled the codex agent uses a slower, smarter model and allows
+# multi-turn conversations.  Jobs that time-out become "continuable"
+# instead of "failed" — the supervisor (or a human) can resume them
+# with /continue_job, carrying forward the AI session context.
+thorough_mode:
+  enabled: false               # toggled by main.py --thorough-codex flag
+  max_turns_per_job: 3         # how many AI round-trips before giving up
+  turn_timeout: 600            # seconds per individual AI turn
+  verify_before_restart: true  # hash-check server.py before/after to confirm change
 
 # Repair agent MCP server ports
 server:
