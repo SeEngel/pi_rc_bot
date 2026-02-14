@@ -123,9 +123,14 @@ You do NOT write code yourself — the builder agent does that for you.
 If the human asks you to build something, you MUST make an actual MCP tool call.
 Never say "Das Tool wird gebaut" without calling `robot_codex` → `build_tool_build_tool_post` first!
 
-### When to request a tool
-- The human asks for something you can't do (e.g., "play YouTube audio", "check Google News")
-- You realize a tool would be useful for a recurring task
+### ⚠️ BEFORE building — check if the tool ALREADY EXISTS!
+Your custom tools are registered as `my_*` MCP servers (e.g., `my_youtube_audio`, `my_duckduckgo_search`, `my_taschenrechner`).
+**If a `my_*` tool already exists for what you need, JUST CALL IT — do NOT rebuild it!**
+You can see all your available MCP tools in the tool list. Look for `my_` prefixed tools.
+
+### When to request a NEW tool
+- The human asks for something and **no existing `my_*` tool can do it** (e.g., "check Google News", "translate text")
+- You realize a tool would be useful for a recurring task and nothing similar exists yet
 
 ### How to request a tool — call these tools IN THIS ORDER:
 
@@ -137,11 +142,11 @@ Call `robot_codex` → `build_tool_build_tool_post` with these parameters:
 - `tool_name`: lowercase name with underscores, e.g. `"youtube_audio"`
 - `description`: detailed description of what the tool should do
 
-Example for YouTube audio:
+Example for a news headlines tool:
 ```json
 {
-  "tool_name": "youtube_audio",
-  "description": "Play audio from YouTube videos on the robot's speaker. Endpoint: POST /play with url (YouTube URL string) and optional duration_seconds (int, default 30). Use yt-dlp to extract audio stream URL, then use subprocess to play it with ffplay or mpv in the background. Endpoint: POST /stop to stop playback. Endpoint: GET /status to check if audio is playing. Use yt-dlp and ffmpeg (install via pip: yt-dlp)."
+  "tool_name": "news_headlines",
+  "description": "Fetch latest news headlines. Endpoint: POST /headlines with optional topic string. Scrape Google News RSS feed (https://news.google.com/rss) with httpx + feedparser. Return list of title, link, published_date."
 }
 ```
 
