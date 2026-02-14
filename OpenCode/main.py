@@ -697,6 +697,7 @@ def has_stop_word(text: str, cfg: dict) -> bool:
 MY_TOOLS_DIR = BASE_DIR / "my_tools"
 MY_TOOLS_BASE_PORT = 9100
 _my_tools_procs: list[subprocess.Popen] = []
+_known_my_tools: set[str] = set()  # track tool names to detect removals
 
 CODEX_AGENT_DIR = BASE_DIR / "codex_agent"
 _codex_agent_proc: subprocess.Popen | None = None
@@ -704,8 +705,15 @@ _codex_agent_proc: subprocess.Popen | None = None
 
 def _start_my_tools(cfg: dict) -> None:
     """Auto-start all custom MCP tool servers found in my_tools/."""
+    global _known_my_tools
     if not MY_TOOLS_DIR.exists():
         return
+    # Initialise known-tools set and clean up any orphans from previous runs
+    _known_my_tools = {
+        d.name for d in MY_TOOLS_DIR.iterdir()
+        if d.is_dir() and not d.name.startswith(("_", ".")) and (d / "server.py").exists()
+    }
+    _cleanup_orphaned_tools(cfg)
     tool_dirs = sorted(
         d for d in MY_TOOLS_DIR.iterdir()
         if d.is_dir() and not d.name.startswith(("_", ".")) and (d / "server.py").exists()
@@ -813,6 +821,104 @@ def _stop_my_tools() -> None:
             if d.is_dir():
                 pf = d / "server.pid"
                 pf.unlink(missing_ok=True)
+
+
+def _unregister_tool_from_opencode(cfg: dict, tool_name: str) -> bool:
+    """Unregister a tool from OpenCode by disabling it via POST /mcp.
+
+    Since OpenCode may not have a DELETE endpoint, we re-register the
+    tool with ``enabled: false`` so the model no longer sees it.
+    """
+    oc_cfg = cfg.get("opencode", {})
+    oc_base = f"http://{oc_cfg.get('host', '127.0.0.1')}:{oc_cfg.get('port', 4096)}"
+    name = f"my_{tool_name}"
+    try:
+        r = requests.post(
+            f"{oc_base}/mcp",
+            json={
+                "name": name,
+                "config": {
+                    "type": "remote",
+                    "url": "http://127.0.0.1:1/mcp",  # dummy — disabled anyway
+                    "enabled": False,
+                },
+            },
+            timeout=10,
+        )
+        if r.ok:
+            LOG.info("Unregistered orphaned MCP '%s' from OpenCode", name)
+            return True
+        else:
+            LOG.warning("Failed to unregister '%s': %d %s", name, r.status_code, r.text[:200])
+    except Exception as exc:
+        LOG.warning("Failed to unregister '%s' from OpenCode: %s", name, exc)
+    return False
+
+
+def _cleanup_orphaned_tools(cfg: dict) -> list[str]:
+    """Detect and clean up tools that were removed from disk but still have
+    stale state (running processes, PID files, OpenCode registrations).
+
+    Walk the my_tools/ directory looking for:
+      1. Dirs with a server.pid but no server.py → folder was gutted or
+         server.py was deleted.  Kill the process and remove the pid.
+      2. Previously known tool names (from _known_my_tools) that no
+         longer have a folder on disk → fully removed.  Unregister from
+         OpenCode.
+
+    Returns list of tool names that were cleaned up.
+    """
+    global _known_my_tools
+    cleaned: list[str] = []
+
+    if not MY_TOOLS_DIR.exists():
+        # Everything was removed — unregister all previously known tools
+        for name in list(_known_my_tools):
+            _unregister_tool_from_opencode(cfg, name)
+            cleaned.append(name)
+        _known_my_tools.clear()
+        return cleaned
+
+    current_dirs = {
+        d.name for d in MY_TOOLS_DIR.iterdir()
+        if d.is_dir() and not d.name.startswith(("_", "."))
+    }
+
+    # 1. Clean up dirs that still exist but lost their server.py
+    for tool_dir in sorted(MY_TOOLS_DIR.iterdir()):
+        if not tool_dir.is_dir() or tool_dir.name.startswith(("_", ".")):
+            continue
+        pid_file = tool_dir / "server.pid"
+        server_py = tool_dir / "server.py"
+        if pid_file.exists() and not server_py.exists():
+            # server.py was deleted but process may still be running
+            try:
+                old_pid = int(pid_file.read_text().strip())
+                os.kill(old_pid, signal.SIGTERM)
+                LOG.info("Killed orphan process pid=%d for removed tool %s", old_pid, tool_dir.name)
+            except (OSError, ValueError):
+                pass
+            pid_file.unlink(missing_ok=True)
+            _unregister_tool_from_opencode(cfg, tool_dir.name)
+            cleaned.append(tool_dir.name)
+
+    # 2. Detect fully removed tool folders (were known before, now gone)
+    removed = _known_my_tools - current_dirs
+    for name in removed:
+        LOG.info("Tool '%s' was removed from disk — cleaning up", name)
+        _unregister_tool_from_opencode(cfg, name)
+        cleaned.append(name)
+
+    # Update the known set to current state (only dirs with server.py)
+    _known_my_tools = {
+        d.name for d in MY_TOOLS_DIR.iterdir()
+        if d.is_dir() and not d.name.startswith(("_", ".")) and (d / "server.py").exists()
+    }
+
+    if cleaned:
+        LOG.info("Cleaned up %d orphaned tool(s): %s", len(cleaned), ", ".join(cleaned))
+
+    return cleaned
 
 
 # ──────────────────────────── codex agent ────────────────────────
@@ -981,7 +1087,10 @@ def _ensure_tools_via_codex(cfg: dict, poll_repair_timeout: float = 120.0) -> bo
         repair_jobs = data.get("repair_jobs", {})
         failed = data.get("failed", [])
         registered = data.get("registered", [])
+        cleanup_removed = data.get("cleanup_removed", [])
 
+        if cleanup_removed:
+            LOG.info("  🧹 Cleaned up orphaned tools: %s", ", ".join(cleanup_removed))
         if already:
             LOG.info("  ✅ Already healthy: %s", ", ".join(already))
         if started:
@@ -1093,6 +1202,10 @@ def run_forever(cfg: dict) -> None:
             if client and turn_count > 0 and turn_count % SESSION_ROTATE_EVERY == 0:
                 LOG.info("Rotating session after %d turns", turn_count)
                 client.new_session()
+                # Periodic cleanup of tools removed from disk
+                orphans = _cleanup_orphaned_tools(cfg)
+                if orphans:
+                    LOG.info("Periodic cleanup removed %d orphaned tool(s)", len(orphans))
 
             # ── Wait for robot to finish speaking before checking sound ──
             if is_robot_speaking(cfg) or is_in_speech_cooldown(cfg):

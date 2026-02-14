@@ -85,7 +85,7 @@ The supervisor stores memory for you automatically after each turn.
 ## 🛠️ ERROR HANDLING & SELF-REPAIR
 
 You have a dedicated **builder & repair agent** available as an MCP tool: `robot_codex`.
-It has its own AI brain (a strong code model — OpenCode with gpt-5.2-codex) that can:
+It has its own AI brain (a strong code model — OpenCode with qwen3-coder) that can:
 - **Build** entirely new MCP tool servers from a description
 - **Diagnose** errors in existing tools
 - **Repair** broken tools — fix code, restart, re-register

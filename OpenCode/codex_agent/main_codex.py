@@ -573,6 +573,71 @@ def _re_register_tool(tool_name: str, mcp_port: int) -> bool:
         return False
 
 
+def _unregister_tool_from_opencode(tool_name: str) -> bool:
+    """Disable a tool in OpenCode by re-registering with enabled=false.
+
+    Used to clean up tools whose folders were manually deleted from disk.
+    """
+    main_port = _CFG.get("main_opencode_port", 4096)
+    name = f"my_{tool_name}"
+    try:
+        r = requests.post(
+            f"http://127.0.0.1:{main_port}/mcp",
+            json={
+                "name": name,
+                "config": {
+                    "type": "remote",
+                    "url": "http://127.0.0.1:1/mcp",
+                    "enabled": False,
+                },
+            },
+            timeout=10,
+        )
+        if r.ok:
+            LOG.info("Unregistered orphaned MCP '%s' from OpenCode", name)
+        return r.ok
+    except Exception as exc:
+        LOG.warning("Failed to unregister '%s' from OpenCode: %s", name, exc)
+        return False
+
+
+def _cleanup_orphaned_tools() -> list[str]:
+    """Find and clean up tools that were manually removed from disk.
+
+    Scans my_tools/ for:
+      - Dirs with a server.pid but no server.py (gutted folder):
+        kill the process, remove pid, unregister from OpenCode.
+      - PID files pointing to dead processes with no server.py:
+        remove pid, unregister from OpenCode.
+
+    Returns list of cleaned-up tool names.
+    """
+    cleaned: list[str] = []
+    if not MY_TOOLS_DIR.exists():
+        return cleaned
+
+    for tool_dir in sorted(MY_TOOLS_DIR.iterdir()):
+        if not tool_dir.is_dir() or tool_dir.name.startswith(("_", ".")):
+            continue
+        pid_file = tool_dir / "server.pid"
+        server_py = tool_dir / "server.py"
+        if pid_file.exists() and not server_py.exists():
+            # server.py was deleted but process / pid file lingers
+            try:
+                old_pid = int(pid_file.read_text().strip())
+                os.kill(old_pid, signal.SIGTERM)
+                LOG.info("Killed orphan process pid=%d for removed tool %s", old_pid, tool_dir.name)
+            except (OSError, ValueError):
+                pass
+            pid_file.unlink(missing_ok=True)
+            _unregister_tool_from_opencode(tool_dir.name)
+            cleaned.append(tool_dir.name)
+
+    if cleaned:
+        LOG.info("Cleaned up %d orphaned tool(s): %s", len(cleaned), ", ".join(cleaned))
+    return cleaned
+
+
 # ══════════════════════════════════════════════════════════════════
 #  FastAPI  Application
 # ══════════════════════════════════════════════════════════════════
@@ -1388,6 +1453,7 @@ class EnsureAllToolsResponse(BaseModel):
     already_healthy: list[str] = Field(default_factory=list, description="Tools that were already running fine")
     failed: list[str] = Field(default_factory=list, description="Tools that failed to start and couldn't be repaired")
     registered: list[str] = Field(default_factory=list, description="Tools re-registered with main OpenCode")
+    cleanup_removed: list[str] = Field(default_factory=list, description="Orphaned tools that were cleaned up (removed from disk)")
     summary: str = ""
 
 
@@ -1410,6 +1476,9 @@ async def ensure_all_tools():
     """
     if not MY_TOOLS_DIR.exists():
         return EnsureAllToolsResponse(summary="my_tools/ directory does not exist")
+
+    # First, clean up any tools that were manually removed from disk
+    cleanup_removed = _cleanup_orphaned_tools()
 
     started: list[str] = []
     repair_jobs: dict[str, str] = {}
@@ -1492,6 +1561,8 @@ async def ensure_all_tools():
             repair_jobs[name] = job.job_id
 
     parts = []
+    if cleanup_removed:
+        parts.append(f"{len(cleanup_removed)} orphans cleaned up: {', '.join(cleanup_removed)}")
     if already_healthy:
         parts.append(f"{len(already_healthy)} already healthy")
     if started:
@@ -1512,6 +1583,7 @@ async def ensure_all_tools():
         already_healthy=already_healthy,
         failed=failed,
         registered=registered,
+        cleanup_removed=cleanup_removed,
         summary=summary,
     )
 
