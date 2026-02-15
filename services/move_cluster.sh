@@ -8,7 +8,7 @@ CONFIG_PATH="$SERVICES_DIR/config.yaml"
 # Parse workflow_mode from services/config.yaml (defaults to legacy).
 workflow_mode="legacy"
 if [[ -f "$CONFIG_PATH" ]]; then
-	val="$(grep -E '^[[:space:]]*workflow_mode[[:space:]]*:' "$CONFIG_PATH" | head -n 1 | sed -E 's/^[[:space:]]*workflow_mode[[:space:]]*:[[:space:]]*//')"
+	val="$(grep -E '^[[:space:]]*workflow_mode[[:space:]]*:' "$CONFIG_PATH" 2>/dev/null | head -n 1 | sed -E 's/^[[:space:]]*workflow_mode[[:space:]]*:[[:space:]]*//' || true)"
 	val="${val%%#*}"
 	val="$(echo "$val" | tr -d '"\r' | xargs)"
 	if [[ -n "$val" ]]; then
