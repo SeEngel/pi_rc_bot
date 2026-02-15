@@ -1,16 +1,18 @@
 # Pi RC Bot
 
-A multi-agent robotic system for the PiCar-X platform using distributed agents with MCP support.
+An autonomous robotic system for the PiCar-X platform, powered by OpenCode (LLM supervisor) and distributed MCP microservices.
 
-## Hardware tested
+## Hardware
 
 - **Raspberry Pi 5** (16GB RAM)
-- **PiCar-X** [PiCar-X harware set](https://www.sunfounder.com/products/picar-x) using Raspberry Pi
+- **PiCar-X** [hardware set](https://www.sunfounder.com/products/picar-x) using Raspberry Pi
 
 ## Documentation
 
 - [PiCar-X Documentation](https://docs.sunfounder.com/projects/picar-x-v20/en/latest/)
-- [Raspberry Pi Connect](https://www.raspberrypi.com/software/connect/) - Remote desktop access via browser
+- [Raspberry Pi Connect](https://www.raspberrypi.com/software/connect/) — Remote desktop access via browser
+
+---
 
 ## Setup Instructions
 
@@ -19,12 +21,10 @@ Follow the [official installation guide](https://docs.sunfounder.com/projects/pi
 
 **Note:** Currently requires installation in the global Python environment to access the `robot_hat` module.
 
-### Step 2: Install Dependencies
+### Step 2: Install System Dependencies
 ```bash
 sudo pip3 install -r requirements.txt --break-system-packages
 ```
-
-> **TODO:** Containerize steps 1-2 with Docker to avoid requiring sudo installation.
 
 ### Step 3: Install uv Package Manager
 Follow the [uv installation guide](https://docs.astral.sh/uv/getting-started/installation/)
@@ -44,14 +44,22 @@ source .venv/bin/activate
 uv sync
 ```
 
+### Step 7: Configure Environment
+```bash
+cp .env.example .env
+# Edit .env and add your OPENAI_API_KEY
+```
+
+---
+
 ## Autostart on Linux boot (systemd)
 
-This project ships systemd *user* units. The recommended way to enable/disable autostart is via the helper scripts.
+This project ships systemd *user* units. Use the helper scripts to enable/disable autostart.
 
-The autostart behavior depends on `services/config.yaml` (`workflow_mode`). To switch modes, update the config and re-run the install script (it will stop/disable the previous advisor unit and enable the correct one).
-
-- **legacy**: enables `pi_rc_services.service` + `pi_rc_advisor.service`
-- **split_brain_move**: enables `pi_rc_brain_services.service` + `pi_rc_move_services.service` + `pi_rc_advisor_split_brain.service`
+Three systemd units are installed:
+- `pi_rc_brain_services.service` — brain cluster (listening, speak, observe, memory)
+- `pi_rc_move_services.service` — move cluster (robot, head, move, proximity, perception, safety, move_advisor)
+- `pi_rc_opencode.service` — OpenCode supervisor
 
 ### Install (enable autostart)
 
@@ -73,49 +81,18 @@ cd ~/Desktop/pi_rc_bot
 bash ./scripts/uninstall.sh
 ```
 
-Optional (undo lingering):
-
-```bash
-sudo loginctl disable-linger $USER
-```
-
 ### Status / Logs
 
-**Legacy mode:**
 ```bash
-systemctl --user status pi_rc_services.service pi_rc_advisor.service
-journalctl --user -u pi_rc_services.service -u pi_rc_advisor.service -f
+systemctl --user status pi_rc_brain_services.service pi_rc_move_services.service pi_rc_opencode.service
+journalctl --user -u pi_rc_brain_services.service -u pi_rc_move_services.service -u pi_rc_opencode.service -f
 ```
-
-**Split-brain move mode:**
-```bash
-systemctl --user status pi_rc_brain_services.service pi_rc_move_services.service pi_rc_advisor_split_brain.service
-journalctl --user -u pi_rc_brain_services.service -u pi_rc_move_services.service -u pi_rc_advisor_split_brain.service -f
-```
-
-### Workflow Modes
-
-The system supports two workflow modes, configured in `services/config.yaml`:
-
-```yaml
-# services/config.yaml
-workflow_mode: legacy  # or split_brain_move
-```
-
-| Mode | Description | Advisor Agent | Services |
-|------|-------------|---------------|----------|
-| **legacy** | Original architecture | `agent/advisor` | All services except `move_advisor` |
-| **split_brain_move** | Split-brain movement | `agent/advisor_split_brain_move` | All services including `move_advisor` |
-
-The install/uninstall scripts automatically read this config and install the appropriate systemd units.
-
-In **split_brain_move** mode, motion/safety/proximity/perception actions are delegated through the `services/move_advisor` MCP service (default MCP endpoint: `http://127.0.0.1:8611/mcp`).
 
 ### Network wait (optional)
 
-On boot, the services can start before Wi‑Fi/DNS is ready. The network wait prevents that race-condition by waiting (up to a timeout) until the network is online, so the first API calls don’t fail.
+On boot, the services can start before Wi‑Fi/DNS is ready. The network wait prevents that race-condition.
 
-You can control the network wait behavior via environment variables:
+Environment variables:
 
 - `NETWORK_TIMEOUT_SECONDS` (default: `120`)
 - `REQUIRE_INTERNET` (`0`/`1`, default: `0`)
@@ -125,55 +102,18 @@ You can control the network wait behavior via environment variables:
 
 ## Architecture
 
-### Runtime topology (by workflow mode)
+### Runtime Topology
 
-#### Legacy (direct MCP calls)
-
-In legacy mode, the advisor calls the lower-level motion stack directly via MCP.
-
-If `memorizer.enabled: true`, the advisor also uses the **MemorizerAgent**, which talks to `services/memory` via MCP (not shown in older versions of this diagram).
+The system runs two parallel clusters of services plus the OpenCode supervisor as brain:
 
 ```mermaid
 flowchart LR
-    A[agent/advisor] <-- MCP --> L[services/listening]
-    A <-- MCP --> S[services/speak]
-    A <-- MCP --> O[services/observe]
-
-    A --> MM[agent/memorizer]
-    MM <-- MCP --> MEM[services/memory]
-
-    A <-- MCP --> SA[services/safety]
-    A <-- MCP --> PX[services/proximity]
-    A <-- MCP --> PC[services/perception]
-    A <-- MCP --> MV[services/move]
-    A <-- MCP --> H[services/head]
-
-    SA --> R[services/robot]
-    PX --> R
-    MV --> R
-    H --> R
-    O --> CAM[(Camera)]
-```
-
-#### Split-brain move (via move_advisor)
-
-In split-brain mode, the advisor delegates *motion-related* actions to `services/move_advisor` (the “move cluster” entry point). This reduces sequential tool-calls in the advisor loop and lets the move cluster execute actions (optionally as background jobs) while the advisor keeps listening/speaking.
-
-Memory stays in the “brain” side: the advisor can still use `agent/memorizer` → `services/memory` regardless of the move cluster.
-
-Head control also stays in the “brain” side (the split-brain advisor calls `services/head` directly).
-
-```mermaid
-flowchart LR
-    A[agent/advisor_split_brain_move] <-- MCP --> L[services/listening]
-    A <-- MCP --> S[services/speak]
-    A <-- MCP --> O[services/observe]
-    A <-- MCP --> MA[services/move_advisor]
-
-    A <-- MCP --> H[services/head]
-
-    A --> MM[agent/memorizer]
-    MM <-- MCP --> MEM[services/memory]
+    OC[OpenCode Supervisor] <-- MCP --> L[services/listening]
+    OC <-- MCP --> S[services/speak]
+    OC <-- MCP --> O[services/observe]
+    OC <-- MCP --> MEM[services/memory]
+    OC <-- MCP --> MA[services/move_advisor]
+    OC <-- MCP --> H[services/head]
 
     MA <-- MCP --> SA[services/safety]
     MA <-- MCP --> PX[services/proximity]
@@ -187,188 +127,67 @@ flowchart LR
     O --> CAM[(Camera)]
 ```
 
-### Design Philosophy: Context Isolation
+### Clusters
 
-The main idea behind the multi-agent architecture is to **encapsulate context from the Advisor Agent** to prevent context window blowup. Each sub-agent handles a specific domain (vision, speech, motion, etc.) with its own focused LLM instructions and MCP connection, keeping the central orchestrator lean and efficient.
+| Cluster | Services | Started by |
+|---------|----------|------------|
+| **Brain** | listening, speak, observe, memory | `services/brain.sh` |
+| **Move** | robot, head, move, proximity, perception, safety, move_advisor | `services/move_cluster.sh` |
+| **Supervisor** | OpenCode (LLM agent loop) | `OpenCode/main.py` |
 
-```mermaid
-flowchart TB
-    subgraph "Why Sub-Agents?"
-        PROBLEM["❌ Single Agent Problem<br/>All tools + contexts in one LLM call<br/>= Context overflow"]
-        SOLUTION["✅ Multi-Agent Solution<br/>Each sub-agent owns one domain<br/>= Focused, efficient calls"]
-    end
-    PROBLEM --> SOLUTION
-```
+### Design Philosophy
 
----
+The OpenCode supervisor communicates with all services exclusively via **MCP over HTTP**. There is zero code-level coupling — the supervisor and services are fully independent processes.
 
-### Agentic Framework Overview
-
-This repository also contains **Agent Framework-based** domain agents under `agent/*` (listener/speaker/observer/mover/etc.). They are useful for experiments and isolation, but the default autostart workflow runs a single advisor process (either `agent/advisor` or `agent/advisor_split_brain_move`, depending on `workflow_mode`) plus the MCP services.
-
-```mermaid
-flowchart TB
-    subgraph ADVISOR["🧠 AdvisorAgent (Orchestrator)"]
-        BRAIN["AdvisorBrain<br/><i>LLM reasoning only</i>"]
-        LEDGER["Ledger<br/><i>Event log + token budget</i>"]
-        PROTOCOL["ProtocolLogger<br/><i>JSONL debug stream</i>"]
-    end
-
-    subgraph SUB_AGENTS["🤖 Specialized Sub-Agents"]
-        direction LR
-        LISTENER["ListenerAgent<br/><i>Speech-to-Text</i>"]
-        SPEAKER["SpeakerAgent<br/><i>Text-to-Speech</i>"]
-        OBSERVER["ObserverAgent<br/><i>Vision/Camera</i>"]
-        MOVER["MoverAgent<br/><i>Drive control</i>"]
-        HEAD["HeadAgent<br/><i>Pan/Tilt</i>"]
-        PROXIMITY["ProximityAgent<br/><i>Distance sensor</i>"]
-        PERCEPTION["PerceptionAgent<br/><i>Face/People detect</i>"]
-        SAFETY["SafetyAgent<br/><i>E-stop + guarded drive</i>"]
-        MEMORIZER["MemorizerAgent<br/><i>Long-term memory</i>"]
-        TODO["TodoAgent<br/><i>Task tracking</i>"]
-    end
-
-    subgraph MCP_SERVICES["🔌 MCP Services (HTTP + FastMCP)"]
-        SVC_LISTEN["listening<br/>:8602"]
-        SVC_SPEAK["speak<br/>:8601"]
-        SVC_OBSERVE["observe<br/>:8603"]
-        SVC_MOVE["move<br/>:8605"]
-        SVC_HEAD["head<br/>:8606"]
-        SVC_PROXIMITY["proximity<br/>:8607"]
-        SVC_PERCEPTION["perception<br/>:8608"]
-        SVC_SAFETY["safety<br/>:8609"]
-        SVC_MEMORY["memory<br/>:8604"]
-    end
-
-    subgraph HARDWARE["🔧 Hardware Layer"]
-        ROBOT["robot<br/>:8010<br/><i>PiCar-X GPIO owner</i>"]
-        CAM["Camera<br/><i>picamera2</i>"]
-        MIC["Microphone<br/><i>ALSA/PortAudio</i>"]
-        SPK["Speaker<br/><i>robot_hat TTS</i>"]
-        US["Ultrasonic<br/><i>HC-SR04</i>"]
-    end
-
-    %% Advisor orchestrates sub-agents
-    BRAIN --> LISTENER & SPEAKER & OBSERVER & MOVER & HEAD & PROXIMITY & PERCEPTION & SAFETY & MEMORIZER & TODO
-
-    %% Sub-agents connect to MCP services
-    LISTENER --> SVC_LISTEN
-    SPEAKER --> SVC_SPEAK
-    OBSERVER --> SVC_OBSERVE
-    MOVER --> SVC_MOVE
-    HEAD --> SVC_HEAD
-    PROXIMITY --> SVC_PROXIMITY
-    PERCEPTION --> SVC_PERCEPTION
-    SAFETY --> SVC_SAFETY
-    MEMORIZER --> SVC_MEMORY
-
-    %% Services use hardware via robot service
-    SVC_MOVE --> ROBOT
-    SVC_HEAD --> ROBOT
-    SVC_PROXIMITY --> ROBOT
-    SVC_SAFETY --> SVC_PROXIMITY & SVC_MOVE
-    ROBOT --> US
-
-    %% Direct hardware access
-    SVC_LISTEN --> MIC
-    SVC_SPEAK --> SPK
-    SVC_OBSERVE --> CAM
-    SVC_PERCEPTION --> CAM
-```
+Motion-related actions are delegated through `services/move_advisor` (the "move cluster" entry point), which reduces sequential tool-calls and enables true parallelism.
 
 ---
 
-### Advisor Agent Modes
+## Project Structure
 
-The Advisor alternates between two operational modes:
-
-```mermaid
-stateDiagram-v2
-    [*] --> AloneMode: startup
-    
-    AloneMode --> InteractionMode: Sound detected\n(threshold exceeded)
-    InteractionMode --> AloneMode: Silence timeout\nor stop word
-    
-    state AloneMode {
-        [*] --> WaitThink
-        WaitThink --> Observe: think_interval elapsed
-        Observe --> ThinkAloud: got observation
-        ThinkAloud --> Explore: explore_enabled
-        Explore --> WaitThink
-        ThinkAloud --> WaitThink: explore_disabled
-    }
-    
-    state InteractionMode {
-        [*] --> Listen
-        Listen --> Think: transcript received
-        Think --> Speak: response ready
-        Speak --> Listen: continue conversation
-    }
 ```
-
-| Mode | Trigger | Actions |
-|------|---------|---------|
-| **Interaction** | Loud sound detected | Listen → Think → Speak loop |
-| **Alone** | Quiet environment | Observe → Think aloud → Explore (optional) |
-
----
-
-### Language / Localization
-
-Both advisor variants (`agent/advisor` and `agent/advisor_split_brain_move`) can be configured to **speak a different language**.
-
-Set `advisor.response_language` in the corresponding config:
-
-```yaml
-# agent/advisor/config.yaml or agent/advisor_split_brain_move/config.yaml
-advisor:
-    response_language: de-DE  # e.g. en-US, pl-PL, ...
+pi_rc_bot/
+├── OpenCode/           # LLM supervisor (brain)
+│   ├── main.py         # Entry point (sound detection → think → act)
+│   ├── config.yaml     # Supervisor config (thresholds, MCP URLs)
+│   ├── opencode.json   # OpenCode agent config (model, persona)
+│   ├── AGENTS.md       # System prompt
+│   ├── src/            # Supervisor library
+│   ├── codex_agent/    # Self-repair sub-agent
+│   └── my_tools/       # Agent-created MCP tools
+├── services/           # MCP microservices (Python + FastAPI + FastMCP)
+│   ├── brain.sh        # Start brain cluster
+│   ├── move_cluster.sh # Start move cluster
+│   ├── main.sh         # Start all services
+│   ├── kill_all.sh     # Stop all services
+│   ├── config.yaml     # Global services config
+│   ├── systemd/        # Systemd unit templates
+│   ├── listening/      # STT (OpenAI Whisper / Vosk)
+│   ├── speak/          # TTS (OpenAI / Piper / pico2wave)
+│   ├── observe/        # Vision (GPT-4o)
+│   ├── memory/         # Vector memory (OpenAI embeddings)
+│   ├── move/           # Drive control
+│   ├── head/           # Pan/tilt control
+│   ├── proximity/      # Ultrasonic distance
+│   ├── perception/     # Face/people detection (OpenCV)
+│   ├── safety/         # Safe motion guard
+│   ├── move_advisor/   # Move cluster entry point
+│   └── robot/          # PiCar-X GPIO owner
+├── scripts/            # Install/deploy scripts
+│   ├── install.sh      # Enable autostart (systemd)
+│   └── uninstall.sh    # Disable autostart
+├── .env                # API keys (not in git)
+├── .env.example        # Template for .env
+├── pyproject.toml      # Python dependencies (uv)
+├── requirements.txt    # System-level pip dependencies
+└── README.md
 ```
-
-For best results, keep the services aligned with the same language:
-
-- STT: `services/listening/config.yaml` → `stt.openai.language` (or `stt.language` for Vosk)
-- TTS: `services/speak/config.yaml` → `tts.language` (for Pico2Wave) and/or `tts.openai.*` (voice/instructions)
-
-### Sub-Agent Responsibilities
-
-Each sub-agent extends `BaseWorkbenchChatAgent` and connects to exactly one MCP service:
-
-| Agent | Purpose | MCP Service | Key Tools |
-|-------|---------|-------------|-----------|
-| **ListenerAgent** | Speech recognition | `listening:8602` | `listen` |
-| **SpeakerAgent** | Text-to-speech | `speak:8601` | `speak`, `stop`, `status` |
-| **ObserverAgent** | Vision/scene description | `observe:8603` | `observe`, `observe_direction` |
-| **MoverAgent** | Wheel motion | `move:8605` | `drive`, `stop`, `status` |
-| **HeadAgent** | Camera pan/tilt | `head:8606` | `set_angles`, `center`, `scan` |
-| **ProximityAgent** | Distance sensing | `proximity:8607` | `distance_cm`, `is_obstacle` |
-| **PerceptionAgent** | Face/people detection | `perception:8608` | `detect`, `status` |
-| **SafetyAgent** | Safe motion control | `safety:8609` | `check`, `estop_on/off`, `guarded_drive` |
-| **MemorizerAgent** | Long-term memory | `memory:8604` | `store_memory`, `get_top_n_memory` |
-| **TodoAgent** | Task management | *local (no MCP)* | `add`, `complete`, `list` |
-
-In **split_brain_move** mode, motion/safety/proximity/perception actions are typically executed via `services/move_advisor` instead of calling `move`/`safety`/`proximity`/`perception` directly.
 
 ---
 
 ## Service Architecture
 
 All services expose both **REST API** and **MCP endpoints** via FastAPI + FastMCP.
-
-### Service Layer Overview
-
-```mermaid
-flowchart LR
-    subgraph "Service Pattern"
-        direction TB
-        MAIN["main.py<br/><i>FastAPI + FastMCP</i>"]
-        CTRL["Controller<br/><i>Business logic</i>"]
-        HW["Hardware/API"]
-    end
-    MAIN --> CTRL --> HW
-```
-
----
 
 ### Robot Service (Hardware Owner)
 
@@ -378,220 +197,22 @@ The **robot** service is the single owner of PiCar-X GPIO. All motion/head/senso
 flowchart TB
     subgraph ROBOT_SVC["🔧 robot:8010"]
         RC["RobotController"]
-        PX["picarx.Picarx()<br/><i>GPIO owner</i>"]
+        PX["picarx.Picarx()"]
     end
-    
+
     subgraph CLIENTS["Client Services"]
         MOVE["move:8005"]
         HEAD["head:8006"]
         PROX["proximity:8007"]
     end
-    
-    CLIENTS -->|HTTP /drive, /stop| RC
-    CLIENTS -->|HTTP /head/*| RC
-    CLIENTS -->|HTTP /distance| RC
+
+    CLIENTS -->|HTTP| RC
     RC --> PX
-    
     PX --> MOTORS["DC Motors"]
     PX --> SERVO["Steering Servo"]
     PX --> CAMS["Cam Pan/Tilt Servos"]
     PX --> ULTRA["Ultrasonic Sensor"]
 ```
-
-**Endpoints:** `/drive`, `/stop`, `/head/set`, `/head/center`, `/distance`, `/healthz`, `/status`
-
----
-
-### Speak Service
-
-```mermaid
-flowchart LR
-    subgraph SPEAK_SVC["🔊 speak:8601"]
-        SPEAKER["Speaker"]
-        ENGINE{"Engine"}
-    end
-    
-    ENGINE -->|openai| OPENAI_TTS["OpenAI TTS API"]
-    ENGINE -->|piper| PIPER["Piper local TTS"]
-    ENGINE -->|pico2wave| PICO["pico2wave + aplay"]
-    
-    SPEAKER --> AUDIO_OUT["🔈 Audio Output"]
-```
-
-**MCP Tools:** `speak {text}`, `stop {}`, `status {}`
-
-**Optional low-latency streaming (HTTP API on port 8001):**
-
-- `POST /stream/start` → `{session_id}`
-- `POST /stream/chunk` → `{session_id, text}` (send incremental text)
-- `POST /stream/end` → `{session_id}`
-
-This is used by the advisor when `interaction.streaming_tts_enabled: true` (see `agent/advisor*/config.yaml`).
-
----
-
-### Listening Service
-
-```mermaid
-flowchart LR
-    subgraph LISTEN_SVC["🎤 listening:8602"]
-        LISTENER["Listener"]
-        STT{"STT Engine"}
-    end
-    
-    MIC["🎙️ Microphone"] --> LISTENER
-    STT -->|openai| WHISPER["OpenAI Whisper API"]
-    STT -->|vosk| VOSK["Vosk Local Model"]
-    LISTENER --> STT
-```
-
-**MCP Tools:** `listen {stream?, speech_pause_seconds?}`
-
----
-
-### Observe Service
-
-```mermaid
-flowchart LR
-    subgraph OBSERVE_SVC["📷 observe:8603"]
-        OBSERVER["Observer"]
-        VLM["Vision LLM<br/><i>GPT-4o</i>"]
-    end
-    
-    CAM["📷 picamera2"] --> OBSERVER
-    OBSERVER -->|JPEG + question| VLM
-    VLM -->|description| OBSERVER
-```
-
-**MCP Tools:** 
-- `observe {question}` → scene description
-- `observe_direction {question}` → navigation grid suggestion
-
----
-
-### Move Service
-
-```mermaid
-flowchart LR
-    subgraph MOVE_SVC["🚗 move:8605"]
-        MOVER["MoveController"]
-        JOB["MoveJob<br/><i>timed drive</i>"]
-    end
-    
-    MOVER -->|HTTP| ROBOT["robot:8010"]
-    MOVER --> JOB
-```
-
-**MCP Tools:** `drive {speed, steer_deg, duration_s?}`, `stop {}`, `status {}`
-
----
-
-### Head Service
-
-```mermaid
-flowchart LR
-    subgraph HEAD_SVC["🎥 head:8606"]
-        HEAD_CTRL["HeadController"]
-    end
-    
-    HEAD_CTRL -->|HTTP| ROBOT["robot:8010"]
-```
-
-**MCP Tools:** `set_angles {pan_deg?, tilt_deg?}`, `center {}`, `scan {pattern?}`, `status {}`
-
----
-
-### Proximity Service
-
-```mermaid
-flowchart LR
-    subgraph PROX_SVC["📏 proximity:8607"]
-        PROX["ProximitySensor"]
-    end
-    
-    PROX -->|HTTP /distance| ROBOT["robot:8010"]
-```
-
-**MCP Tools:** `distance_cm {}`, `is_obstacle {threshold_cm?}`, `status {}`
-
----
-
-### Safety Service
-
-```mermaid
-flowchart LR
-    subgraph SAFETY_SVC["🛡️ safety:8609"]
-        SAFETY["SafetyController"]
-        ESTOP["E-Stop Flag"]
-    end
-    
-    SAFETY -->|check distance| PROX["proximity:8007"]
-    SAFETY -->|drive| MOVE["move:8005"]
-```
-
-**MCP Tools:**
-- `check {threshold_cm?}` → returns `{safe_to_drive, distance_cm, obstacle}`
-- `estop_on {}` / `estop_off {}` → software emergency stop
-- `guarded_drive {speed, steer_deg, ...}` → drive only if safe
-- `stop {}`
-
----
-
-### Move Advisor Service (split-brain move)
-
-The **move_advisor** service is the entry point of the “move cluster”. It accepts high-level action dicts from the advisor and executes them by calling lower-level MCP services (safety/proximity/perception/move). It can also run actions as background jobs.
-
-Default ports:
-
-- HTTP: `8011`
-- MCP: `8611`
-
-**MCP Tools (implemented):**
-
-- `execute_action {action, background?, request_id?}`
-- `job_status {job_id}`
-- `job_cancel {job_id}`
-- `healthz_healthz_get {}`
-
----
-
-### Memory Service
-
-```mermaid
-flowchart LR
-    subgraph MEM_SVC["🧠 memory:8604"]
-        STORE["MemoryStore"]
-        EMB["Embeddings<br/><i>OpenAI / local</i>"]
-        IDX["Vector Index<br/><i>numpy cosine</i>"]
-    end
-    
-    STORE --> EMB --> IDX
-    IDX --> JSON["memories.json<br/>embeddings.npy"]
-```
-
-**MCP Tools:**
-- `store_memory {content, tags[]}` → embed and persist
-- `get_top_n_memory {content, top_n}` → semantic recall
-
----
-
-### Perception Service
-
-```mermaid
-flowchart LR
-    subgraph PERC_SVC["👁️ perception:8608"]
-        PERC["Perception"]
-        CV["OpenCV<br/><i>Haar cascades</i>"]
-    end
-    
-    CAM["📷 picamera2"] --> PERC --> CV
-    CV --> FACES["Face boxes"]
-    CV --> PEOPLE["People boxes"]
-```
-
-**MCP Tools:** `detect {}` → returns detected faces/people, `status {}`
-
----
 
 ### Port Summary
 
@@ -607,246 +228,34 @@ flowchart LR
 | proximity | 8007 | 8607 | Ultrasonic distance |
 | perception | 8008 | 8608 | Face/people detection |
 | safety | 8009 | 8609 | Safe motion guard |
-| move_advisor | 8011 | 8611 | Split-brain move cluster entry point |
+| move_advisor | 8011 | 8611 | Move cluster entry point |
+
+### MCP Tools per Service
+
+| Service | MCP Tools |
+|---------|-----------|
+| **listening** | `listen` |
+| **speak** | `speak`, `stop`, `status` |
+| **observe** | `observe`, `observe_direction` |
+| **memory** | `store_memory`, `get_top_n_memory` |
+| **move** | `drive`, `stop`, `status` |
+| **head** | `set_angles`, `center`, `scan`, `status` |
+| **proximity** | `distance_cm`, `is_obstacle`, `status` |
+| **safety** | `check`, `estop_on`, `estop_off`, `guarded_drive`, `stop` |
+| **perception** | `detect`, `status` |
+| **move_advisor** | `execute_action`, `job_status`, `job_cancel`, `healthz_healthz_get` |
 
 ---
 
 ## External AI/ML Models
 
-The system uses external OpenAI APIs and optional local models for various capabilities. Below is a complete map of where models are consumed.
-
-### Model Usage Overview
-
-```mermaid
-flowchart TB
-    subgraph OPENAI["☁️ OpenAI API"]
-        GPT4O["gpt-4o<br/><i>Vision LLM</i>"]
-        GPT4OMINI["gpt-5.2<br/><i>Agent reasoning</i>"]
-        WHISPER["gpt-4o-mini-transcribe<br/><i>Whisper STT</i>"]
-        TTS["gpt-4o-mini-tts<br/><i>Text-to-Speech</i>"]
-        EMB["text-embedding-3-large<br/><i>Memory embeddings</i>"]
-    end
-
-    subgraph LOCAL["🏠 Local Models (optional)"]
-        VOSK["Vosk<br/><i>Offline STT</i>"]
-        PIPER["Piper<br/><i>Offline TTS</i>"]
-        HAAR["OpenCV Haar<br/><i>Face detection</i>"]
-    end
-
-    subgraph AGENTS["Agent Layer"]
-        ADVISOR["AdvisorBrain"]
-        SUBAGENTS["Sub-Agents<br/><i>(via MCP)</i>"]
-    end
-
-    subgraph SERVICES["Service Layer"]
-        SVC_SPEAK["speak"]
-        SVC_LISTEN["listening"]
-        SVC_OBSERVE["observe"]
-        SVC_MEMORY["memory"]
-        SVC_PERCEP["perception"]
-    end
-
-    %% Agent → OpenAI (reasoning)
-    ADVISOR -->|chat completions| GPT4OMINI
-    SUBAGENTS -->|chat completions| GPT4OMINI
-
-    %% Services → OpenAI
-    SVC_SPEAK -->|audio.speech| TTS
-    SVC_LISTEN -->|audio.transcriptions| WHISPER
-    SVC_OBSERVE -->|chat.completions + image| GPT4O
-    SVC_MEMORY -->|embeddings.create| EMB
-
-    %% Local alternatives
-    SVC_SPEAK -.->|fallback| PIPER
-    SVC_LISTEN -.->|fallback| VOSK
-    SVC_PERCEP -->|Haar cascades| HAAR
-```
-
----
-
-### LLM (Language Models)
-
-| Model | Used By | Purpose | Input | Output |
-|-------|---------|---------|-------|--------|
-| **gpt-5.2** | All Agents (via `OpenAIChatClient`) | Reasoning, tool selection, response generation | System prompt + user message + tool results | Text response or tool calls |
-| **gpt-4o** | `observe` service | Vision understanding | JPEG image + question | Scene description / grid selection |
-
-**Agent LLM Flow:**
-```mermaid
-sequenceDiagram
-    participant A as Agent
-    participant LLM as OpenAI gpt-5.2
-    participant MCP as MCP Service
-
-    A->>LLM: Instructions + User request
-    LLM->>A: Tool call (e.g., drive, speak)
-    A->>MCP: Execute tool via HTTP
-    MCP->>A: Tool result JSON
-    A->>LLM: Tool result
-    LLM->>A: Final response text
-```
-
----
-
-### STT (Speech-to-Text)
-
-| Engine | Model | Used By | Input | Output |
-|--------|-------|---------|-------|--------|
-| **openai** | `gpt-4o-mini-transcribe` (Whisper) | `listening` service | WAV audio (16-bit PCM) | Transcript text |
-| **vosk** | Local Vosk model | `listening` service | Audio stream | Transcript text |
-
-**STT Flow (OpenAI):**
-```mermaid
-sequenceDiagram
-    participant MIC as Microphone
-    participant L as Listener
-    participant API as OpenAI audio.transcriptions
-
-    MIC->>L: Raw PCM audio
-    Note over L: Detect speech start/end<br/>(energy threshold)
-    L->>L: Write temp WAV file
-    L->>API: POST /audio/transcriptions<br/>model: gpt-4o-mini-transcribe<br/>file: audio.wav
-    API->>L: {"text": "transcribed text"}
-```
-
-**Configuration:**
-```yaml
-# services/listening/config.yaml
-stt:
-  engine: openai  # or "vosk"
-  openai:
-    model: gpt-4o-mini-transcribe
-    language: de  # ISO-639-1
-    record_seconds: 15.0
-    stop_silence_seconds: 1.0
-    energy_threshold: 900.0
-```
-
----
-
-### TTS (Text-to-Speech)
-
-| Engine | Model | Used By | Input | Output |
-|--------|-------|---------|-------|--------|
-| **openai** | `gpt-4o-mini-tts` | `speak` service | Text + voice + instructions | Streaming audio |
-| **piper** | Local Piper model | `speak` service | Text | WAV audio |
-| **pico2wave** | System binary | `speak` service | Text | WAV audio |
-| **espeak** | System binary | `speak` service | Text | Audio output |
-
-**TTS Flow (OpenAI):**
-```mermaid
-sequenceDiagram
-    participant S as Speaker
-    participant API as OpenAI audio.speech
-    participant OUT as Audio Output
-
-    S->>S: Chunk text (max 600 chars)
-    loop For each chunk
-        S->>API: POST /audio/speech<br/>model: gpt-4o-mini-tts<br/>voice: alloy<br/>input: text chunk
-        API-->>S: Streaming audio bytes
-        S->>OUT: Play audio
-    end
-```
-
-**Configuration:**
-```yaml
-# services/speak/config.yaml
-tts:
-  engine: openai  # or "piper", "pico2wave", "espeak"
-  openai:
-    model: gpt-4o-mini-tts
-    voice: alloy  # alloy, echo, fable, onyx, nova, shimmer
-    instructions: ""
-    stream: true
-    gain: 1.0
-    chunking: true
-    max_chars: 600
-```
-
----
-
-### Vision LLM
-
-| Model | Used By | Purpose | Input | Output |
-|-------|---------|---------|-------|--------|
-| **gpt-4o** | `observe` service | Scene understanding | Base64 JPEG + question | Text description |
-| **gpt-4o** | `observe` service | Navigation suggestion | Base64 JPEG with 2×3 grid overlay | JSON: `{row, col, why, fit}` |
-
-**Vision Flow:**
-```mermaid
-sequenceDiagram
-    participant CAM as Camera
-    participant O as Observer
-    participant API as OpenAI chat.completions
-
-    CAM->>O: Capture JPEG
-    O->>O: Base64 encode image
-    O->>API: POST /chat/completions<br/>model: gpt-4o<br/>messages: [system, {text + image_url}]
-    API->>O: {"choices": [{"message": {"content": "..."}}]}
-```
-
-**Configuration:**
-```yaml
-# services/observe/config.yaml
-vision:
-  engine: openai
-  openai:
-    model: gpt-4o
-    temperature: 0.2
-    max_tokens: 200
-```
-
----
-
-### Embeddings
-
-| Model | Used By | Purpose | Input | Output |
-|-------|---------|---------|-------|--------|
-| **text-embedding-3-large** | `memory` service | Semantic memory storage/retrieval | Text content | Embedding vector (dimension depends on model; 3072 for `text-embedding-3-large`) |
-
-**Embedding Flow:**
-```mermaid
-sequenceDiagram
-    participant M as MemoryStore
-    participant API as OpenAI embeddings.create
-    participant IDX as Vector Index
-
-    M->>API: POST /embeddings<br/>model: text-embedding-3-large<br/>input: "memory content"
-    API->>M: {"data": [{"embedding": [...]}]}
-    M->>IDX: Store normalized vector
-    
-    Note over M,IDX: Retrieval (cosine similarity)
-    M->>API: Embed query text
-    API->>M: Query vector
-    M->>IDX: top_n nearest neighbors
-    IDX->>M: Matching memories
-```
-
-**Configuration:**
-```yaml
-# services/memory/config.yaml
-openai:
-    embedding_model: text-embedding-3-large
-    # base_url: optional override
-```
-
----
-
-### Local Detection (No API)
-
-| Model | Used By | Purpose | Input | Output |
-|-------|---------|---------|-------|--------|
-| **Haar cascades** | `perception` service | Face/people detection | Camera frame (OpenCV) | Bounding boxes |
-
-**Detection Flow:**
-```mermaid
-flowchart LR
-    CAM["📷 Camera"] --> CV["OpenCV<br/>cvtColor(GRAY)"]
-    CV --> HAAR["Haar Cascade<br/>detectMultiScale"]
-    HAAR --> BOXES["[{x,y,w,h}, ...]"]
-```
-
----
+| Operation | Model | Service |
+|-----------|-------|---------|
+| Vision understanding | gpt-4o | observe |
+| Speech-to-text | gpt-4o-mini-transcribe (Whisper) | listening |
+| Text-to-speech | gpt-4o-mini-tts | speak |
+| Memory embeddings | text-embedding-3-large | memory |
+| Face detection | OpenCV Haar cascades (local) | perception |
 
 ### Environment Variables
 
@@ -854,20 +263,37 @@ All OpenAI calls require an API key. Set in `.env`:
 
 ```bash
 OPENAI_API_KEY=sk-...
-# Optional: custom endpoint for Azure/local
+# Optional: custom endpoint
 OPENAI_BASE_URL=https://your-endpoint/v1
 ```
 
 ---
 
-### Cost Considerations
+## Development
 
-| Operation | Model | ~Tokens/Call | Frequency |
-|-----------|-------|--------------|-----------|
-| Agent reasoning | gpt-5.2 | 500-2000 | Every user interaction |
-| Vision observe | gpt-4o | 1000-2000 + image | Alone mode + on-demand |
-| STT transcribe | Whisper | ~1-10s audio | Every speech input |
-| TTS speak | gpt-4o-mini-tts | ~50-600 chars | Every robot response |
-| Memory embed | text-embedding-3-large | ~50-500 | Store + recall |
+### OpenCode supervisor (`OpenCode/`)
+```bash
+cd OpenCode
+uv run python main.py
+```
 
-**Tip:** Use `dry_run: true` in config files to test without API calls
+### Services (`services/`)
+```bash
+# Start all services
+cd services
+bash main.sh
+
+# Or start individual clusters
+bash brain.sh
+bash move_cluster.sh
+```
+
+### Installing new Python packages
+```bash
+# For OpenCode / root project:
+uv add <package>
+
+# For services (system Python):
+pip3 install <package>
+# Then update requirements.txt
+```

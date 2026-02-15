@@ -5,7 +5,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_SRC_DIR="${ROOT_DIR}/services/systemd"
 UNIT_DST_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-CONFIG_PATH="${ROOT_DIR}/services/config.yaml"
 
 log() {
 	echo "[install.sh] $*"
@@ -20,21 +19,6 @@ need_cmd() {
 	command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
-# Parse workflow_mode from services/config.yaml (defaults to legacy).
-get_workflow_mode() {
-	local mode="legacy"
-	if [[ -f "${CONFIG_PATH}" ]]; then
-		local val
-		val="$(grep -E '^[[:space:]]*workflow_mode[[:space:]]*:' "${CONFIG_PATH}" | head -n 1 | sed -E 's/^[[:space:]]*workflow_mode[[:space:]]*:[[:space:]]*//')"
-		val="${val%%#*}"
-		val="$(echo "$val" | tr -d '"\r' | xargs)"
-		if [[ -n "$val" ]]; then
-			mode="$val"
-		fi
-	fi
-	echo "$mode"
-}
-
 render_unit_file() {
 	local src="$1"
 	local dst="$2"
@@ -43,7 +27,6 @@ render_unit_file() {
 	[[ -f "${src}" ]] || die "Unit template not found: ${src}"
 
 	# Replace the default repo path used in templates with the actually installed repo path.
-	# The templates use %h/Desktop/pi_rc_bot.
 	sed "s|%h/Desktop/pi_rc_bot|${unit_repo_prefix}|g" "${src}" >"${dst}"
 }
 
@@ -53,10 +36,8 @@ need_cmd sed
 
 # --- Ensure scripts are executable
 chmod +x "${ROOT_DIR}/scripts/wait_for_network.sh" || true
-chmod +x "${ROOT_DIR}/services/main.sh" || true
 chmod +x "${ROOT_DIR}/services/brain.sh" || true
 chmod +x "${ROOT_DIR}/services/move_cluster.sh" || true
-chmod +x "${ROOT_DIR}/scripts/install_systemd_user_units.sh" || true
 
 # --- Ensure .env exists (OpenAI services require OPENAI_API_KEY)
 if [[ ! -f "${ROOT_DIR}/.env" ]]; then
@@ -102,90 +83,35 @@ fi
 log "Installing systemd user units to: ${UNIT_DST_DIR}"
 log "Repo path in unit files will be: ${UNIT_REPO_PREFIX}"
 
-# Determine workflow mode and install appropriate services.
-WORKFLOW_MODE="$(get_workflow_mode)"
-log "Workflow mode: ${WORKFLOW_MODE}"
+# Install open_code units (brain services + move cluster + OpenCode supervisor).
+log "Installing open_code units (brain services + move cluster + OpenCode supervisor)."
+render_unit_file "${UNIT_SRC_DIR}/pi_rc_brain_services.service" "${UNIT_DST_DIR}/pi_rc_brain_services.service" "${UNIT_REPO_PREFIX}"
+render_unit_file "${UNIT_SRC_DIR}/pi_rc_move_services.service" "${UNIT_DST_DIR}/pi_rc_move_services.service" "${UNIT_REPO_PREFIX}"
+render_unit_file "${UNIT_SRC_DIR}/pi_rc_opencode.service" "${UNIT_DST_DIR}/pi_rc_opencode.service" "${UNIT_REPO_PREFIX}"
 
-# Install units based on workflow mode.
-case "${WORKFLOW_MODE}" in
-	legacy)
-		log "Installing legacy mode units (monolithic services + legacy advisor)."
-		render_unit_file "${UNIT_SRC_DIR}/pi_rc_services.service" "${UNIT_DST_DIR}/pi_rc_services.service" "${UNIT_REPO_PREFIX}"
-		render_unit_file "${UNIT_SRC_DIR}/pi_rc_advisor.service" "${UNIT_DST_DIR}/pi_rc_advisor.service" "${UNIT_REPO_PREFIX}"
-		# Remove split-brain and open_code units if present from a previous install.
-		rm -f "${UNIT_DST_DIR}/pi_rc_advisor_split_brain.service" 2>/dev/null || true
-		rm -f "${UNIT_DST_DIR}/pi_rc_brain_services.service" 2>/dev/null || true
-		rm -f "${UNIT_DST_DIR}/pi_rc_move_services.service" 2>/dev/null || true
-		rm -f "${UNIT_DST_DIR}/pi_rc_opencode.service" 2>/dev/null || true
-		;;
-	split_brain_move)
-		log "Installing split_brain_move units (brain services + move cluster + split-brain advisor)."
-		render_unit_file "${UNIT_SRC_DIR}/pi_rc_brain_services.service" "${UNIT_DST_DIR}/pi_rc_brain_services.service" "${UNIT_REPO_PREFIX}"
-		render_unit_file "${UNIT_SRC_DIR}/pi_rc_move_services.service" "${UNIT_DST_DIR}/pi_rc_move_services.service" "${UNIT_REPO_PREFIX}"
-		render_unit_file "${UNIT_SRC_DIR}/pi_rc_advisor_split_brain.service" "${UNIT_DST_DIR}/pi_rc_advisor_split_brain.service" "${UNIT_REPO_PREFIX}"
-		# Remove legacy/monolithic and open_code units if present from a previous install.
-		rm -f "${UNIT_DST_DIR}/pi_rc_advisor.service" 2>/dev/null || true
-		rm -f "${UNIT_DST_DIR}/pi_rc_services.service" 2>/dev/null || true
-		rm -f "${UNIT_DST_DIR}/pi_rc_opencode.service" 2>/dev/null || true
-		;;
-	open_code)
-		log "Installing open_code units (brain services + move cluster + OpenCode supervisor)."
-		render_unit_file "${UNIT_SRC_DIR}/pi_rc_brain_services.service" "${UNIT_DST_DIR}/pi_rc_brain_services.service" "${UNIT_REPO_PREFIX}"
-		render_unit_file "${UNIT_SRC_DIR}/pi_rc_move_services.service" "${UNIT_DST_DIR}/pi_rc_move_services.service" "${UNIT_REPO_PREFIX}"
-		render_unit_file "${UNIT_SRC_DIR}/pi_rc_opencode.service" "${UNIT_DST_DIR}/pi_rc_opencode.service" "${UNIT_REPO_PREFIX}"
-		# Remove legacy and split-brain units if present from a previous install.
-		rm -f "${UNIT_DST_DIR}/pi_rc_advisor.service" 2>/dev/null || true
-		rm -f "${UNIT_DST_DIR}/pi_rc_services.service" 2>/dev/null || true
-		rm -f "${UNIT_DST_DIR}/pi_rc_advisor_split_brain.service" 2>/dev/null || true
-		;;
-	*)
-		die "Unknown workflow_mode in services/config.yaml: '${WORKFLOW_MODE}' (expected legacy|split_brain_move|open_code)"
-		;;
-esac
+# Remove legacy units if present from a previous install.
+rm -f "${UNIT_DST_DIR}/pi_rc_advisor.service" 2>/dev/null || true
+rm -f "${UNIT_DST_DIR}/pi_rc_services.service" 2>/dev/null || true
+rm -f "${UNIT_DST_DIR}/pi_rc_advisor_split_brain.service" 2>/dev/null || true
 
 # Reload, enable and start
 systemctl --user daemon-reload
 
-# Clear any previous start-limit hits (e.g., after a failed install run).
-systemctl --user reset-failed pi_rc_services.service 2>/dev/null || true
+# Clear any previous start-limit hits.
 systemctl --user reset-failed pi_rc_brain_services.service 2>/dev/null || true
 systemctl --user reset-failed pi_rc_move_services.service 2>/dev/null || true
-systemctl --user reset-failed pi_rc_advisor.service 2>/dev/null || true
-systemctl --user reset-failed pi_rc_advisor_split_brain.service 2>/dev/null || true
 systemctl --user reset-failed pi_rc_opencode.service 2>/dev/null || true
 
-case "${WORKFLOW_MODE}" in
-	legacy)
-		systemctl --user enable --now pi_rc_services.service
-		systemctl --user enable --now pi_rc_advisor.service
-		# Ensure split-brain and open_code units are stopped/disabled if they were running.
-		systemctl --user disable --now pi_rc_brain_services.service 2>/dev/null || true
-		systemctl --user disable --now pi_rc_move_services.service 2>/dev/null || true
-		systemctl --user disable --now pi_rc_advisor_split_brain.service 2>/dev/null || true
-		systemctl --user disable --now pi_rc_opencode.service 2>/dev/null || true
-		log "Installed + started: pi_rc_services.service, pi_rc_advisor.service"
-		;;
-	split_brain_move)
-		systemctl --user enable --now pi_rc_brain_services.service
-		systemctl --user enable --now pi_rc_move_services.service
-		systemctl --user enable --now pi_rc_advisor_split_brain.service
-		# Ensure legacy/monolithic and open_code units are stopped/disabled if they were running.
-		systemctl --user disable --now pi_rc_advisor.service 2>/dev/null || true
-		systemctl --user disable --now pi_rc_services.service 2>/dev/null || true
-		systemctl --user disable --now pi_rc_opencode.service 2>/dev/null || true
-		log "Installed + started: pi_rc_brain_services.service, pi_rc_move_services.service, pi_rc_advisor_split_brain.service"
-		;;
-	open_code)
-		systemctl --user enable --now pi_rc_brain_services.service
-		systemctl --user enable --now pi_rc_move_services.service
-		systemctl --user enable --now pi_rc_opencode.service
-		# Ensure legacy and split-brain advisor units are stopped/disabled if they were running.
-		systemctl --user disable --now pi_rc_advisor.service 2>/dev/null || true
-		systemctl --user disable --now pi_rc_services.service 2>/dev/null || true
-		systemctl --user disable --now pi_rc_advisor_split_brain.service 2>/dev/null || true
-		log "Installed + started: pi_rc_brain_services.service, pi_rc_move_services.service, pi_rc_opencode.service"
-		;;
-esac
+systemctl --user enable --now pi_rc_brain_services.service
+systemctl --user enable --now pi_rc_move_services.service
+systemctl --user enable --now pi_rc_opencode.service
+
+# Ensure legacy units are stopped/disabled if they were running.
+systemctl --user disable --now pi_rc_advisor.service 2>/dev/null || true
+systemctl --user disable --now pi_rc_services.service 2>/dev/null || true
+systemctl --user disable --now pi_rc_advisor_split_brain.service 2>/dev/null || true
+
+log "Installed + started: pi_rc_brain_services.service, pi_rc_move_services.service, pi_rc_opencode.service"
 
 # --- Optional: enable lingering so user services start at boot without GUI/login
 linger_mode="${ENABLE_LINGER:-auto}"
@@ -199,7 +125,6 @@ if [[ "${linger_mode}" == "force" || "${linger_mode}" == "auto" ]]; then
 			log "Enabling lingering for user ${USER} (requires sudo)."
 			sudo loginctl enable-linger "${USER}"
 		else
-			# Auto: only do it if sudo won't prompt.
 			if sudo -n true >/dev/null 2>&1; then
 				log "Enabling lingering for user ${USER} (passwordless sudo detected)."
 				sudo loginctl enable-linger "${USER}"
@@ -217,15 +142,4 @@ else
 	log "Lingering not enabled (ENABLE_LINGER=${ENABLE_LINGER:-auto})."
 fi
 
-# Final status message based on workflow mode.
-case "${WORKFLOW_MODE}" in
-	legacy)
-		log "Done. Check status with: systemctl --user status pi_rc_services.service pi_rc_advisor.service"
-		;;
-	split_brain_move)
-		log "Done. Check status with: systemctl --user status pi_rc_brain_services.service pi_rc_move_services.service pi_rc_advisor_split_brain.service"
-		;;
-	open_code)
-		log "Done. Check status with: systemctl --user status pi_rc_brain_services.service pi_rc_move_services.service pi_rc_opencode.service"
-		;;
-esac 
+log "Done. Check status with: systemctl --user status pi_rc_brain_services.service pi_rc_move_services.service pi_rc_opencode.service"

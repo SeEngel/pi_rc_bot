@@ -1,9 +1,4 @@
 # services/config.yaml
 #
-# Controls which set of services `services/main.sh` starts.
-#
-# - legacy:           monolithic services + legacy advisor agent
-# - split_brain_move: brain services + move cluster + split-brain advisor agent
-# - open_code:        brain services + move cluster + OpenCode supervisor (recommended)
-
-workflow_mode: open_code
+# Global services configuration.
+# All services run in open_code mode (brain services + move cluster + OpenCode supervisor).
