@@ -6,17 +6,8 @@ SERVICES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CONFIG_PATH="$SERVICES_DIR/config.yaml"
 
-workflow_mode="legacy"
-if [[ -f "$CONFIG_PATH" ]]; then
-	# Parse a single top-level key: workflow_mode: legacy|split_brain_move
-	# (Keep parsing deliberately simple and dependency-free.)
-	val="$(grep -E '^[[:space:]]*workflow_mode[[:space:]]*:' "$CONFIG_PATH" | head -n 1 | sed -E 's/^[[:space:]]*workflow_mode[[:space:]]*:[[:space:]]*//')"
-	val="${val%%#*}"
-	val="$(echo "$val" | tr -d '"\r' | xargs)"
-	if [[ -n "$val" ]]; then
-		workflow_mode="$val"
-	fi
-fi
+# All services are started (open_code mode).
+# The OpenCode supervisor runs separately (pi_rc_opencode.service).
 
 # Use global python3 by default (robot services are typically installed system-wide).
 # Override with: PI_RC_BOT_PYTHON=/path/to/python
@@ -98,28 +89,11 @@ start_service() {
 
 should_start_service() {
 	local name="$1"
-	# Always skip helper/internal folders.
+	# Skip helper/internal folders.
 	if [[ "$name" == "systemd" ]]; then
 		return 1
 	fi
-
-	case "$workflow_mode" in
-		legacy)
-			# Legacy mode: do NOT start the split-brain move_advisor.
-			if [[ "$name" == "move_advisor" ]]; then
-				return 1
-			fi
-			return 0
-			;;
-		split_brain_move)
-			# Split-brain mode: start everything (including move_advisor).
-			return 0
-			;;
-		*)
-			echo "unknown workflow_mode in services/config.yaml: '$workflow_mode' (expected legacy|split_brain_move)" >&2
-			exit 2
-			;;
-	esac
+	return 0
 }
 
 # Helper: check if a service depends on 'robot' being available first.

@@ -1,0 +1,107 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "model": "or/openai/gpt-4.1-mini",
+  "small_model": "or/openai/gpt-4.1-mini",
+
+  "provider": {
+    "or": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenRouter (compatible)",
+      "options": {
+        "baseURL": "https://openrouter.ai/api/v1"
+      },
+      "models": {
+        "openai/gpt-4.1-mini": {
+          "name": "GPT-4.1 Mini",
+          "limit": {
+            "context": 1047576,
+            "output": 32768
+          }
+        }
+      }
+    }
+  },
+
+  "enabled_providers": ["or"],
+
+  "mcp": {
+    "robot_speak": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8601/mcp",
+      "enabled": true
+    },
+    "robot_head": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8606/mcp",
+      "enabled": true
+    },
+    "robot_proximity": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8607/mcp",
+      "enabled": true
+    },
+    "robot_perception": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8608/mcp",
+      "enabled": true
+    },
+    "robot_safety": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8609/mcp",
+      "enabled": true
+    },
+    "robot_listen": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8602/mcp",
+      "enabled": true
+    },
+    "robot_observe": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8603/mcp",
+      "enabled": true
+    },
+    "robot_memory": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8604/mcp",
+      "enabled": true
+    },
+    "robot_move_advisor": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8611/mcp",
+      "enabled": true
+    },
+    "robot_codex": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8612/mcp",
+      "enabled": false
+    }
+  },
+
+  "permission": {
+    "*": "allow",
+    "webfetch": "allow"
+  },
+
+  "agent": {
+    "robot": {
+      "description": "Always-on robot brain — two workstreams: autonomous thinking and human interaction.",
+      "mode": "primary",
+      "prompt": "{file:./AGENTS.md}",
+      "tools": {
+        "robot_speak_*": true,
+        "robot_head_*": true,
+        "robot_proximity_*": true,
+        "robot_perception_*": true,
+        "robot_safety_*": true,
+        "robot_listen_*": true,
+        "robot_observe_*": true,
+        "robot_memory_*": true,
+        "robot_move_advisor_*": true,
+        "robot_codex_*": true,
+        "webfetch": true,
+        "websearch": true
+      }
+    }
+  }
+}

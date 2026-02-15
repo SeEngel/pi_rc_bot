@@ -9,7 +9,7 @@ safety:
   proximity_base_url: http://127.0.0.1:8007
 
   # Default obstacle threshold (cm)
-  obstacle_threshold_cm: 35
+  obstacle_threshold_cm: 20
 
 service:
   host: 0.0.0.0

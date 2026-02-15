@@ -83,7 +83,7 @@ start_service() {
 }
 
 # Brain-cluster services (interactive IO + memory).
-# NOTE: advisor itself is an agent (agent/advisor), not a service.
+# NOTE: The OpenCode supervisor runs separately (pi_rc_opencode.service).
 SERVICES=(
 	"listening"
 	"speak"

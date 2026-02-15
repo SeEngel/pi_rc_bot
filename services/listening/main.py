@@ -396,6 +396,7 @@ def main() -> int:
 		raw = await request.body()
 		stream = False
 		speech_pause_seconds: float | None = None
+		max_wait_for_speech_seconds: float | None = None
 		try:
 			if raw:
 				import json
@@ -416,12 +417,24 @@ def main() -> int:
 							speech_pause_seconds = float(val)
 						except Exception:
 							speech_pause_seconds = None
+					# No-speech timeout: give up if no speech is detected within this many seconds.
+					# Useful for post-interaction windows where we want fast fallback.
+					wait_val = data.get("max_wait_for_speech_seconds")
+					if wait_val is not None:
+						try:
+							max_wait_for_speech_seconds = float(wait_val)
+						except Exception:
+							max_wait_for_speech_seconds = None
 		except Exception:
 			pass
 
 		def _do_listen() -> tuple[dict[str, Any], str]:
 			with listener_lock:
-				res = li.listen_once(stream=stream, speech_pause_seconds=speech_pause_seconds)
+				res = li.listen_once(
+					stream=stream,
+					speech_pause_seconds=speech_pause_seconds,
+					max_wait_for_speech_seconds=max_wait_for_speech_seconds,
+				)
 				text = li.extract_text(res)
 				return res, text
 

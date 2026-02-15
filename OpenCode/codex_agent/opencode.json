@@ -1,0 +1,61 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "model": "or/google/gemini-2.5-flash",
+  "small_model": "or/qwen/qwen3-coder",
+
+  "provider": {
+    "or": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenRouter (compatible)",
+      "options": {
+        "baseURL": "https://openrouter.ai/api/v1"
+      },
+      "models": {
+        "anthropic/claude-sonnet-4.5": {
+          "name": "Claude Sonnet 4.5",
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          }
+        },
+        "qwen/qwen3-coder": {
+          "name": "Qwen3 Coder",
+          "limit": {
+            "context": 262144,
+            "output": 65536
+          }
+        },
+        "google/gemini-2.5-flash": {
+          "name": "Gemini 2.5 Flash",
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          }
+        }
+      }
+    }
+  },
+
+  "enabled_providers": ["or"],
+
+  "mcp": {},
+
+  "permission": {
+    "*": "allow",
+    "bash": "allow",
+    "edit": "allow"
+  },
+
+  "agent": {
+    "codex": {
+      "description": "Codex agent — builds new and repairs broken Python MCP tool servers.",
+      "mode": "primary",
+      "prompt": "{file:./AGENTS.md}",
+      "tools": {
+        "bash": true,
+        "edit": true
+      }
+    }
+  }
+}

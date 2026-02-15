@@ -28,7 +28,7 @@ move_advisor:
   max_speed: 100
   max_steer_deg: 45
   max_duration_s: 10.0
-  default_threshold_cm: 35.0
+  default_threshold_cm: 20.0
 
   # Job retention (for /job_status polling)
   max_jobs: 50

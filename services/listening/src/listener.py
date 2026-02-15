@@ -105,11 +105,18 @@ class Listener:
 		*,
 		stream: bool = False,
 		speech_pause_seconds: float | None = None,
+		max_wait_for_speech_seconds: float | None = None,
 	) -> dict[str, Any]:
 		"""Listen once and return the raw result dict.
 
 		On success, the underlying implementation typically returns:
 		  {"text": "..."}
+
+		Parameters:
+		  speech_pause_seconds: Override for how long silence ends the recording
+		    after speech has started.
+		  max_wait_for_speech_seconds: If set, give up after this many seconds
+		    if no speech is detected at all. Returns {"text": ""}.
 		"""
 		if self.settings.dry_run:
 			return {"text": "(dry_run)"}
@@ -119,7 +126,10 @@ class Listener:
 
 		engine = (self.settings.engine or "").strip().lower()
 		if engine == "openai":
-			return self._listen_openai_once(speech_pause_seconds=speech_pause_seconds)
+			return self._listen_openai_once(
+				speech_pause_seconds=speech_pause_seconds,
+				max_wait_for_speech_seconds=max_wait_for_speech_seconds,
+			)
 		if engine != "vosk":
 			raise ListenerError(f"Unsupported STT engine: {self.settings.engine!r}")
 
@@ -136,8 +146,14 @@ class Listener:
 		# Normalize unknown return types.
 		return {"text": str(res)}
 
-	def _listen_openai_once(self, *, speech_pause_seconds: float | None = None) -> dict[str, Any]:
-		"""Record a short WAV and transcribe it via OpenAI."""
+	def _listen_openai_once(self, *, speech_pause_seconds: float | None = None, max_wait_for_speech_seconds: float | None = None) -> dict[str, Any]:
+		"""Record a short WAV and transcribe it via OpenAI.
+
+		Parameters:
+		  max_wait_for_speech_seconds: If set, give up after this many seconds
+		    of waiting for speech to start. Returns {"text": ""} immediately
+		    without calling the OpenAI API.
+		"""
 		client = self._openai_client
 		if client is None:
 			raise ListenerError(self._available_reason or "OpenAI client not initialized")
@@ -212,11 +228,14 @@ class Listener:
 		last_exc: Exception | None = None
 		audio_arr = None
 		sample_rate: int | None = None
+		# Compute no-speech timeout in frames (per sample-rate).
+		_max_wait_s = max_wait_for_speech_seconds
 		for sr in unique_rates:
 			frames_per_chunk = max(1, int(sr * (chunk_ms / 1000.0)))
 			max_frames = int(max_record_s * sr)
 			if max_frames <= 0:
 				continue
+			max_wait_frames = int(_max_wait_s * sr) if _max_wait_s is not None and _max_wait_s > 0 else None
 
 			pre_roll_frames = int(pre_roll_s * sr)
 			pre_buf: "collections.deque[np.ndarray]" = collections.deque()
@@ -226,6 +245,7 @@ class Listener:
 			started = False
 			silence_frames = 0
 			total_frames = 0
+			no_speech_abort = False
 
 			try:
 				with sd.InputStream(
@@ -245,6 +265,11 @@ class Listener:
 						is_speech = level >= energy_th
 
 						if not started:
+							# Give up early if no speech detected within the limit.
+							if max_wait_frames is not None and total_frames >= max_wait_frames:
+								no_speech_abort = True
+								break
+
 							# Accumulate pre-roll while waiting for speech.
 							if pre_roll_frames > 0:
 								pre_buf.append(arr)
@@ -272,6 +297,11 @@ class Listener:
 								silence_frames += frames
 								if (silence_frames / sr) >= stop_silence_s:
 									break
+
+				# If no-speech timeout triggered, return empty immediately
+				# without calling the OpenAI API (saves time + money).
+				if no_speech_abort:
+					return {"text": ""}
 
 				# If we never detected speech, still return what we captured (up to max_record_s).
 				audio_arr = np.concatenate(chunks, axis=0) if chunks else np.zeros((0, 1), dtype=np.int16)
