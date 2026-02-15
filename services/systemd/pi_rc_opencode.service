@@ -1,7 +1,6 @@
 [Unit]
 Description=pi_rc_bot OpenCode Supervisor (observe → think → act → remember)
-Requires=pi_rc_brain_services.service pi_rc_move_services.service
-Wants=network-online.target
+Wants=pi_rc_brain_services.service pi_rc_move_services.service network-online.target
 After=network-online.target pi_rc_brain_services.service pi_rc_move_services.service
 
 [Service]
