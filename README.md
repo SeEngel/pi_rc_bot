@@ -269,6 +269,244 @@ OPENAI_BASE_URL=https://your-endpoint/v1
 
 ---
 
+## Dynamic Tool Creation — Self-Extending Agent via Codex Agent
+
+One of the most powerful capabilities enabled by [OpenCode](https://opencode.ai) is the ability to give the main robot agent access to a **dedicated coding agent** (the Codex Agent). This means the robot can **create entirely new MCP tool servers on the fly** — at runtime, on request, without any human developer involvement.
+
+The robot is not limited to its pre-built services. If a user asks it to do something it cannot do yet (e.g., "search YouTube for music", "check the weather", "translate a sentence"), the main agent delegates to the Codex Agent, which writes, deploys, and registers a brand-new MCP tool server — all within seconds. The new tool is immediately available as a native MCP tool for the main agent to call.
+
+### Why OpenCode Makes This Possible
+
+OpenCode exposes a **headless HTTP API** (`opencode serve`) that turns any LLM into a fully autonomous coding agent with file editing, terminal access, and tool-use capabilities. The Codex Agent runs its **own, separate OpenCode instance** (port 4097) backed by a strong code model (e.g., Gemini 2.5 Flash, Qwen3 Coder). This gives it the same power as a human developer sitting at a terminal: it can write files, install packages, and verify syntax — all autonomously.
+
+Because OpenCode also supports **hot-registration of MCP servers** via its `/mcp` HTTP endpoint, newly created tools can be injected into the main agent's tool palette at runtime, without restarting anything.
+
+### Architecture Overview
+
+```mermaid
+flowchart TB
+    subgraph MAIN["Main Agent (OpenCode :4096)"]
+        BRAIN["🧠 Robot Brain<br/>(LLM — Claude/GPT)"]
+        MCP_REG["MCP Registry"]
+    end
+
+    subgraph CODEX["Codex Agent (:8012 / :8612)"]
+        CODEX_API["FastAPI + FastMCP<br/>build_tool / repair_tool"]
+        CODEX_OC["OpenCode :4097<br/>(Code LLM — Gemini/Qwen)"]
+        TRACKER["Job Tracker"]
+    end
+
+    subgraph MY_TOOLS["my_tools/ (Dynamic)"]
+        T1["🔧 duckduckgo_search<br/>:9100 / :9700"]
+        T2["🔧 youtube_audio<br/>:9101 / :9701"]
+        TN["🔧 ... (future tools)<br/>:91xx / :97xx"]
+    end
+
+    BRAIN -- "1. build_tool(description)" --> CODEX_API
+    CODEX_API -- "2. prompt" --> CODEX_OC
+    CODEX_OC -- "3. writes server.py" --> MY_TOOLS
+    CODEX_API -- "4. starts process" --> MY_TOOLS
+    CODEX_API -- "5. POST /mcp (hot-register)" --> MCP_REG
+    BRAIN -- "6. calls new tool" --> MY_TOOLS
+
+    style MAIN fill:#1a1a2e,color:#fff
+    style CODEX fill:#16213e,color:#fff
+    style MY_TOOLS fill:#0f3460,color:#fff
+```
+
+### End-to-End Flow: Building a New Tool
+
+The following sequence shows exactly what happens when a user says *"Can you search the web for me?"* and the robot has no web-search tool yet:
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Brain as 🧠 Main Agent<br/>(OpenCode :4096)
+    participant Speak as 🔊 Speak Service
+    participant Codex as 🔧 Codex Agent<br/>(:8012)
+    participant CodeAI as 💻 Code LLM<br/>(OpenCode :4097)
+    participant FS as 📁 File System<br/>(my_tools/)
+    participant OC as OpenCode<br/>MCP Registry
+
+    User->>Brain: "Can you search the web?"
+    Brain->>Brain: No web-search tool exists
+
+    Brain->>Speak: speak("I need a new tool for that. Building it now!")
+    Brain->>Codex: build_tool({ description: "Web search using DuckDuckGo...", suggested_name: "duckduckgo_search" })
+
+    Note over Codex: Creates Job, returns job_id immediately
+
+    Codex->>Codex: Scan existing tools (inventory)
+    Codex->>CodeAI: Send build prompt + inventory + template
+
+    Note over CodeAI: Code LLM writes complete server.py<br/>using bash (cat > server.py)
+
+    CodeAI->>FS: Write server.py to my_tools/duckduckgo_search/
+    CodeAI-->>Codex: "BUILT: DuckDuckGo web search"
+
+    Codex->>Codex: Verify Python syntax (ast.parse)
+    Codex->>FS: Start server process (port 9100)
+    Codex->>OC: POST /mcp → hot-register "my_duckduckgo_search"
+    Codex->>Codex: Health check (/healthz) → ✅
+
+    Note over Codex: Job state → DONE
+
+    Brain->>Codex: job_detail({ job_id: "abc123" })
+    Codex-->>Brain: { state: "done", healthy: true }
+
+    Brain->>Speak: speak("Done! I can search the web now.")
+    Brain->>FS: my_duckduckgo_search → search({ query: "..." })
+    FS-->>Brain: { results: [...] }
+    Brain->>Speak: speak("Here's what I found: ...")
+```
+
+### How Each Step Works Internally
+
+#### Step 1 — Build Request
+
+The main agent calls `robot_codex` → `build_tool` with a plain-text description. The Codex Agent creates an async **Job** (tracked by `JobTracker`) and returns a `job_id` immediately. A background thread starts the actual build.
+
+#### Step 2 — Inventory Scan
+
+Before writing any code, the `BuildWorker` scans `my_tools/` via `ToolInventory.build_inventory_for_ai()`. This produces a human-readable summary of all existing tools — their names, ports, endpoints, and source previews — so the Code LLM can decide:
+
+| Decision | When |
+|----------|------|
+| `EXISTS` | An existing tool already covers the capability |
+| `EXTENDING` | An existing tool is close — just add new endpoints |
+| `REWRITING` | An existing tool needs fundamental redesign |
+| `BUILT` | No match — build from scratch |
+
+#### Step 3 — Code Generation
+
+The `CodexClient` sends a detailed prompt (via `build_prompt()`) to the dedicated OpenCode instance on port 4097. This prompt includes:
+- The requested capability description
+- The full tool inventory
+- A mandatory code template (FastAPI + FastMCP + dual-uvicorn bootstrap)
+- Strict rules (Python only, `uv add` for packages, `httpx` for HTTP, Pydantic models with descriptions)
+
+The Code LLM writes a complete, working `server.py` using bash `cat` commands — not stubs.
+
+#### Step 4 — Verification & Deployment
+
+After the Code LLM finishes:
+
+1. **Syntax verification** — `ast.parse(server.py)` catches any Python syntax errors
+2. **Auto-repair** — If syntax fails, a repair prompt is sent for a second attempt
+3. **Process launch** — The server is started as a subprocess via `ToolInventory.restart()`
+4. **Hot-registration** — `ToolInventory.re_register()` calls `POST /mcp` on the main OpenCode instance (port 4096) to inject the new tool into the MCP registry
+5. **Health check** — A `GET /healthz` call confirms the server is alive and responding
+
+#### Step 5 — Immediate Availability
+
+The new tool is now a first-class MCP tool in the main agent's palette, prefixed with `my_` (e.g., `my_duckduckgo_search`). The agent can call it in the same conversation turn.
+
+### Self-Repair: Fixing Broken Tools
+
+The Codex Agent doesn't just build — it also **repairs**. The main supervisor periodically health-checks all `my_tools/` servers. When a tool is broken:
+
+```mermaid
+flowchart LR
+    HC["Health Check<br/>(every 5 min)"] -- "unhealthy" --> BRAIN["🧠 Main Agent"]
+    BRAIN -- "repair_tool(description)" --> CODEX["🔧 Codex Agent"]
+    CODEX -- "reads source + logs" --> DIAG["Diagnose<br/>(error patterns)"]
+    DIAG -- "repair prompt" --> AI["💻 Code LLM"]
+    AI -- "writes fix" --> FS["📁 server.py"]
+    FS -- "restart + re-register" --> LIVE["✅ Tool Healthy"]
+```
+
+The `RepairWorker`:
+1. Auto-detects which tool is broken by matching tool names in the description or scanning for unhealthy servers
+2. Reads the full source code, error logs, and server status via `ToolInventory.read()`
+3. Sends everything to the Code LLM with a `repair_prompt()`
+4. Verifies the fix was applied (SHA-256 hash comparison of `server.py` before/after)
+5. Restarts and re-registers the repaired tool
+
+### Tool Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Requested: User asks for new capability
+    Requested --> Building: build_tool() called
+    Building --> SyntaxCheck: Code LLM writes server.py
+    SyntaxCheck --> AutoRepair: Syntax error
+    AutoRepair --> SyntaxCheck: Retry
+    SyntaxCheck --> Starting: Syntax OK
+    Starting --> Registering: Process launched
+    Registering --> Healthy: Hot-registered + healthz OK
+    Registering --> Unhealthy: healthz failed
+    Healthy --> InUse: Agent calls tool
+    InUse --> Broken: Runtime error
+    Broken --> Repairing: repair_tool() called
+    Repairing --> Starting: Fix applied
+    Unhealthy --> Repairing: Auto-detected
+    InUse --> Extending: New endpoints needed
+    Extending --> SyntaxCheck: Code LLM updates server.py
+```
+
+### Port Allocation
+
+Dynamic tools use auto-assigned ports starting from **9100**, with MCP ports at **+600**:
+
+| Tool | API Port | MCP Port | Status |
+|------|----------|----------|--------|
+| duckduckgo_search | 9100 | 9700 | Built by Codex Agent |
+| youtube_audio_search_loop | 9101 | 9701 | Built by Codex Agent |
+| *(next tool)* | 9102 | 9702 | *(auto-assigned)* |
+
+Each tool's port is persisted in `my_tools/<name>/port.txt` to survive restarts.
+
+### Two-Level OpenCode Architecture
+
+A key architectural insight is the **two independent OpenCode instances**:
+
+```mermaid
+flowchart LR
+    subgraph OC1["OpenCode Instance 1 (:4096)"]
+        direction TB
+        M1["Model: Claude / GPT-4o"]
+        R1["Role: Robot Brain"]
+        T1["Tools: speak, observe, drive,<br/>memory, head, codex, my_*"]
+    end
+
+    subgraph OC2["OpenCode Instance 2 (:4097)"]
+        direction TB
+        M2["Model: Gemini 2.5 Flash /<br/>Qwen3 Coder"]
+        R2["Role: Code Specialist"]
+        T2["Tools: bash, edit, file read/write"]
+    end
+
+    OC1 -- "build_tool / repair_tool<br/>(via Codex Agent MCP)" --> OC2
+    OC2 -- "writes code + installs deps" --> FS["📁 my_tools/"]
+    FS -- "hot-register → /mcp" --> OC1
+
+    style OC1 fill:#1a1a2e,color:#fff
+    style OC2 fill:#0f3460,color:#fff
+```
+
+| | Main Agent (OC1) | Codex Agent (OC2) |
+|---|---|---|
+| **Port** | 4096 | 4097 |
+| **Model** | Claude Sonnet / GPT-4o | Gemini 2.5 Flash / Qwen3 Coder |
+| **Role** | Robot brain — perception, speech, motion, planning | Code specialist — write, debug, deploy MCP servers |
+| **MCP Tools** | 10+ service tools + dynamic `my_*` tools | bash, file edit (OpenCode built-in tools) |
+| **Isolation** | Never writes code | Never drives the robot |
+
+This separation ensures the robot brain stays focused on its mission (exploring, interacting, executing plans) while code tasks are handled by a specialist model optimized for programming.
+
+### Example: Tools Built at Runtime
+
+The robot has already used this system to create tools on user request:
+
+| Tool | Description | How It Was Created |
+|------|-------------|--------------------|
+| `duckduckgo_search` | Web search via DuckDuckGo API | User asked "Can you search the web?" |
+| `youtube_audio_search_loop` | Search and play YouTube audio | User asked "Can you play music from YouTube?" |
+
+Each tool is a fully self-contained FastAPI + FastMCP server with health checks, Pydantic models, and proper error handling — all written autonomously by the Codex Agent.
+
+---
+
 ## Development
 
 ### OpenCode supervisor (`OpenCode/`)
