@@ -275,7 +275,9 @@ OPENAI_BASE_URL=https://your-endpoint/v1
 
 One of the most powerful capabilities enabled by [OpenCode](https://opencode.ai) is the ability to give the main robot agent access to a **dedicated coding agent** (the Codex Agent). This means the robot can **create entirely new MCP tool servers on the fly** — at runtime, on request, without any human developer involvement.
 
-The robot is not limited to its pre-built services. If a user asks it to do something it cannot do yet (e.g., "search YouTube for music", "check the weather", "translate a sentence"), the main agent delegates to the Codex Agent, which writes, deploys, and registers a brand-new MCP tool server — all within seconds. The new tool is immediately available as a native MCP tool for the main agent to call.
+OpenCode exposes a **headless HTTP API** (`opencode serve`) that turns any LLM into a fully autonomous coding agent with file editing, terminal access, and tool-use capabilities. The Codex Agent runs its **own, separate OpenCode instance** (port 4097) backed by a strong code model. For best results, we recommend using **Claude Sonnet 4.5** as the main agent model (for reasoning and tool use), and a strong code model (e.g., Gemini 2.5 Flash, Qwen3 Coder) for the Codex Agent. This gives the system the same power as a human developer sitting at a terminal: it can write files, install packages, and verify syntax — all autonomously.
+
+Because OpenCode also supports **hot-registration of MCP servers** via its `/mcp` HTTP endpoint, newly created tools can be injected into the main agent's tool palette at runtime, without restarting anything.
 
 ### Why OpenCode Makes This Possible
 
