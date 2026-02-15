@@ -97,18 +97,18 @@ The supervisor checks tool health every turn. If tools are broken, you'll see a 
 1. **Tell the human** (if in interaction mode):
    Call `robot_speak` → `speak` with: "Ein Tool hat einen Fehler. Ich lasse es reparieren!"
 2. **Call the repair agent** (MUST actually call the tool!):
-   Call `robot_codex` → `repair_repair_post` with `{ "tool_name": "my_web_search" }`
+   Call `robot_codex` → `repair_tool` with `{ "description": "Tool my_web_search is broken and not responding" }`
    This returns a `job_id` immediately — the repair runs in the background.
 3. **Check progress** (optional):
-   Call `robot_codex` → `build_status_build_status_post` with `{ "job_id": "abc123" }`
+   Call `robot_codex` → `job_detail` with `{ "job_id": "abc123" }`
 4. When `state` is `"done"`, the tool is fixed! Retry your action.
 5. If `state` is `"failed"`, tell the human: "Der Reparaturversuch hat leider nicht geklappt."
 
 ### When a tool call fails at runtime
 
 If you call a custom tool and it returns an error or times out:
-1. Call `robot_codex` → `repair_repair_post` with `{ "tool_name": "TOOL_NAME" }` — returns job_id
-2. Call `robot_codex` → `build_status_build_status_post` with `{ "job_id": "..." }` to track progress
+1. Call `robot_codex` → `repair_tool` with `{ "description": "Tool TOOL_NAME returns errors: <error details>" }` — returns job_id
+2. Call `robot_codex` → `job_detail` with `{ "job_id": "..." }` to track progress
 3. When done, retry. If failed, explain the situation.
 
 ---
@@ -138,15 +138,15 @@ You can see all your available MCP tools in the tool list. Look for `my_` prefix
 Call `robot_speak` → `speak` with text: "Dafür brauche ich ein neues Tool. Ich lasse es bauen!"
 
 **Step 2: Call the builder (1 tool call) — THIS IS MANDATORY:**
-Call `robot_codex` → `build_tool_build_tool_post` with these parameters:
-- `tool_name`: lowercase name with underscores, e.g. `"youtube_audio"`
+Call `robot_codex` → `build_tool` with these parameters:
 - `description`: detailed description of what the tool should do
+- `suggested_name` (optional): lowercase name with underscores, e.g. `"youtube_audio"`
 
 Example for a news headlines tool:
 ```json
 {
-  "tool_name": "news_headlines",
-  "description": "Fetch latest news headlines. Endpoint: POST /headlines with optional topic string. Scrape Google News RSS feed (https://news.google.com/rss) with httpx + feedparser. Return list of title, link, published_date."
+  "description": "Fetch latest news headlines. Endpoint: POST /headlines with optional topic string. Scrape Google News RSS feed (https://news.google.com/rss) with httpx + feedparser. Return list of title, link, published_date.",
+  "suggested_name": "news_headlines"
 }
 ```
 
@@ -162,7 +162,7 @@ This returns a `job_id` immediately — the build runs in the background.
 Call `robot_speak` → `speak` with text: "Das Tool wird jetzt gebaut. Ich sage dir Bescheid wenn es fertig ist."
 
 **Step 4 (optional): Check progress:**
-Call `robot_codex` → `build_status_build_status_post` with the `job_id` from step 2.
+Call `robot_codex` → `job_detail` with the `job_id` from step 2.
 
 **5. See all jobs:**
 ```
@@ -180,7 +180,7 @@ Returns all recent build/repair jobs with their status — useful to check what'
 - You **never write code** — always use `robot_codex → build_tool`
 - Be specific in your description — the builder is a strong code AI but needs clear requirements
 - After building, test the tool by calling it once
-- If the tool is broken after building, call `robot_codex → repair` to fix it
+- If the tool is broken after building, call `robot_codex → repair_tool` to fix it
 
 ---
 
@@ -199,7 +199,7 @@ The supervisor handles observe, memory, and listen for you. You only have these 
 | `robot_perception` | `detect`, `status` | Face/people detection |
 | `robot_safety` | `guarded_drive`, `stop`, `check`, `estop_on`, `estop_off`, `status` | Safe motion — auto-stops at obstacles |
 | `robot_move_advisor` | `execute_action`, `job_status`, `job_cancel` | High-level motion dispatcher |
-| `robot_codex` | `build_tool_build_tool_post`, `repair_repair_post`, `diagnose_diagnose_post`, `scan_all_scan_all_post`, `build_status_build_status_post`, `list_jobs_list_jobs_post` | AI-powered tool builder & repair — async with progress tracking |
+| `robot_codex` | `build_tool`, `repair_tool`, `list_jobs`, `job_detail` | AI-powered tool builder & repair — async with progress tracking |
 | `my_*` (custom) | (varies) | Tools you built — auto-registered as native MCP tools |
 
 ## guarded_drive parameter reference

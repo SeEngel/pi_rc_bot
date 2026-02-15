@@ -470,6 +470,17 @@ def interaction_prompt(transcript: str, observation: str, memories: str) -> str:
         5. Reply out loud → robot_speak → speak.
         6. Do NOT call robot_observe — the scene data is above.
 
+        ## 🛠️ Building & Repairing tools
+        If the human asks you to BUILD something (new app, new feature, new tool):
+        - You MUST actually call `robot_codex → build_tool` with a description!
+        - Do NOT just SAY "it's being built" — you must make the real MCP tool call.
+        - Example: robot_codex → build_tool(description="...", suggested_name="...")
+
+        If the human asks about a broken service or tool:
+        - Call `robot_codex → repair_tool` with a description of the problem.
+
+        To check job status: `robot_codex → list_jobs` or `robot_codex → job_detail`.
+
         The supervisor will also store a basic memory for you after this turn.
         Respond in the language the human used (default: German / de-DE).
         When given a goal: ACT FIRST, talk second. Be bold!
@@ -959,7 +970,7 @@ def _start_codex_agent() -> None:
     """Launch the codex agent MCP server as a child process.
 
     The codex agent is a FastAPI+FastMCP server that the main agent can
-    call as ``robot_codex`` → ``build_tool`` / ``repair`` / ``diagnose`` / ``scan_all``.
+    call as ``robot_codex`` → ``build_tool`` / ``repair_tool`` / ``list_jobs`` / ``job_detail``.
     Under the hood it runs its own OpenCode instance (port 4097) for
     AI-powered code generation and fixing.
     """
@@ -1066,11 +1077,29 @@ def _register_codex_agent_with_opencode(cfg: dict) -> None:
 
 # ──────────────────────────── my_tools health check ──────────────
 
+_last_health_check: float = 0.0          # monotonic timestamp of last full check
+_last_health_result: list[str] = []      # cached result
+_HEALTH_CHECK_INTERVAL = 300.0           # seconds (5 min) between full checks
+_HEALTH_CHECK_FIRST_DONE = False         # first check at startup is always immediate
 
-def check_my_tools_health(cfg: dict) -> list[str]:
-    """Quick healthcheck on all running my_tools.  Returns list of broken tool names."""
+
+def check_my_tools_health(cfg: dict, force: bool = False) -> list[str]:
+    """Quick healthcheck on all running my_tools.  Returns list of broken tool names.
+
+    Results are cached for 5 minutes to avoid hammering healthz endpoints
+    every think-cycle.  Use force=True to bypass the cache (e.g. at startup).
+    """
+    global _last_health_check, _last_health_result, _HEALTH_CHECK_FIRST_DONE
+
+    now = time.monotonic()
+    if not force and _HEALTH_CHECK_FIRST_DONE and (now - _last_health_check) < _HEALTH_CHECK_INTERVAL:
+        return list(_last_health_result)
+
     broken: list[str] = []
     if not MY_TOOLS_DIR.exists():
+        _last_health_check = now
+        _last_health_result = broken
+        _HEALTH_CHECK_FIRST_DONE = True
         return broken
     for tool_dir in sorted(MY_TOOLS_DIR.iterdir()):
         if not tool_dir.is_dir() or tool_dir.name.startswith(("_", ".")):
@@ -1087,85 +1116,84 @@ def check_my_tools_health(cfg: dict) -> list[str]:
                 broken.append(tool_dir.name)
         except Exception:
             broken.append(tool_dir.name)
+
+    _last_health_check = now
+    _last_health_result = broken
+    _HEALTH_CHECK_FIRST_DONE = True
     return broken
 
 
 # ──────────────────────────── ensure tools via codex agent ───────
 
 def _ensure_tools_via_codex(cfg: dict, poll_repair_timeout: float = 120.0) -> bool:
-    """Call the codex agent's /ensure_all_tools to start/repair all my_tools.
+    """Start/repair all my_tools using the codex agent.
 
-    Returns True if the call succeeded (even if some tools need async repair).
-    Returns False if the codex agent is unreachable.
+    Scans my_tools/ for broken tools, sends each to /repair_tool,
+    then polls /job_detail until done or timeout.
+    Returns True if at least the codex agent was reachable.
     """
-    try:
-        r = requests.post(
-            f"http://127.0.0.1:{CODEX_API_PORT}/ensure_all_tools",
-            timeout=60,
-        )
-        if not r.ok:
-            LOG.warning("ensure_all_tools returned %d: %s", r.status_code, r.text[:200])
-            return False
-
-        data = r.json()
-        LOG.info("ensure_all_tools result: %s", data.get("summary", ""))
-
-        already = data.get("already_healthy", [])
-        started = data.get("started", [])
-        repair_jobs = data.get("repair_jobs", {})
-        failed = data.get("failed", [])
-        registered = data.get("registered", [])
-        cleanup_removed = data.get("cleanup_removed", [])
-
-        if cleanup_removed:
-            LOG.info("  🧹 Cleaned up orphaned tools: %s", ", ".join(cleanup_removed))
-        if already:
-            LOG.info("  ✅ Already healthy: %s", ", ".join(already))
-        if started:
-            LOG.info("  🚀 Started: %s", ", ".join(started))
-        if registered:
-            LOG.info("  📝 Registered with OpenCode: %s", ", ".join(registered))
-        if failed:
-            LOG.warning("  ❌ Failed: %s", ", ".join(failed))
-
-        # If there are repair jobs, poll them until done or timeout
-        if repair_jobs:
-            LOG.info("  🔧 Repair jobs queued: %s", repair_jobs)
-            deadline = time.monotonic() + poll_repair_timeout
-            pending = dict(repair_jobs)  # tool_name → job_id
-
-            while pending and time.monotonic() < deadline:
-                time.sleep(5)
-                for tool_name, job_id in list(pending.items()):
-                    try:
-                        sr = requests.post(
-                            f"http://127.0.0.1:{CODEX_API_PORT}/build_status",
-                            json={"job_id": job_id},
-                            timeout=10,
-                        )
-                        if sr.ok:
-                            status = sr.json()
-                            state = status.get("state", "")
-                            phase = status.get("phase", "")
-                            if state in ("done", "failed"):
-                                result = status.get("result", {})
-                                healthy = result.get("healthy_after", False)
-                                LOG.info("  Repair %s: %s (%s) — healthy=%s",
-                                         tool_name, state, phase, healthy)
-                                del pending[tool_name]
-                            else:
-                                LOG.debug("  Repair %s: %s (%s)…", tool_name, state, phase)
-                    except Exception as exc:
-                        LOG.warning("  Repair status poll failed for %s: %s", tool_name, exc)
-
-            if pending:
-                LOG.warning("  ⏰ Repair still pending after timeout: %s", list(pending.keys()))
-
+    my_tools_dir = Path(__file__).resolve().parent / "my_tools"
+    if not my_tools_dir.exists():
+        LOG.info("No my_tools/ directory — nothing to ensure")
         return True
 
-    except Exception as exc:
-        LOG.warning("ensure_all_tools call failed: %s", exc)
-        return False
+    broken = check_my_tools_health(cfg, force=True)
+    if not broken:
+        LOG.info("All custom tools are healthy — nothing to repair")
+        return True
+
+    LOG.info("Found %d broken tool(s): %s", len(broken), ", ".join(broken))
+    repair_jobs: dict[str, str] = {}  # tool_name → job_id
+
+    for tool_name in broken:
+        try:
+            r = requests.post(
+                f"http://127.0.0.1:{CODEX_API_PORT}/repair_tool",
+                json={"description": f"Tool '{tool_name}' is broken or not responding. Fix it."},
+                timeout=30,
+            )
+            if r.ok:
+                data = r.json()
+                job_id = data.get("job_id", "")
+                if job_id:
+                    repair_jobs[tool_name] = job_id
+                    LOG.info("  🔧 Repair queued for %s — job_id=%s", tool_name, job_id)
+        except Exception as exc:
+            LOG.warning("  Failed to queue repair for %s: %s", tool_name, exc)
+
+    # Poll repair jobs until done or timeout
+    if repair_jobs:
+        deadline = time.monotonic() + poll_repair_timeout
+        pending = dict(repair_jobs)
+
+        while pending and time.monotonic() < deadline:
+            time.sleep(5)
+            for tool_name, job_id in list(pending.items()):
+                try:
+                    sr = requests.post(
+                        f"http://127.0.0.1:{CODEX_API_PORT}/job_detail",
+                        json={"job_id": job_id},
+                        timeout=10,
+                    )
+                    if sr.ok:
+                        status = sr.json()
+                        state = status.get("state", "")
+                        phase = status.get("phase", "")
+                        if state in ("done", "failed"):
+                            result = status.get("result", {})
+                            healthy = result.get("healthy", False)
+                            LOG.info("  Repair %s: %s (%s) — healthy=%s",
+                                     tool_name, state, phase, healthy)
+                            del pending[tool_name]
+                        else:
+                            LOG.debug("  Repair %s: %s (%s)…", tool_name, state, phase)
+                except Exception as exc:
+                    LOG.warning("  Repair status poll failed for %s: %s", tool_name, exc)
+
+        if pending:
+            LOG.warning("  ⏰ Repair still pending after timeout: %s", list(pending.keys()))
+
+    return True
 
 
 # ──────────────────────────── main loop ──────────────────────────
@@ -1199,14 +1227,13 @@ def run_forever(cfg: dict) -> None:
     if codex_ready:
         _register_codex_agent_with_opencode(cfg)
 
-    # Use codex agent's /ensure_all_tools for smart recovery (start stopped,
-    # repair broken, re-register all).  Falls back to simple _start_my_tools
-    # if codex agent isn't available.
+    # Use codex agent to repair broken tools.  Falls back to simple
+    # _start_my_tools if codex agent isn't available.
     if codex_ready:
-        LOG.info("Codex agent available — using /ensure_all_tools for smart recovery…")
+        LOG.info("Codex agent available — checking and repairing broken tools…")
         ok = _ensure_tools_via_codex(cfg)
         if not ok:
-            LOG.warning("ensure_all_tools failed — falling back to simple start")
+            LOG.warning("Codex repair failed — falling back to simple start")
             _start_my_tools(cfg)
     else:
         LOG.info("Codex agent not available — using simple _start_my_tools")
@@ -1290,7 +1317,7 @@ def run_forever(cfg: dict) -> None:
                         "\n\n## ⚠️ BROKEN TOOLS\n"
                         f"The following custom tools have errors: {', '.join(broken_tools)}\n"
                         "Tell the human: 'Ein Tool hat einen Fehler, ich kümmere mich darum!' "
-                        "Then call robot_codex → repair with the tool_name to fix it. "
+                        "Then call robot_codex → repair_tool with a description of the problem. "
                         "After the repair, retry the action.\n"
                     )
 
@@ -1387,7 +1414,7 @@ def run_forever(cfg: dict) -> None:
                             "\n\n## ⚠️ BROKEN TOOLS\n"
                             f"The following custom tools have errors: {', '.join(broken_tools)}\n"
                             "Tell the human: 'Ein Tool hat einen Fehler, ich kümmere mich darum!' "
-                            "Then call robot_codex → repair with the tool_name to fix it. "
+                            "Then call robot_codex → repair_tool with a description of the problem. "
                             "After the repair, retry the action.\n"
                         )
                     try:
@@ -1429,8 +1456,7 @@ def run_forever(cfg: dict) -> None:
                     alone_p += (
                         "\n\n## ⚠️ BROKEN TOOLS\n"
                         f"The following custom tools have errors: {', '.join(broken_tools)}\n"
-                        "Call robot_codex → repair with the tool_name to fix them. "
-                        "Or call robot_codex → scan_all first to get details.\n"
+                        "Call robot_codex → repair_tool with a description of the problem to fix them.\n"
                     )
 
                 try:

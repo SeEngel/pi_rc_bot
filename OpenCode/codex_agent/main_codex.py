@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Codex Agent — MCP Tool Server
-================================
+Codex Agent — MCP Tool Server (simplified)
+============================================
 A FastAPI + FastMCP server that the main robot agent can call as a native
 MCP tool (``robot_codex``).  Under the hood it runs its own OpenCode
-instance (port 4097) to do the actual code diagnosis and fixing.
+instance (port 4097) to do the actual code work.
 
-Endpoints (each becomes an MCP tool):
-  POST /diagnose    — read a tool's server.log + server.py, return diagnosis
-  POST /repair      — diagnose AND fix a broken tool, restart it, re-register
-  POST /scan_all    — scan every tool in my_tools/, return list of broken ones
-  GET  /healthz     — liveness check
+MCP Tools (4):
+  POST /build_tool   — describe a new tool in plain text; codex builds it
+  POST /repair_tool  — describe what's broken in plain text; codex fixes it
+  POST /list_jobs    — high-level overview of all jobs
+  POST /job_detail   — detailed status by job_id
+
+Plus:
+  GET  /healthz      — liveness check
 
 Usage (auto-started by main.py supervisor):
     uv run python OpenCode/codex_agent/main_codex.py --port 8012
@@ -66,12 +69,11 @@ PROJECT_ROOT = OPENCODE_DIR.parent                  # pi_rc_bot/
 
 LOG = logging.getLogger("codex-agent")
 
-
 _SECRET_RE = re.compile(r"sk-[A-Za-z0-9]{10,}")
 
 
 def _redact_secrets(text: str) -> str:
-    """Best-effort redaction for logs (avoid leaking API keys into log files)."""
+    """Best-effort redaction for logs (avoid leaking API keys)."""
     if not text:
         return text
     text = _SECRET_RE.sub("sk-***", text)
@@ -80,6 +82,7 @@ def _redact_secrets(text: str) -> str:
 
 # ──────────────────────────── config ─────────────────────────────
 
+
 def _load_config() -> dict:
     cfg: dict = {}
     if CONFIG_PATH.exists():
@@ -87,21 +90,8 @@ def _load_config() -> dict:
             cfg = yaml.safe_load(f) or {}
     return cfg
 
+
 _CFG = _load_config()
-
-
-def _thorough_mode() -> bool:
-    """Return True if thorough (slow/intelligent) mode is enabled."""
-    return _deep_get(_CFG, "thorough_mode", "enabled", default=False)
-
-
-def _deep_get(d: dict, *keys, default=None):
-    """Safely traverse nested dicts."""
-    for k in keys:
-        if not isinstance(d, dict):
-            return default
-        d = d.get(k, default)
-    return d
 
 
 def _file_sha256(path: Path) -> str:
@@ -109,15 +99,6 @@ def _file_sha256(path: Path) -> str:
     if not path.exists():
         return ""
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _has_running_job_for(tool_name: str) -> Job | None:
-    """Return a running/queued job for this tool, or None."""
-    with _jobs_lock:
-        for j in _jobs.values():
-            if j.tool_name == tool_name and j.state in (JobState.QUEUED, JobState.RUNNING):
-                return j
-    return None
 
 
 # ──────────────────────────── job tracker ────────────────────────
@@ -133,7 +114,6 @@ class JobState(str, Enum):
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
-    CONTINUABLE = "continuable"   # timed-out but can be resumed
 
 
 @dataclass
@@ -141,18 +121,17 @@ class Job:
     job_id: str
     kind: JobKind
     tool_name: str
+    description: str = ""          # original user request (plain text)
     state: JobState = JobState.QUEUED
     phase: str = "queued"          # human-readable current step
-    progress: list[str] = dc_field(default_factory=list)  # log of completed phases
+    progress: list[str] = dc_field(default_factory=list)
     result: dict[str, Any] = dc_field(default_factory=dict)
     created_at: float = dc_field(default_factory=time.time)
     finished_at: float | None = None
-    # ── continuation context (saved on timeout for /continue_job) ──
-    session_id: str | None = None          # OpenCode session to resume
-    last_prompt: str = ""                  # the prompt that timed out
-    turns_completed: int = 0               # how many AI round-trips done
-    source_hash_before: str = ""           # sha256 of server.py before AI call
-    original_description: str = ""         # for build jobs: the original request
+    # internal context
+    session_id: str | None = None
+    turns_completed: int = 0
+    source_hash_before: str = ""
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -165,13 +144,13 @@ class Job:
         return round(end - self.created_at, 1)
 
 
-_jobs: dict[str, Job] = {}   # job_id → Job
+_jobs: dict[str, Job] = {}   # job_id -> Job
 _jobs_lock = threading.Lock()
 
 
-def _create_job(kind: JobKind, tool_name: str) -> Job:
+def _create_job(kind: JobKind, tool_name: str, description: str = "") -> Job:
     jid = uuid.uuid4().hex[:12]
-    job = Job(job_id=jid, kind=kind, tool_name=tool_name)
+    job = Job(job_id=jid, kind=kind, tool_name=tool_name, description=description)
     with _jobs_lock:
         _jobs[jid] = job
     return job
@@ -182,7 +161,16 @@ def _get_job(job_id: str) -> Job | None:
         return _jobs.get(job_id)
 
 
-# ──────────────────────────── OpenCode serve (for repair AI) ─────
+def _has_running_job_for(tool_name: str) -> Job | None:
+    """Return a running/queued job for this tool, or None."""
+    with _jobs_lock:
+        for j in _jobs.values():
+            if j.tool_name == tool_name and j.state in (JobState.QUEUED, JobState.RUNNING):
+                return j
+    return None
+
+
+# ──────────────────────────── OpenCode serve ─────────────────────
 
 _opencode_proc: subprocess.Popen | None = None
 
@@ -202,7 +190,7 @@ def _find_opencode_bin() -> str | None:
 
 
 def _start_opencode_serve() -> None:
-    """Boot a dedicated OpenCode instance for the repair agent."""
+    """Boot a dedicated OpenCode instance for the codex agent."""
     global _opencode_proc
     if _opencode_proc is not None:
         return
@@ -213,18 +201,18 @@ def _start_opencode_serve() -> None:
 
     opencode_bin = _find_opencode_bin()
     if opencode_bin is None:
-        LOG.error("opencode binary not found — repair AI will be unavailable")
+        LOG.error("opencode binary not found — AI will be unavailable")
         return
 
     cmd = [opencode_bin, "serve", "--port", str(port), "--hostname", host]
-    LOG.info("Starting repair OpenCode: %s", " ".join(cmd))
+    LOG.info("Starting codex OpenCode: %s", " ".join(cmd))
 
     serve_log = BASE_DIR / "opencode_serve.log"
     fh = open(serve_log, "w", encoding="utf-8")
 
     _opencode_proc = subprocess.Popen(
         cmd,
-        cwd=str(BASE_DIR),         # picks up codex_agent/opencode.json
+        cwd=str(BASE_DIR),
         stdout=fh,
         stderr=subprocess.STDOUT,
     )
@@ -265,21 +253,21 @@ def _wait_for_opencode(retries: int = 30, delay: float = 2.0) -> bool:
                 return True
         except Exception:
             pass
-        LOG.info("Waiting for codex OpenCode (%d/%d)…", i + 1, retries)
+        LOG.info("Waiting for codex OpenCode (%d/%d)...", i + 1, retries)
         time.sleep(delay)
     LOG.error("Codex OpenCode not reachable after %d attempts", retries)
     return False
 
 
-# ──────────────────────────── OpenCode repair client ─────────────
+# ──────────────────────────── OpenCode client ────────────────────
 
-class _RepairClient:
-    """Send a repair prompt to the dedicated OpenCode instance."""
+class _CodexClient:
+    """Send prompts to the dedicated OpenCode instance."""
 
     def __init__(self):
         oc = _CFG.get("opencode", {})
         self.base = f"http://{oc.get('host', '127.0.0.1')}:{oc.get('port', 4097)}"
-        self.timeout = oc.get("request_timeout", 90)
+        self.timeout = oc.get("request_timeout", 600)
         self._session_id: str | None = None
 
     @property
@@ -287,7 +275,7 @@ class _RepairClient:
         if self._session_id is None:
             r = requests.post(
                 f"{self.base}/session",
-                json={"title": "repair"},
+                json={"title": "codex"},
                 timeout=self.timeout,
             )
             r.raise_for_status()
@@ -320,25 +308,6 @@ class _RepairClient:
         parts = data.get("parts", [])
         texts: list[str] = []
         tool_calls: list[str] = []
-        tool_results: list[str] = []
-
-        def _is_tool_call(part: dict) -> bool:
-            t = str(part.get("type", ""))
-            if t in {"tool-invocation", "tool_invocation", "tool-call", "tool_call", "tool"}:
-                return True
-            # Some builds omit type but include toolName/tool + args
-            if ("toolName" in part or "tool" in part) and any(k in part for k in ("input", "args", "parameters")):
-                return True
-            return False
-
-        def _is_tool_result(part: dict) -> bool:
-            t = str(part.get("type", ""))
-            if t in {"tool-result", "tool_result", "toolResult"}:
-                return True
-            # Heuristic: has output/result/content and also references a tool
-            if any(k in part for k in ("output", "result")) and ("toolName" in part or "tool" in part or "name" in part):
-                return True
-            return False
 
         for p in parts:
             if not isinstance(p, dict):
@@ -346,78 +315,48 @@ class _RepairClient:
             if p.get("type") == "text":
                 texts.append(p.get("text", ""))
                 continue
-            if _is_tool_call(p):
-                tool_name = p.get("toolName") or p.get("tool") or p.get("name") or "unknown_tool"
+            # Tool call
+            t = str(p.get("type", ""))
+            if t in {"tool-invocation", "tool_invocation", "tool-call", "tool_call", "tool"} or (
+                ("toolName" in p or "tool" in p) and any(k in p for k in ("input", "args", "parameters"))
+            ):
+                tool_name = p.get("toolName") or p.get("tool") or p.get("name") or "unknown"
                 tool_input = p.get("input") or p.get("args") or p.get("parameters") or {}
-                summary = ""
                 if isinstance(tool_input, dict):
-                    cmd = tool_input.get("command") or tool_input.get("cmd") or tool_input.get("shell") or ""
-                    file_path = tool_input.get("filePath") or tool_input.get("file") or tool_input.get("path") or ""
-                    if cmd:
-                        summary = f"🔧 {tool_name}: {cmd}"
-                    elif file_path:
-                        summary = f"🔧 {tool_name}: {file_path}"
-                    else:
-                        summary = f"🔧 {tool_name}: {tool_input}"
+                    cmd = tool_input.get("command") or tool_input.get("cmd") or ""
+                    file_path = tool_input.get("filePath") or tool_input.get("file") or ""
+                    summary = f"🔧 {tool_name}: {cmd or file_path or tool_input}"
                 else:
                     summary = f"🔧 {tool_name}: {tool_input}"
                 summary = _redact_secrets(str(summary))[:220]
                 tool_calls.append(summary)
-                if _CFG.get("log_ai_details", True):
-                    LOG.info("AI tool call: %s", summary)
-                continue
-            if _is_tool_result(p):
-                output = p.get("output") or p.get("result") or p.get("content") or ""
-                if isinstance(output, list):
-                    output = " ".join(str(x) for x in output)
-                out_s = _redact_secrets(str(output)).strip()
-                if out_s:
-                    tool_results.append(out_s[:300])
-                    if _CFG.get("log_ai_details", True):
-                        LOG.debug("AI tool result: %s", out_s[:200])
+                LOG.info("AI tool call: %s", summary)
                 continue
             if "content" in p:
                 texts.append(str(p["content"]))
 
-        # Store for callers to access (job logs, status polling, etc.)
-        self._last_response = data
         self._last_tool_calls = tool_calls
-        self._last_tool_results = tool_results
         joined = "\n".join(texts) if texts else raw[:2000]
         self._last_text = joined
         return joined
 
     @property
     def last_tool_calls(self) -> list[str]:
-        """Tool calls from the most recent send() — bash commands, file edits, etc."""
         return getattr(self, "_last_tool_calls", [])
 
     @property
-    def last_tool_results(self) -> list[str]:
-        """Tool outputs from the most recent send() (truncated)."""
-        return getattr(self, "_last_tool_results", [])
-
-    @property
     def last_text(self) -> str:
-        """Assistant text from the most recent send()."""
         return getattr(self, "_last_text", "")
 
 
-_repair_client: _RepairClient | None = None
-_repair_turn_count = 0
+_codex_client: _CodexClient | None = None
 
 
-def _get_client() -> _RepairClient:
-    global _repair_client, _repair_turn_count
-    if _repair_client is None:
-        _repair_client = _RepairClient()
-    _repair_turn_count += 1
-    if _repair_turn_count % 5 == 0:
-        try:
-            _repair_client.new_session()
-        except Exception:
-            pass
-    return _repair_client
+def _get_client() -> _CodexClient:
+    global _codex_client
+    if _codex_client is None:
+        _codex_client = _CodexClient()
+    return _codex_client
 
 
 # ──────────────────────────── error helpers ──────────────────────
@@ -454,6 +393,8 @@ def _extract_error_block(text: str) -> str:
         return "\n".join(err[-20:])
     return "\n".join(lines[-30:])
 
+
+# ──────────────────────────── tool helpers ───────────────────────
 
 def _read_tool(tool_name: str) -> dict:
     """Gather all info about a tool: source, log tail, port, status."""
@@ -509,43 +450,6 @@ def _read_tool(tool_name: str) -> dict:
     }
 
 
-def _build_repair_prompt(info: dict) -> str:
-    return textwrap.dedent(f"""\
-        [REPAIR] A custom MCP tool server is broken. Fix it.
-
-        ## Tool info
-        - Name: {info['tool_name']}
-        - Path: {info['tool_dir']}
-        - Port: {info['port']} (MCP: {info['mcp_port']})
-        - Process alive: {info['process_alive']}
-        - Healthy: {info['healthy']}
-
-        ## server.py (full source)
-        ```python
-        {info['source']}
-        ```
-
-        ## server.log (error section)
-        ```
-        {info['error_block']}
-        ```
-
-        ## Full log tail (last lines)
-        ```
-        {info['log_tail'][-3000:]}
-        ```
-
-        ## Your task
-        1. Diagnose the error from the log.
-        2. Write the fixed server.py using bash: cat > {info['tool_dir']}/server.py << 'PYEOF' ... PYEOF
-        3. If a missing package caused the error: cd /home/engelbot/Desktop/pi_rc_bot && uv add PACKAGE
-        4. Verify: python3 -c "import ast; ast.parse(open('{info['tool_dir']}/server.py').read())"
-        5. DO NOT start the server or register it — the caller handles that.
-
-        Respond with FIXED: <description> or UNFIXABLE: <reason>
-    """)
-
-
 def _restart_tool(tool_name: str, port: int) -> bool:
     """Kill old process, start fresh, return True if healthy."""
     tool_dir = MY_TOOLS_DIR / tool_name
@@ -582,11 +486,11 @@ def _restart_tool(tool_name: str, port: int) -> bool:
     try:
         r = requests.get(f"http://127.0.0.1:{port}/healthz", timeout=5)
         if r.ok:
-            LOG.info("✅ %s healthy after restart", tool_name)
+            LOG.info("%s healthy after restart", tool_name)
             return True
     except Exception:
         pass
-    LOG.warning("❌ %s still unhealthy after restart", tool_name)
+    LOG.warning("%s still unhealthy after restart", tool_name)
     return False
 
 
@@ -612,762 +516,8 @@ def _re_register_tool(tool_name: str, mcp_port: int) -> bool:
         return False
 
 
-def _unregister_tool_from_opencode(tool_name: str) -> bool:
-    """Disable a tool in OpenCode by re-registering with enabled=false.
-
-    Used to clean up tools whose folders were manually deleted from disk.
-    """
-    main_port = _CFG.get("main_opencode_port", 4096)
-    name = f"my_{tool_name}"
-    try:
-        r = requests.post(
-            f"http://127.0.0.1:{main_port}/mcp",
-            json={
-                "name": name,
-                "config": {
-                    "type": "remote",
-                    "url": "http://127.0.0.1:1/mcp",
-                    "enabled": False,
-                },
-            },
-            timeout=10,
-        )
-        if r.ok:
-            LOG.info("Unregistered orphaned MCP '%s' from OpenCode", name)
-        return r.ok
-    except Exception as exc:
-        LOG.warning("Failed to unregister '%s' from OpenCode: %s", name, exc)
-        return False
-
-
-def _cleanup_orphaned_tools() -> list[str]:
-    """Find and clean up tools that were manually removed from disk.
-
-    Scans my_tools/ for:
-      - Dirs with a server.pid but no server.py (gutted folder):
-        kill the process, remove pid, unregister from OpenCode.
-      - PID files pointing to dead processes with no server.py:
-        remove pid, unregister from OpenCode.
-
-    Returns list of cleaned-up tool names.
-    """
-    cleaned: list[str] = []
-    if not MY_TOOLS_DIR.exists():
-        return cleaned
-
-    for tool_dir in sorted(MY_TOOLS_DIR.iterdir()):
-        if not tool_dir.is_dir() or tool_dir.name.startswith(("_", ".")):
-            continue
-        pid_file = tool_dir / "server.pid"
-        server_py = tool_dir / "server.py"
-        if pid_file.exists() and not server_py.exists():
-            # server.py was deleted but process / pid file lingers
-            try:
-                old_pid = int(pid_file.read_text().strip())
-                os.kill(old_pid, signal.SIGTERM)
-                LOG.info("Killed orphan process pid=%d for removed tool %s", old_pid, tool_dir.name)
-            except (OSError, ValueError):
-                pass
-            pid_file.unlink(missing_ok=True)
-            _unregister_tool_from_opencode(tool_dir.name)
-            cleaned.append(tool_dir.name)
-
-    if cleaned:
-        LOG.info("Cleaned up %d orphaned tool(s): %s", len(cleaned), ", ".join(cleaned))
-    return cleaned
-
-
-# ══════════════════════════════════════════════════════════════════
-#  FastAPI  Application
-# ══════════════════════════════════════════════════════════════════
-
-app = FastAPI(title="robot_codex", version="0.2.0")
-
-
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True, "service": "robot_codex"}
-
-
-# ── POST /diagnose ──────────────────────────────────────────────
-
-class DiagnoseRequest(BaseModel):
-    tool_name: str = Field(description="Name of the tool folder inside my_tools/ (e.g. 'my_web_search')")
-
-class DiagnoseResponse(BaseModel):
-    ok: bool = True
-    tool_name: str = ""
-    healthy: bool = False
-    process_alive: bool = False
-    has_errors: bool = False
-    error_block: str = ""
-    log_tail: str = ""
-    diagnosis: str = ""
-
-
-@app.post("/diagnose", response_model=DiagnoseResponse)
-async def diagnose(req: DiagnoseRequest):
-    """Read a tool's logs and source code, return a diagnosis of what's wrong.
-    Does NOT fix or restart the tool — use /repair for that."""
-    info = _read_tool(req.tool_name)
-    if "error" in info:
-        return DiagnoseResponse(ok=False, tool_name=req.tool_name, diagnosis=info["error"])
-
-    if info["healthy"] and not info["has_errors"]:
-        return DiagnoseResponse(
-            ok=True,
-            tool_name=req.tool_name,
-            healthy=True,
-            process_alive=info["process_alive"],
-            has_errors=False,
-            diagnosis="Tool is healthy — no errors found.",
-        )
-
-    # Use OpenCode to diagnose
-    prompt = (
-        f"[DIAGNOSE ONLY — do NOT write files or fix anything]\n\n"
-        f"Tool: {info['tool_name']} at {info['tool_dir']}\n"
-        f"Port: {info['port']}, process_alive={info['process_alive']}, healthy={info['healthy']}\n\n"
-        f"## server.py\n```python\n{info['source']}\n```\n\n"
-        f"## Error from server.log\n```\n{info['error_block']}\n```\n\n"
-        f"## Full log tail\n```\n{info['log_tail'][-2000:]}\n```\n\n"
-        f"Explain what's wrong in 1-3 sentences. Start with 'DIAGNOSIS:'"
-    )
-    try:
-        client = _get_client()
-        reply = client.send(prompt)
-    except Exception as exc:
-        reply = f"Could not reach repair AI: {exc}"
-
-    return DiagnoseResponse(
-        ok=True,
-        tool_name=req.tool_name,
-        healthy=info["healthy"],
-        process_alive=info["process_alive"],
-        has_errors=info["has_errors"],
-        error_block=info["error_block"][:500],
-        log_tail=info["log_tail"][-500:],
-        diagnosis=reply[:1000],
-    )
-
-
-# ── POST /repair ────────────────────────────────────────────────
-
-class RepairRequest(BaseModel):
-    tool_name: str = Field(description="Name of the tool folder inside my_tools/ (e.g. 'my_web_search')")
-
-class RepairResponse(BaseModel):
-    ok: bool = True
-    tool_name: str = ""
-    was_broken: bool = False
-    fix_applied: bool = False
-    restarted: bool = False
-    re_registered: bool = False
-    healthy_after: bool = False
-    summary: str = ""
-    job_id: str = ""
-
-
-def _run_repair_sync(job: Job, tool_name: str) -> None:
-    """Background worker for repair — runs in a thread.
-
-    In thorough mode: allows multiple AI turns with timeout-per-turn.
-    On timeout, marks job CONTINUABLE so /continue_job can resume.
-    """
-    try:
-        job.state = JobState.RUNNING
-
-        info = _read_tool(tool_name)
-        if "error" in info:
-            job.phase = "tool not found"
-            job.log(info["error"])
-            job.state = JobState.FAILED
-            job.result = {"ok": False, "tool_name": tool_name, "summary": info["error"]}
-            job.finished_at = time.time()
-            return
-
-        if info["healthy"] and not info["has_errors"]:
-            job.phase = "already healthy"
-            job.log("Tool is already healthy — nothing to repair.")
-            job.state = JobState.DONE
-            job.result = {"ok": True, "tool_name": tool_name, "was_broken": False,
-                          "healthy_after": True, "summary": "Tool is already healthy — nothing to repair."}
-            job.finished_at = time.time()
-            return
-
-        thorough = _thorough_mode()
-        max_turns = _deep_get(_CFG, "thorough_mode", "max_turns_per_job", default=3) if thorough else 1
-
-        # Record source hash before AI touches it
-        server_py = MY_TOOLS_DIR / tool_name / "server.py"
-        job.source_hash_before = _file_sha256(server_py)
-
-        # 1. Send to OpenCode for fix (with multi-turn retry in thorough mode)
-        job.phase = "sending repair prompt to AI"
-        job.log(f"Reading logs and source, sending to code AI… (thorough={thorough}, max_turns={max_turns})")
-        prompt = _build_repair_prompt(info)
-        job.last_prompt = prompt
-
-        client = _get_client()
-        reply = ""
-        fix_applied = False
-        timed_out = False
-
-        for turn in range(1, max_turns + 1):
-            job.phase = f"AI turn {turn}/{max_turns}"
-            job.log(f"── AI turn {turn}/{max_turns} ──")
-
-            try:
-                if turn == 1:
-                    reply = client.send(prompt)
-                else:
-                    # Follow-up: re-read state and ask AI to continue
-                    info = _read_tool(tool_name)
-                    follow_up = (
-                        f"The previous fix attempt did not fully resolve the issue.\n"
-                        f"Current error log:\n```\n{info.get('error_block', '')[:2000]}\n```\n"
-                        f"Current server.py:\n```python\n{info.get('source', '')[:4000]}\n```\n"
-                        f"Please continue fixing. Respond with FIXED: or UNFIXABLE:"
-                    )
-                    reply = client.send(follow_up)
-
-                job.turns_completed = turn
-                job.session_id = client._session_id
-
-                LOG.info("Repair AI reply (turn %d) for %s: %s", turn, tool_name, reply[:300])
-                for tc in client.last_tool_calls:
-                    job.log(tc)
-                if reply.strip():
-                    job.log(f"AI says: {reply[:300]}")
-                else:
-                    job.log("AI replied (no text — only tool actions)")
-
-            except requests.exceptions.ReadTimeout:
-                timed_out = True
-                job.last_prompt = prompt if turn == 1 else follow_up  # type: ignore[possibly-undefined]
-                job.session_id = client._session_id
-                job.turns_completed = turn - 1
-                job.log(f"⏱️ AI timed out on turn {turn}")
-                break
-            except Exception as exc:
-                job.phase = "AI error"
-                job.log(f"Repair AI failed: {exc}")
-                job.state = JobState.FAILED
-                job.result = {"ok": False, "tool_name": tool_name, "was_broken": True,
-                              "summary": f"Repair AI failed: {exc}"}
-                job.finished_at = time.time()
-                return
-
-            if "UNFIXABLE" in reply.upper():
-                job.phase = "unfixable"
-                job.log(f"AI says unfixable: {reply[:200]}")
-                job.state = JobState.FAILED
-                job.result = {"ok": True, "tool_name": tool_name, "was_broken": True,
-                              "fix_applied": False, "summary": f"AI says unfixable: {reply[:500]}"}
-                job.finished_at = time.time()
-                return
-
-            if "FIXED" in reply.upper():
-                fix_applied = True
-                job.log("AI reports FIXED")
-                break
-
-            # In single-turn mode, don't loop
-            if not thorough:
-                break
-
-        # If timed out in thorough mode → mark CONTINUABLE
-        if timed_out and thorough:
-            job.phase = "timed out (continuable)"
-            job.log("Marked as CONTINUABLE — use /continue_job to resume")
-            job.state = JobState.CONTINUABLE
-            job.result = {
-                "ok": True, "tool_name": tool_name, "was_broken": True,
-                "fix_applied": False, "timed_out": True, "continuable": True,
-                "turns_completed": job.turns_completed,
-                "summary": f"AI timed out after {job.turns_completed} turn(s) — job can be continued",
-            }
-            job.finished_at = time.time()
-            return
-
-        # If timed out in normal mode → just fail
-        if timed_out:
-            job.phase = "timed out"
-            job.log("AI timed out (non-thorough mode)")
-            job.state = JobState.FAILED
-            job.result = {"ok": False, "tool_name": tool_name, "was_broken": True,
-                          "summary": "Repair AI timed out"}
-            job.finished_at = time.time()
-            return
-
-        # 2. Verify source actually changed before restarting
-        source_hash_after = _file_sha256(server_py)
-        if source_hash_after == job.source_hash_before and not fix_applied:
-            job.phase = "no changes made"
-            job.log("⚠️ AI did not modify server.py — skipping restart")
-            job.state = JobState.FAILED
-            job.result = {"ok": True, "tool_name": tool_name, "was_broken": True,
-                          "fix_applied": False, "summary": f"AI did not change server.py. Reply: {reply[:300]}"}
-            job.finished_at = time.time()
-            return
-
-        if source_hash_after != job.source_hash_before:
-            job.log("✅ server.py was modified by AI")
-            fix_applied = True
-
-        # 3. Restart the tool
-        job.phase = "restarting server"
-        job.log("Restarting tool server…")
-        restarted = _restart_tool(tool_name, info["port"])
-        if restarted:
-            job.log("✅ Server restarted")
-        else:
-            job.log("❌ Server failed to restart")
-
-        # 4. Re-register with main OpenCode
-        re_registered = False
-        if restarted:
-            job.phase = "re-registering with OpenCode"
-            job.log("Re-registering with main OpenCode…")
-            re_registered = _re_register_tool(tool_name, info["mcp_port"])
-            if re_registered:
-                job.log("✅ Re-registered")
-
-        # 5. Final health check
-        job.phase = "health check"
-        healthy_after = False
-        try:
-            r = requests.get(f"http://127.0.0.1:{info['port']}/healthz", timeout=5)
-            healthy_after = r.ok
-        except Exception:
-            pass
-        if healthy_after:
-            job.log("✅ Tool is now healthy!")
-        else:
-            job.log("❌ Tool still unhealthy after repair attempt")
-
-        # 6. Write repair log
-        repair_log = MY_TOOLS_DIR / tool_name / "repair.log"
-        try:
-            with open(repair_log, "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*60}\n")
-                f.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Turns: {job.turns_completed}, Thorough: {thorough}\n")
-                f.write(f"Result: {'FIXED' if healthy_after else 'ATTEMPTED'}\n")
-                f.write(f"Reply: {reply[:500]}\n")
-        except Exception:
-            pass
-
-        summary_parts = []
-        if fix_applied:
-            summary_parts.append("Fix applied by AI")
-        if job.turns_completed > 1:
-            summary_parts.append(f"{job.turns_completed} AI turns")
-        if restarted:
-            summary_parts.append("process restarted")
-        if re_registered:
-            summary_parts.append("re-registered with OpenCode")
-        if healthy_after:
-            summary_parts.append("✅ tool is now healthy!")
-        else:
-            summary_parts.append("❌ tool still unhealthy after repair attempt")
-        summary_parts.append(f"AI said: {reply[:300]}")
-
-        job.phase = "done" if healthy_after else "done (still broken)"
-        job.state = JobState.DONE if healthy_after else JobState.FAILED
-        job.result = {
-            "ok": True, "tool_name": tool_name, "was_broken": True,
-            "fix_applied": fix_applied, "restarted": restarted,
-            "re_registered": re_registered, "healthy_after": healthy_after,
-            "turns": job.turns_completed,
-            "summary": " | ".join(summary_parts),
-        }
-        job.finished_at = time.time()
-        job.log(f"Repair finished in {job.elapsed()}s — {'FIXED' if healthy_after else 'STILL BROKEN'}")
-
-    except Exception as exc:
-        job.phase = "unexpected error"
-        job.log(f"Unexpected error: {exc}")
-        job.state = JobState.FAILED
-        job.result = {"ok": False, "tool_name": tool_name, "summary": f"Unexpected error: {exc}"}
-        job.finished_at = time.time()
-
-
-@app.post("/repair", response_model=RepairResponse)
-async def repair(req: RepairRequest):
-    """Diagnose, fix, restart, and re-register a broken tool.
-
-    Runs **asynchronously** — returns a job_id immediately.
-    Poll ``/build_status`` with the job_id to track progress.
-    """
-    info = _read_tool(req.tool_name)
-    if "error" in info:
-        return RepairResponse(ok=False, tool_name=req.tool_name, summary=info["error"])
-
-    if info["healthy"] and not info["has_errors"]:
-        return RepairResponse(
-            ok=True,
-            tool_name=req.tool_name,
-            was_broken=False,
-            healthy_after=True,
-            summary="Tool is already healthy — nothing to repair.",
-        )
-
-    # Prevent duplicate jobs for the same tool
-    existing = _has_running_job_for(req.tool_name)
-    if existing:
-        return RepairResponse(
-            ok=True,
-            tool_name=req.tool_name,
-            was_broken=True,
-            summary=f"A job is already running for this tool — job_id={existing.job_id} ({existing.phase})",
-            job_id=existing.job_id,
-        )
-
-    job = _create_job(JobKind.REPAIR, req.tool_name)
-    job.log(f"Repair queued — tool={req.tool_name}")
-
-    thread = threading.Thread(
-        target=_run_repair_sync,
-        args=(job, req.tool_name),
-        daemon=True,
-    )
-    thread.start()
-
-    return RepairResponse(
-        ok=True,
-        tool_name=req.tool_name,
-        was_broken=True,
-        summary=f"Repair started — job_id={job.job_id}. Poll build_status for progress.",
-        job_id=job.job_id,
-    )
-
-
-# ── POST /continue_job ─────────────────────────────────────────
-
-class ContinueJobRequest(BaseModel):
-    job_id: str = Field(description="ID of a CONTINUABLE job to resume")
-    extra_context: str = Field(default="", description="Optional extra instructions for the AI")
-
-class ContinueJobResponse(BaseModel):
-    ok: bool = True
-    job_id: str = ""
-    resumed: bool = False
-    summary: str = ""
-
-
-def _run_continue_sync(job: Job, extra_context: str) -> None:
-    """Resume a CONTINUABLE job — runs in a thread."""
-    try:
-        job.state = JobState.RUNNING
-        job.phase = "resuming from timeout"
-        job.log(f"Resuming job (previously completed {job.turns_completed} turns)")
-
-        thorough = _thorough_mode()
-        max_turns = _deep_get(_CFG, "thorough_mode", "max_turns_per_job", default=3)
-        remaining = max(1, max_turns - job.turns_completed)
-
-        client = _get_client()
-        # Try to reuse the same session
-        if job.session_id:
-            client._session_id = job.session_id
-            job.log(f"Reusing session {job.session_id[:12]}…")
-        else:
-            client.new_session()
-            job.log("Creating new session (no saved session)")
-
-        tool_name = job.tool_name
-
-        for turn in range(1, remaining + 1):
-            actual_turn = job.turns_completed + turn
-            job.phase = f"AI turn {actual_turn} (continuation {turn}/{remaining})"
-            job.log(f"── continuation turn {turn}/{remaining} ──")
-
-            # Build a context-rich follow-up prompt
-            if job.kind == JobKind.REPAIR:
-                info = _read_tool(tool_name)
-                follow_up = (
-                    f"You were previously fixing tool '{tool_name}' but timed out.\n"
-                    f"Please continue where you left off.\n\n"
-                    f"Current error log:\n```\n{info.get('error_block', '')[:2000]}\n```\n"
-                    f"Current server.py:\n```python\n{info.get('source', '')[:4000]}\n```\n"
-                )
-                if extra_context:
-                    follow_up += f"\nAdditional context: {extra_context}\n"
-                follow_up += "\nRespond with FIXED: or UNFIXABLE:"
-            else:
-                # Build job
-                tool_dir = MY_TOOLS_DIR / tool_name
-                server_py = tool_dir / "server.py"
-                if server_py.exists():
-                    source = server_py.read_text("utf-8")[:4000]
-                    follow_up = (
-                        f"You were building tool '{tool_name}' but timed out.\n"
-                        f"Current server.py:\n```python\n{source}\n```\n"
-                        f"Please continue building. Check syntax, install missing packages.\n"
-                    )
-                else:
-                    follow_up = (
-                        f"You were building tool '{tool_name}' but timed out before creating server.py.\n"
-                        f"Description: {job.original_description}\n"
-                        f"Please create server.py now.\n"
-                    )
-                if extra_context:
-                    follow_up += f"\nAdditional context: {extra_context}\n"
-                follow_up += "\nRespond with BUILT: or FAILED:"
-
-            try:
-                reply = client.send(follow_up)
-                job.turns_completed = actual_turn
-                job.session_id = client._session_id
-
-                LOG.info("Continue AI reply (turn %d) for %s: %s", actual_turn, tool_name, reply[:300])
-                for tc in client.last_tool_calls:
-                    job.log(tc)
-                if reply.strip():
-                    job.log(f"AI says: {reply[:300]}")
-                else:
-                    job.log("AI replied (no text — only tool actions)")
-
-            except requests.exceptions.ReadTimeout:
-                job.log(f"⏱️ AI timed out again on continuation turn {turn}")
-                job.phase = "timed out again (continuable)"
-                job.state = JobState.CONTINUABLE
-                job.result = {
-                    "ok": True, "tool_name": tool_name,
-                    "timed_out": True, "continuable": True,
-                    "turns_completed": job.turns_completed,
-                    "summary": f"AI timed out again after {job.turns_completed} total turn(s)",
-                }
-                job.finished_at = time.time()
-                return
-            except Exception as exc:
-                job.phase = "AI error"
-                job.log(f"AI failed: {exc}")
-                job.state = JobState.FAILED
-                job.result = {"ok": False, "tool_name": tool_name,
-                              "summary": f"AI failed during continuation: {exc}"}
-                job.finished_at = time.time()
-                return
-
-            # Check for completion signals
-            if job.kind == JobKind.REPAIR:
-                if "UNFIXABLE" in reply.upper():
-                    job.state = JobState.FAILED
-                    job.result = {"ok": True, "tool_name": tool_name, "was_broken": True,
-                                  "fix_applied": False, "summary": f"AI says unfixable: {reply[:500]}"}
-                    job.finished_at = time.time()
-                    return
-                if "FIXED" in reply.upper():
-                    break
-            else:
-                if "FAILED" in reply.upper()[:100]:
-                    job.state = JobState.FAILED
-                    job.result = {"ok": True, "tool_name": tool_name,
-                                  "built": False, "summary": f"AI could not build: {reply[:500]}"}
-                    job.finished_at = time.time()
-                    return
-                if "BUILT" in reply.upper()[:100]:
-                    break
-
-        # Now do the post-fix steps (restart, re-register, health check)
-        if job.kind == JobKind.REPAIR:
-            info = _read_tool(tool_name)
-            if "error" in info:
-                job.state = JobState.FAILED
-                job.result = {"ok": False, "tool_name": tool_name, "summary": "Tool not found after continuation"}
-                job.finished_at = time.time()
-                return
-
-            # Verify source changed
-            server_py = MY_TOOLS_DIR / tool_name / "server.py"
-            new_hash = _file_sha256(server_py)
-            if new_hash == job.source_hash_before:
-                job.log("⚠️ server.py unchanged after continuation")
-
-            job.phase = "restarting server"
-            job.log("Restarting tool server…")
-            restarted = _restart_tool(tool_name, info["port"])
-            job.log("✅ Server restarted" if restarted else "❌ Server failed to restart")
-
-            re_registered = False
-            if restarted:
-                job.phase = "re-registering with OpenCode"
-                re_registered = _re_register_tool(tool_name, info["mcp_port"])
-                job.log("✅ Re-registered" if re_registered else "❌ Registration failed")
-
-            healthy_after = False
-            try:
-                r = requests.get(f"http://127.0.0.1:{info['port']}/healthz", timeout=5)
-                healthy_after = r.ok
-            except Exception:
-                pass
-            job.log("✅ Tool is now healthy!" if healthy_after else "❌ Tool still unhealthy")
-
-            job.phase = "done" if healthy_after else "done (still broken)"
-            job.state = JobState.DONE if healthy_after else JobState.FAILED
-            job.result = {
-                "ok": True, "tool_name": tool_name, "was_broken": True,
-                "fix_applied": new_hash != job.source_hash_before,
-                "restarted": restarted, "re_registered": re_registered,
-                "healthy_after": healthy_after, "turns": job.turns_completed,
-                "summary": f"Continuation {'FIXED' if healthy_after else 'STILL BROKEN'} after {job.turns_completed} turns",
-            }
-        else:
-            # Build job post-steps
-            tool_dir = MY_TOOLS_DIR / tool_name
-            server_py = tool_dir / "server.py"
-            port = job.result.get("port", 0)
-            mcp_port = job.result.get("mcp_port", 0)
-
-            if not server_py.exists():
-                job.state = JobState.FAILED
-                job.result = {"ok": False, "tool_name": tool_name,
-                              "summary": "server.py still not created after continuation"}
-                job.finished_at = time.time()
-                return
-
-            # Syntax check
-            try:
-                import ast
-                ast.parse(server_py.read_text("utf-8"))
-                job.log("✅ Syntax OK")
-            except SyntaxError as exc:
-                job.state = JobState.FAILED
-                job.result = {"ok": False, "tool_name": tool_name,
-                              "summary": f"Syntax error after continuation: {exc}"}
-                job.finished_at = time.time()
-                return
-
-            if port:
-                started = _restart_tool(tool_name, port)
-                job.log("✅ Server started" if started else "❌ Server failed to start")
-
-                registered = _re_register_tool(tool_name, mcp_port) if started else False
-                job.log("✅ Registered" if registered else "❌ Registration failed")
-
-                healthy = False
-                if started:
-                    try:
-                        r = requests.get(f"http://127.0.0.1:{port}/healthz", timeout=5)
-                        healthy = r.ok
-                    except Exception:
-                        pass
-                job.log("✅ Healthy" if healthy else "❌ Not healthy")
-
-                job.phase = "done" if healthy else "done (unhealthy)"
-                job.state = JobState.DONE if healthy else JobState.FAILED
-                job.result = {
-                    "ok": True, "tool_name": tool_name, "port": port, "mcp_port": mcp_port,
-                    "built": True, "started": started, "registered": registered,
-                    "healthy": healthy, "turns": job.turns_completed,
-                    "summary": f"Continuation {'SUCCESS' if healthy else 'PARTIAL'} after {job.turns_completed} turns",
-                }
-            else:
-                job.state = JobState.DONE
-                job.result = {"ok": True, "tool_name": tool_name, "built": True,
-                              "turns": job.turns_completed,
-                              "summary": f"Code generated after {job.turns_completed} turns (no port to start)"}
-
-        job.finished_at = time.time()
-        job.log(f"Continuation finished in {job.elapsed()}s")
-
-    except Exception as exc:
-        job.phase = "unexpected error"
-        job.log(f"Unexpected error during continuation: {exc}")
-        job.state = JobState.FAILED
-        job.result = {"ok": False, "tool_name": job.tool_name, "summary": f"Unexpected error: {exc}"}
-        job.finished_at = time.time()
-
-
-@app.post("/continue_job", response_model=ContinueJobResponse)
-async def continue_job(req: ContinueJobRequest):
-    """Resume a CONTINUABLE job that timed out.
-
-    Only jobs in the ``continuable`` state can be continued.
-    The AI resumes in the same OpenCode session with full context.
-    """
-    with _jobs_lock:
-        job = _jobs.get(req.job_id)
-    if job is None:
-        return ContinueJobResponse(ok=False, job_id=req.job_id,
-                                   summary=f"Job {req.job_id} not found")
-    if job.state != JobState.CONTINUABLE:
-        return ContinueJobResponse(ok=False, job_id=req.job_id,
-                                   summary=f"Job is in state '{job.state.value}', not continuable")
-
-    job.finished_at = None  # reset
-    job.log(f"Continuation requested (extra_context: {req.extra_context[:100] if req.extra_context else 'none'})")
-
-    thread = threading.Thread(
-        target=_run_continue_sync,
-        args=(job, req.extra_context),
-        daemon=True,
-    )
-    thread.start()
-
-    return ContinueJobResponse(
-        ok=True, job_id=job.job_id, resumed=True,
-        summary=f"Job resumed — turns so far: {job.turns_completed}. Poll build_status for progress.",
-    )
-
-
-# ── POST /scan_all ──────────────────────────────────────────────
-
-class ScanAllResponse(BaseModel):
-    ok: bool = True
-    total_tools: int = 0
-    healthy_tools: list[str] = []
-    broken_tools: list[str] = []
-    details: dict[str, str] = {}
-
-
-@app.post("/scan_all", response_model=ScanAllResponse)
-async def scan_all():
-    """Scan all tools in my_tools/ and return which are healthy vs broken."""
-    if not MY_TOOLS_DIR.exists():
-        return ScanAllResponse()
-
-    healthy: list[str] = []
-    broken: list[str] = []
-    details: dict[str, str] = {}
-
-    for tool_dir in sorted(MY_TOOLS_DIR.iterdir()):
-        if not tool_dir.is_dir() or tool_dir.name.startswith(("_", ".")):
-            continue
-        if not (tool_dir / "server.py").exists():
-            continue
-
-        info = _read_tool(tool_dir.name)
-        if "error" in info:
-            continue
-
-        if info["healthy"] and not info["has_errors"]:
-            healthy.append(tool_dir.name)
-            details[tool_dir.name] = "healthy"
-        else:
-            broken.append(tool_dir.name)
-            reason = []
-            if not info["process_alive"]:
-                reason.append("process dead")
-            if not info["healthy"]:
-                reason.append("healthz failed")
-            if info["has_errors"]:
-                reason.append("errors in log")
-            details[tool_dir.name] = ", ".join(reason) if reason else "unknown issue"
-
-    return ScanAllResponse(
-        total_tools=len(healthy) + len(broken),
-        healthy_tools=healthy,
-        broken_tools=broken,
-        details=details,
-    )
-
-
-# ── POST /build_tool ────────────────────────────────────────────
-
 def _next_free_port() -> int:
-    """Find the next unused port starting at 9100 by reading existing port.txt files."""
+    """Find the next unused port starting at 9100."""
     used: set[int] = set()
     if MY_TOOLS_DIR.exists():
         for d in MY_TOOLS_DIR.iterdir():
@@ -1383,43 +533,138 @@ def _next_free_port() -> int:
     return port
 
 
-def _build_tool_prompt(tool_name: str, description: str, port: int, tool_dir: str) -> str:
+def _build_tool_inventory_for_ai() -> str:
+    """Build a human-readable summary of all existing tools for the AI."""
+    if not MY_TOOLS_DIR.exists():
+        return "(no my_tools/ directory — no tools exist yet)"
+
+    sections: list[str] = []
+    for tool_dir in sorted(MY_TOOLS_DIR.iterdir()):
+        if not tool_dir.is_dir() or tool_dir.name.startswith(("_", ".")):
+            continue
+        name = tool_dir.name
+        server_py = tool_dir / "server.py"
+        port_file = tool_dir / "port.txt"
+
+        if not server_py.exists():
+            sections.append(f"### {name}\n- Status: EMPTY (no server.py)\n")
+            continue
+
+        port = int(port_file.read_text().strip()) if port_file.exists() else 0
+        source = server_py.read_text("utf-8", errors="replace")
+
+        # Extract endpoint info
+        endpoints: list[str] = []
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("@app.post(") or stripped.startswith("@app.get("):
+                endpoints.append(stripped)
+
+        info = _read_tool(name)
+        status = "healthy" if info.get("healthy") else ("running" if info.get("process_alive") else "stopped")
+
+        section = f"### {name}\n"
+        section += f"- Port: {port}, Status: {status}\n"
+        section += f"- Endpoints: {', '.join(endpoints[:10]) if endpoints else '(none)'}\n"
+        source_preview = "\n".join(source.splitlines()[:80])
+        section += f"- Source preview:\n```python\n{source_preview}\n```\n"
+        sections.append(section)
+
+    if not sections:
+        return "(no tools found in my_tools/)"
+
+    return "\n".join(sections)
+
+
+# ──────────────────────────── prompt builders ────────────────────
+
+def _build_build_prompt(tool_name: str, description: str, port: int,
+                        tool_dir: str, inventory: str) -> str:
+    """Prompt for building a new tool OR extending an existing one."""
     return textwrap.dedent(f"""\
-        [BUILD NEW MCP TOOL]
+        [BUILD / EXTEND MCP TOOL]
 
-        Create a fully working FastAPI + FastMCP tool server.
+        The robot needs a new capability. Your job is to decide whether an
+        existing tool can be extended or a new one should be built, then DO it.
 
-        ## Requirements
-        - Tool name: {tool_name}
-        - Description: {description}
-        - API port: {port}
-        - MCP port: {port + 600}
-        - Tool directory: {tool_dir}
+        ## Requested capability
+        {description}
 
-        ## Steps
-        1. Think about what Python packages are needed. Install them:
-           cd /home/engelbot/Desktop/pi_rc_bot && uv add PACKAGE_NAME
-        2. Write the complete server.py:
-           cat > {tool_dir}/server.py << 'PYEOF'
-           ... (full code) ...
-           PYEOF
-        3. The server.py MUST follow this exact structure:
-           - imports at top
-           - FastAPI app = FastAPI(title="{tool_name}", version="0.1.0")
-           - @app.get("/healthz") returning {{"ok": True, "service": "{tool_name}"}}
-           - One or more @app.post() endpoints, each with Pydantic request/response models
-           - Every POST endpoint becomes an MCP tool — give them clear names and Field descriptions
-           - The bootstrap section at the bottom (argparse + FastMCP.from_fastapi + dual uvicorn)
-        4. Verify syntax: python3 -c "import ast; ast.parse(open('{tool_dir}/server.py').read())"
-        5. DO NOT start the server — the caller handles that.
+        ## Suggested tool name (use this if building new): {tool_name}
+        ## Assigned port (if building new): {port} (MCP: {port + 600})
+        ## Target directory (if building new): {tool_dir}
 
-        ## Bootstrap template (MUST be at bottom of server.py, copy exactly):
+        ## Existing tools in my_tools/
+        {inventory}
+
+        ## Decision process
+        1. If an existing tool already covers this: respond `EXISTS: <tool_name> — <reason>`
+        2. If an existing tool is close and just needs new endpoints ADDED:
+           - Respond first: `EXTENDING: <tool_name>`
+           - Then write the FULL updated server.py preserving ALL existing endpoints.
+           - Use: `cat > <existing_tool_dir>/server.py << 'PYEOF' ... PYEOF`
+           - Respond: `EXTENDED: <what was added>`
+        3. If an existing tool needs to be FUNDAMENTALLY REDESIGNED (different
+           endpoints, changed behavior, removed features, new purpose):
+           - Respond first: `REWRITING: <tool_name>`
+           - Then write a completely NEW server.py — you MAY remove, rename,
+             or replace any existing endpoints.
+           - Use: `cat > <existing_tool_dir>/server.py << 'PYEOF' ... PYEOF`
+           - Respond: `REWRITTEN: <what changed and why>`
+        4. If a new tool is needed:
+           - Use the suggested name, port, and directory above.
+           - Write the complete server.py following the template below.
+           - Respond: `BUILT: <what the tool does>`
+
+        ## Template for NEW tools (server.py structure)
+        Follow this EXACT structure. Every section is mandatory.
+
         ```python
+        #!/usr/bin/env python3
+        \"\"\"{tool_name} — MCP Tool Server
+
+        <One-line description.>
+        \"\"\"
+
+        from __future__ import annotations
+
+        import argparse
+        import asyncio
+        import logging
+        import signal
+        from typing import Any, Optional
+
+        import uvicorn
+        from fastapi import FastAPI
+        from fastmcp import FastMCP
+        from pydantic import BaseModel, Field
+
+        # domain-specific imports here (e.g. import httpx)
+
+        LOG = logging.getLogger("{tool_name}")
+
+        app = FastAPI(title="{tool_name}", version="0.1.0")
+
+        @app.get("/healthz")
+        def healthz() -> dict[str, Any]:
+            return {{"ok": True, "service": "{tool_name}"}}
+
+        # --- Pydantic models (every Field needs description=) ---
+
+        # --- @app.post() endpoints ---
+
         def main():
-            parser = argparse.ArgumentParser()
+            parser = argparse.ArgumentParser(description="{tool_name} MCP server")
             parser.add_argument("--port", type=int, default={port})
             parser.add_argument("--host", type=str, default="0.0.0.0")
             args = parser.parse_args()
+
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s [%(levelname)-7s] %(name)s: %(message)s",
+                datefmt="%H:%M:%S",
+            )
+
             mcp = FastMCP.from_fastapi(app=app, name=f"{tool_name} (port {{args.port}})")
             mcp_app = mcp.http_app(path="/mcp")
             async def serve():
@@ -1446,999 +691,726 @@ def _build_tool_prompt(tool_name: str, description: str, port: int, tool_dir: st
             main()
         ```
 
-        ## IMPORTANT
-        - Python only. Use uv add for packages (NEVER pip).
-        - Make the tool actually useful and functional — not a stub.
-        - Use httpx for HTTP requests (not requests).
-        - Handle errors gracefully — return error info in the response model.
+        ## Rules
+        - Python only. Use `uv add` for packages (NEVER pip).
+        - Use `httpx` for HTTP requests (not requests).
+        - FastAPI + FastMCP pattern. Every POST endpoint = MCP tool.
+        - **Logging**: Use `LOG = logging.getLogger("<name>")` + `LOG.info/warning/error/debug`. NEVER use `print()`.
+        - **Imports**: Group as: `from __future__` → stdlib → third-party → domain-specific.
+        - **Docstring**: Every server.py starts with `#!/usr/bin/env python3` + module docstring.
+        - **Pydantic**: Every `Field()` must have `description=`.
+        - **`logging.basicConfig(...)`** must be in `main()` — configure format + level there.
+        - Verify syntax: `python3 -c "import ast; ast.parse(open('<path>').read())"`
+        - DO NOT start the server — the caller handles that.
+        - Write files using bash: `cat > /path/to/server.py << 'PYEOF' ... PYEOF`
         - Project root: /home/engelbot/Desktop/pi_rc_bot
-
-        Respond with BUILT: <one-line description of what the tool does>
-        Or FAILED: <reason> if you can't build it.
     """)
 
 
-class BuildToolRequest(BaseModel):
-    tool_name: str = Field(description="Name for the new tool (lowercase, underscores, e.g. 'web_search')")
-    description: str = Field(description="What the tool should do — be specific about the API, data sources, endpoints needed")
+def _build_repair_prompt(description: str, info: dict | None = None,
+                         tool_name: str = "") -> str:
+    """Prompt for repairing a tool or system issue."""
+    context_section = ""
+    if info and "error" not in info:
+        context_section = textwrap.dedent(f"""\
+            ## Tool info (auto-detected)
+            - Name: {info['tool_name']}
+            - Path: {info['tool_dir']}
+            - Port: {info['port']} (MCP: {info['mcp_port']})
+            - Process alive: {info['process_alive']}
+            - Healthy: {info['healthy']}
 
-class BuildToolResponse(BaseModel):
-    ok: bool = True
-    tool_name: str = ""
-    port: int = 0
-    mcp_port: int = 0
-    built: bool = False
-    started: bool = False
-    registered: bool = False
-    healthy: bool = False
-    summary: str = ""
-    job_id: str = ""
+            ## server.py (full source)
+            ```python
+            {info['source']}
+            ```
+
+            ## server.log (error section)
+            ```
+            {info['error_block']}
+            ```
+
+            ## Full log tail (last lines)
+            ```
+            {info['log_tail'][-3000:]}
+            ```
+        """)
+
+    inventory = _build_tool_inventory_for_ai()
+
+    return textwrap.dedent(f"""\
+        [REPAIR] Something is broken. Fix it.
+
+        ## Problem description (from the operator)
+        {description}
+
+        {context_section}
+
+        ## All existing tools (for context)
+        {inventory}
+
+        ## Your task
+        1. Figure out what is broken based on the description above.
+           - If a specific tool is mentioned or auto-detected, fix its server.py.
+           - If it is a system-level issue (e.g. missing package, config), fix that.
+        2. Write the fix using bash: `cat > /path/to/server.py << 'PYEOF' ... PYEOF`
+        3. If a missing package caused the error: `cd /home/engelbot/Desktop/pi_rc_bot && uv add PACKAGE`
+        4. Verify syntax: `python3 -c "import ast; ast.parse(open('/path/to/server.py').read())"`
+        5. DO NOT start the server or register it — the caller handles that.
+        6. While fixing, also fix any style violations you notice:
+           - Add `#!/usr/bin/env python3` shebang + module docstring if missing
+           - Add `from __future__ import annotations` if missing
+           - Replace any `print()` calls with `LOG.info/warning/error/debug`
+           - Add `LOG = logging.getLogger("<tool_name>")` if missing
+           - Ensure `logging.basicConfig(...)` is in `main()`
+           - Add `description=` to any Pydantic Field that lacks it
+           - Fix import ordering: future → stdlib → third-party → domain
+
+        Respond with `FIXED: <tool_name> — <description>` or `UNFIXABLE: <reason>`
+    """)
 
 
-def _run_build_tool_sync(job: Job, name: str, description: str, port: int, mcp_port: int, tool_dir: Path) -> None:
-    """Background worker for build_tool — runs in a thread.
+# ══════════════════════════════════════════════════════════════════
+#  Background workers
+# ══════════════════════════════════════════════════════════════════
 
-    In thorough mode: allows multiple AI turns with timeout-per-turn.
-    On timeout, marks job CONTINUABLE so /continue_job can resume.
-    """
+def _run_build_sync(job: Job) -> None:
+    """Background worker for build_tool — runs in a thread."""
     try:
         job.state = JobState.RUNNING
-        job.original_description = description
+        description = job.description
+        suggested_name = job.tool_name
 
-        thorough = _thorough_mode()
-        max_turns = _deep_get(_CFG, "thorough_mode", "max_turns_per_job", default=3) if thorough else 1
+        # 1. Scan existing tools
+        job.phase = "scanning existing tools"
+        job.log("Scanning existing tools...")
+        inventory = _build_tool_inventory_for_ai()
 
-        # 1. Send build prompt to OpenCode (strong code model)
+        # Prepare directory + port for potential new build
+        tool_dir = MY_TOOLS_DIR / suggested_name
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        port_file = tool_dir / "port.txt"
+        if port_file.exists():
+            port = int(port_file.read_text().strip())
+        else:
+            port = _next_free_port()
+            port_file.write_text(str(port))
+        mcp_port = port + 600
+
+        # 2. Send to AI
         job.phase = "sending build prompt to AI"
-        job.log(f"Sending build prompt to code AI… (thorough={thorough}, max_turns={max_turns})")
-        prompt = _build_tool_prompt(name, description, port, str(tool_dir))
-        job.last_prompt = prompt
+        job.log("Sending build prompt to code AI...")
+        prompt = _build_build_prompt(suggested_name, description, port,
+                                     str(tool_dir), inventory)
 
         client = _get_client()
-        client.new_session()  # fresh session for each build
-        reply = ""
-        timed_out = False
+        client.new_session()
 
-        for turn in range(1, max_turns + 1):
-            job.phase = f"AI turn {turn}/{max_turns}"
-            job.log(f"── AI turn {turn}/{max_turns} ──")
+        try:
+            reply = client.send(prompt)
+            job.turns_completed = 1
+            job.session_id = client._session_id
+            LOG.info("Build AI reply for %s: %s", suggested_name, reply[:400])
+            for tc in client.last_tool_calls:
+                job.log(tc)
+            if reply.strip():
+                job.log(f"AI says: {reply[:300]}")
+            else:
+                job.log("AI replied (tool actions only)")
+        except Exception as exc:
+            job.phase = "AI error"
+            job.log(f"Build AI failed: {exc}")
+            job.state = JobState.FAILED
+            job.result = {"ok": False, "summary": f"Build AI failed: {exc}"}
+            job.finished_at = time.time()
+            return
 
-            try:
-                if turn == 1:
-                    reply = client.send(prompt)
-                else:
-                    # Follow-up: check what's missing and ask AI to continue
-                    server_py = tool_dir / "server.py"
-                    if server_py.exists():
-                        source = server_py.read_text("utf-8")[:4000]
-                        follow_up = (
-                            f"The build is not complete yet. Current server.py:\n"
-                            f"```python\n{source}\n```\n"
-                            f"Please continue building. Check syntax, install missing packages, "
-                            f"and ensure the server is complete.\n"
-                            f"Respond with BUILT: or FAILED:"
-                        )
-                    else:
-                        follow_up = (
-                            f"server.py was not created yet. Please create it now.\n"
-                            f"Tool: {name}, Port: {port}, Dir: {tool_dir}\n"
-                            f"Description: {description}\n"
-                            f"Respond with BUILT: or FAILED:"
-                        )
-                    reply = client.send(follow_up)
+        # 3. Parse AI decision
+        reply_upper = reply.upper()
 
-                job.turns_completed = turn
-                job.session_id = client._session_id
-
-                LOG.info("Build AI reply (turn %d) for %s: %s", turn, name, reply[:400])
-                for tc in client.last_tool_calls:
-                    job.log(tc)
-                if reply.strip():
-                    job.log(f"AI says: {reply[:300]}")
-                else:
-                    job.log("AI replied (no text — only tool actions)")
-
-            except requests.exceptions.ReadTimeout:
-                timed_out = True
-                job.last_prompt = prompt if turn == 1 else follow_up  # type: ignore[possibly-undefined]
-                job.session_id = client._session_id
-                job.turns_completed = turn - 1
-                job.log(f"⏱️ AI timed out on turn {turn}")
-                break
-            except Exception as exc:
-                job.phase = "AI error"
-                job.log(f"Build AI failed: {exc}")
-                job.state = JobState.FAILED
-                job.result = {"ok": False, "tool_name": name, "port": port, "mcp_port": mcp_port,
-                              "summary": f"Build AI failed: {exc}"}
-                job.finished_at = time.time()
-                return
-
-            if "FAILED" in reply.upper()[:100]:
-                job.phase = "AI could not build"
-                job.log(f"AI refused to build: {reply[:200]}")
-                job.state = JobState.FAILED
-                job.result = {"ok": True, "tool_name": name, "port": port, "mcp_port": mcp_port,
-                              "built": False, "summary": f"AI could not build: {reply[:500]}"}
-                job.finished_at = time.time()
-                return
-
-            if "BUILT" in reply.upper()[:100]:
-                job.log("AI reports BUILT")
-                break
-
-            # In single-turn mode, don't loop
-            if not thorough:
-                break
-
-        # If timed out in thorough mode → mark CONTINUABLE
-        if timed_out and thorough:
-            job.phase = "timed out (continuable)"
-            job.log("Marked as CONTINUABLE — use /continue_job to resume")
-            job.state = JobState.CONTINUABLE
+        # EXISTS — tool already covers this
+        if "EXISTS:" in reply_upper:
+            m = re.search(r"EXISTS:\s*(\S+)", reply, re.IGNORECASE)
+            existing_name = m.group(1).strip(" -") if m else suggested_name
+            job.phase = "done (already exists)"
+            job.log(f"AI says tool already exists: {existing_name}")
+            job.state = JobState.DONE
             job.result = {
-                "ok": True, "tool_name": name, "port": port, "mcp_port": mcp_port,
-                "built": False, "timed_out": True, "continuable": True,
-                "turns_completed": job.turns_completed,
-                "summary": f"AI timed out after {job.turns_completed} turn(s) — job can be continued",
+                "ok": True, "decision": "exists", "tool_name": existing_name,
+                "summary": f"Capability already provided by '{existing_name}'",
             }
+            # Clean up the empty dir we created if different
+            if existing_name != suggested_name and not (tool_dir / "server.py").exists():
+                shutil.rmtree(tool_dir, ignore_errors=True)
             job.finished_at = time.time()
             return
 
-        if timed_out:
-            job.phase = "timed out"
-            job.log("AI timed out (non-thorough mode)")
+        # Determine which tool was actually built/extended/rewritten
+        actual_tool_name = suggested_name
+        actual_tool_dir = tool_dir
+        actual_port = port
+        actual_mcp_port = mcp_port
+
+        is_rewrite = "REWRITTEN:" in reply_upper or "REWRITING:" in reply_upper
+        is_extend = "EXTENDED:" in reply_upper or "EXTENDING:" in reply_upper
+
+        if is_rewrite or is_extend:
+            pattern = r"REWRIT(?:ING|TEN):\s*(\S+)" if is_rewrite else r"EXTEND(?:ING|ED):\s*(\S+)"
+            m = re.search(pattern, reply, re.IGNORECASE)
+            if m:
+                ext_name = m.group(1).strip(" -")
+                ext_dir = MY_TOOLS_DIR / ext_name
+                if ext_dir.is_dir():
+                    actual_tool_name = ext_name
+                    actual_tool_dir = ext_dir
+                    ext_port_file = ext_dir / "port.txt"
+                    if ext_port_file.exists():
+                        actual_port = int(ext_port_file.read_text().strip())
+                        actual_mcp_port = actual_port + 600
+            # Clean up the empty dir for the suggested name
+            if actual_tool_name != suggested_name and not (tool_dir / "server.py").exists():
+                shutil.rmtree(tool_dir, ignore_errors=True)
+            job.tool_name = actual_tool_name
+            if is_rewrite:
+                job.log(f"AI is rewriting tool: {actual_tool_name}")
+
+        if "FAILED:" in reply_upper[:100]:
+            job.phase = "AI could not build"
+            job.log(f"AI refused: {reply[:200]}")
             job.state = JobState.FAILED
-            job.result = {"ok": False, "tool_name": name, "port": port, "mcp_port": mcp_port,
-                          "summary": "Build AI timed out"}
+            job.result = {"ok": False, "summary": f"AI could not build: {reply[:500]}"}
             job.finished_at = time.time()
             return
 
-        # 2. Check if server.py was actually created
+        # 4. Verify server.py exists
         job.phase = "checking generated code"
-        job.log("Checking if server.py was created…")
-        server_py = tool_dir / "server.py"
+        server_py = actual_tool_dir / "server.py"
         if not server_py.exists():
-            job.phase = "no server.py created"
-            job.log("AI did not create server.py — build failed")
-            job.state = JobState.FAILED
-            job.result = {"ok": False, "tool_name": name, "port": port, "mcp_port": mcp_port,
-                          "built": False, "summary": "AI did not create server.py — build failed"}
-            job.finished_at = time.time()
-            return
+            # Check other dirs
+            for d in MY_TOOLS_DIR.iterdir():
+                if d.is_dir() and (d / "server.py").exists():
+                    m2 = re.search(rf"my_tools/{d.name}/server\.py", reply)
+                    if m2:
+                        actual_tool_name = d.name
+                        actual_tool_dir = d
+                        server_py = d / "server.py"
+                        pf = d / "port.txt"
+                        if pf.exists():
+                            actual_port = int(pf.read_text().strip())
+                            actual_mcp_port = actual_port + 600
+                        break
+            if not server_py.exists():
+                job.phase = "no server.py created"
+                job.log("AI did not create server.py")
+                job.state = JobState.FAILED
+                job.result = {"ok": False, "summary": "AI did not create server.py"}
+                job.finished_at = time.time()
+                return
 
-        # 3. Verify syntax
+        # 5. Verify syntax
         job.phase = "verifying syntax"
-        job.log("Verifying Python syntax…")
+        job.log("Verifying Python syntax...")
         try:
             import ast
             ast.parse(server_py.read_text("utf-8"))
-            job.log("✅ Syntax OK")
+            job.log("Syntax OK")
         except SyntaxError as exc:
-            job.phase = "fixing syntax error"
-            job.log(f"Syntax error: {exc} — attempting auto-repair…")
-            repair_info = _read_tool(name)
-            repair_prompt = _build_repair_prompt(repair_info)
+            job.log(f"Syntax error: {exc} — attempting auto-repair...")
             try:
-                reply2 = client.send(repair_prompt)
-                LOG.info("Repair attempt after build: %s", reply2[:200])
+                repair_info = _read_tool(actual_tool_name)
+                repair_reply = client.send(_build_repair_prompt(
+                    f"Fix syntax error in {actual_tool_name}: {exc}",
+                    repair_info, actual_tool_name,
+                ))
                 for tc in client.last_tool_calls:
                     job.log(tc)
-                if reply2.strip():
-                    job.log(f"AI fix says: {reply2[:200]}")
             except Exception:
                 pass
-            # Re-check
             try:
                 ast.parse(server_py.read_text("utf-8"))
-                job.log("✅ Syntax OK after fix")
-            except SyntaxError:
-                job.phase = "syntax error unfixable"
-                job.log(f"Syntax still broken: {exc}")
+                job.log("Syntax OK after fix")
+            except SyntaxError as exc2:
                 job.state = JobState.FAILED
-                job.result = {"ok": False, "tool_name": name, "port": port, "mcp_port": mcp_port,
-                              "built": False, "summary": f"server.py has syntax errors even after repair: {exc}"}
+                job.result = {"ok": False, "summary": f"Syntax error unfixable: {exc2}"}
                 job.finished_at = time.time()
                 return
 
-        built = True
-        job.log("✅ Code generated successfully")
-
-        # 4. Start the tool
+        # 6. Start the tool
         job.phase = "starting server"
-        job.log(f"Starting server on port {port}…")
-        started = _restart_tool(name, port)
-        if started:
-            job.log("✅ Server started")
-        else:
-            job.log("❌ Server failed to start")
+        job.log(f"Starting server on port {actual_port}...")
+        started = _restart_tool(actual_tool_name, actual_port)
+        job.log("Server started" if started else "Server failed to start")
 
-        # 5. Register with main OpenCode
+        # 7. Register with main OpenCode
         registered = False
         if started:
             job.phase = "registering with OpenCode"
-            job.log("Registering with main OpenCode…")
-            registered = _re_register_tool(name, mcp_port)
-            if registered:
-                job.log("✅ Registered with OpenCode")
-            else:
-                job.log("❌ Registration failed")
+            registered = _re_register_tool(actual_tool_name, actual_mcp_port)
+            job.log("Registered" if registered else "Registration failed")
 
-        # 6. Final health check
+        # 8. Health check
         healthy = False
         if started:
-            job.phase = "health check"
             try:
-                r = requests.get(f"http://127.0.0.1:{port}/healthz", timeout=5)
+                r = requests.get(f"http://127.0.0.1:{actual_port}/healthz", timeout=5)
                 healthy = r.ok
             except Exception:
                 pass
-            if healthy:
-                job.log(f"✅ Healthy on port {port} (MCP: {mcp_port})")
-            else:
-                job.log("❌ Not healthy yet")
+            job.log("Healthy!" if healthy else "Not healthy")
 
-        # 7. Build log
-        build_log = tool_dir / "build.log"
+        # 9. Build log
+        build_log = actual_tool_dir / "build.log"
         try:
             with open(build_log, "a", encoding="utf-8") as f:
                 f.write(f"\n{'='*60}\n")
                 f.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"Description: {description}\n")
-                f.write(f"Port: {port}, MCP: {mcp_port}\n")
-                f.write(f"Turns: {job.turns_completed}, Thorough: {thorough}\n")
+                f.write(f"Port: {actual_port}, MCP: {actual_mcp_port}\n")
                 f.write(f"Result: {'SUCCESS' if healthy else 'PARTIAL'}\n")
-                f.write(f"AI reply: {reply[:500]}\n")
         except Exception:
             pass
 
-        parts = []
-        if built:
-            parts.append("✅ Code generated")
-        if job.turns_completed > 1:
-            parts.append(f"{job.turns_completed} AI turns")
-        if started:
-            parts.append("✅ Server started")
-        if registered:
-            parts.append("✅ Registered with OpenCode")
-        if healthy:
-            parts.append(f"✅ Healthy on port {port} (MCP: {mcp_port})")
-        else:
-            parts.append("❌ Not healthy yet")
-        parts.append(f"AI: {reply[:300]}")
-
+        decision = "rewrite" if is_rewrite else ("extend" if is_extend else "build")
         job.phase = "done" if healthy else "done (unhealthy)"
         job.state = JobState.DONE if healthy else JobState.FAILED
         job.result = {
-            "ok": True, "tool_name": name, "port": port, "mcp_port": mcp_port,
-            "built": built, "started": started, "registered": registered, "healthy": healthy,
-            "turns": job.turns_completed,
-            "summary": " | ".join(parts),
+            "ok": True,
+            "decision": decision,
+            "tool_name": actual_tool_name,
+            "port": actual_port,
+            "mcp_port": actual_mcp_port,
+            "built": True,
+            "started": started,
+            "registered": registered,
+            "healthy": healthy,
+            "summary": f"{actual_tool_name} on port {actual_port} ({'healthy' if healthy else 'unhealthy'})",
         }
         job.finished_at = time.time()
-        job.log(f"Build finished in {job.elapsed()}s — {'SUCCESS' if healthy else 'PARTIAL'}")
+        job.log(f"Build finished in {job.elapsed()}s")
 
     except Exception as exc:
         job.phase = "unexpected error"
         job.log(f"Unexpected error: {exc}")
         job.state = JobState.FAILED
-        job.result = {"ok": False, "tool_name": name, "summary": f"Unexpected error: {exc}"}
+        job.result = {"ok": False, "summary": f"Unexpected error: {exc}"}
         job.finished_at = time.time()
+
+
+def _run_repair_sync(job: Job) -> None:
+    """Background worker for repair_tool — runs in a thread."""
+    try:
+        job.state = JobState.RUNNING
+        description = job.description
+
+        # 1. Try to auto-detect which tool is mentioned
+        job.phase = "analyzing repair request"
+        job.log(f"Analyzing: {description[:200]}")
+
+        detected_tool: str | None = None
+        detected_info: dict | None = None
+
+        # Check if any known tool name appears in the description
+        if MY_TOOLS_DIR.exists():
+            for tool_dir in sorted(MY_TOOLS_DIR.iterdir()):
+                if not tool_dir.is_dir() or tool_dir.name.startswith(("_", ".")):
+                    continue
+                if not (tool_dir / "server.py").exists():
+                    continue
+                if tool_dir.name.lower() in description.lower():
+                    detected_tool = tool_dir.name
+                    detected_info = _read_tool(detected_tool)
+                    job.log(f"Auto-detected tool: {detected_tool}")
+                    break
+
+        # If no tool auto-detected, scan for broken ones
+        if detected_tool is None and MY_TOOLS_DIR.exists():
+            job.log("No specific tool mentioned — scanning for broken tools...")
+            for tool_dir in sorted(MY_TOOLS_DIR.iterdir()):
+                if not tool_dir.is_dir() or tool_dir.name.startswith(("_", ".")):
+                    continue
+                if not (tool_dir / "server.py").exists():
+                    continue
+                info = _read_tool(tool_dir.name)
+                if info.get("has_errors") or not info.get("healthy"):
+                    detected_tool = tool_dir.name
+                    detected_info = info
+                    job.log(f"Found broken tool: {detected_tool}")
+                    break
+
+        if detected_tool:
+            job.tool_name = detected_tool
+
+        # Record hash before
+        if detected_tool:
+            server_py = MY_TOOLS_DIR / detected_tool / "server.py"
+            job.source_hash_before = _file_sha256(server_py)
+
+        # 2. Send to AI
+        job.phase = "sending repair prompt to AI"
+        job.log("Sending repair prompt to code AI...")
+        prompt = _build_repair_prompt(description, detected_info,
+                                      detected_tool or "")
+
+        client = _get_client()
+        client.new_session()
+
+        try:
+            reply = client.send(prompt)
+            job.turns_completed = 1
+            job.session_id = client._session_id
+            LOG.info("Repair AI reply: %s", reply[:400])
+            for tc in client.last_tool_calls:
+                job.log(tc)
+            if reply.strip():
+                job.log(f"AI says: {reply[:300]}")
+            else:
+                job.log("AI replied (tool actions only)")
+        except Exception as exc:
+            job.phase = "AI error"
+            job.log(f"Repair AI failed: {exc}")
+            job.state = JobState.FAILED
+            job.result = {"ok": False, "summary": f"Repair AI failed: {exc}"}
+            job.finished_at = time.time()
+            return
+
+        if "UNFIXABLE" in reply.upper():
+            job.phase = "unfixable"
+            job.log(f"AI says unfixable: {reply[:200]}")
+            job.state = JobState.FAILED
+            job.result = {"ok": False, "summary": f"AI says unfixable: {reply[:500]}"}
+            job.finished_at = time.time()
+            return
+
+        # 3. Figure out which tool was fixed (from AI reply)
+        fixed_tool = detected_tool
+        m = re.search(r"FIXED:\s*(\S+)", reply, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip(" -")
+            if (MY_TOOLS_DIR / candidate).is_dir():
+                fixed_tool = candidate
+        if not fixed_tool:
+            m2 = re.search(r"my_tools/(\w+)/server\.py", reply)
+            if m2:
+                fixed_tool = m2.group(1)
+
+        if not fixed_tool:
+            # System-level repair (no specific tool to restart)
+            job.phase = "done (system repair)"
+            job.log("System-level repair completed (no tool to restart)")
+            job.state = JobState.DONE
+            job.result = {
+                "ok": True,
+                "summary": f"System repair done: {reply[:300]}",
+            }
+            job.finished_at = time.time()
+            return
+
+        job.tool_name = fixed_tool
+
+        # 4. Verify source changed
+        server_py = MY_TOOLS_DIR / fixed_tool / "server.py"
+        new_hash = _file_sha256(server_py)
+        if new_hash == job.source_hash_before and "FIXED" not in reply.upper():
+            job.phase = "no changes made"
+            job.log("AI did not modify server.py")
+            job.state = JobState.FAILED
+            job.result = {"ok": False, "summary": f"AI did not change server.py. Reply: {reply[:300]}"}
+            job.finished_at = time.time()
+            return
+
+        if new_hash != job.source_hash_before:
+            job.log("server.py was modified")
+
+        # 5. Restart
+        info = _read_tool(fixed_tool)
+        port = info.get("port", 9100) if "error" not in info else 9100
+        mcp_port = port + 600
+
+        job.phase = "restarting server"
+        job.log("Restarting tool server...")
+        restarted = _restart_tool(fixed_tool, port)
+        job.log("Restarted" if restarted else "Restart failed")
+
+        # 6. Re-register
+        registered = False
+        if restarted:
+            job.phase = "re-registering"
+            registered = _re_register_tool(fixed_tool, mcp_port)
+            job.log("Re-registered" if registered else "Registration failed")
+
+        # 7. Health check
+        healthy = False
+        if restarted:
+            try:
+                r = requests.get(f"http://127.0.0.1:{port}/healthz", timeout=5)
+                healthy = r.ok
+            except Exception:
+                pass
+            job.log("Healthy!" if healthy else "Still unhealthy")
+
+        # 8. Repair log
+        repair_log = MY_TOOLS_DIR / fixed_tool / "repair.log"
+        try:
+            with open(repair_log, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*60}\n")
+                f.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Description: {description[:200]}\n")
+                f.write(f"Result: {'FIXED' if healthy else 'ATTEMPTED'}\n")
+        except Exception:
+            pass
+
+        job.phase = "done" if healthy else "done (still broken)"
+        job.state = JobState.DONE if healthy else JobState.FAILED
+        job.result = {
+            "ok": True,
+            "tool_name": fixed_tool,
+            "port": port,
+            "mcp_port": mcp_port,
+            "fix_applied": new_hash != job.source_hash_before,
+            "restarted": restarted,
+            "registered": registered,
+            "healthy": healthy,
+            "summary": f"{'FIXED' if healthy else 'STILL BROKEN'}: {fixed_tool}",
+        }
+        job.finished_at = time.time()
+        job.log(f"Repair finished in {job.elapsed()}s")
+
+    except Exception as exc:
+        job.phase = "unexpected error"
+        job.log(f"Unexpected error: {exc}")
+        job.state = JobState.FAILED
+        job.result = {"ok": False, "summary": f"Unexpected error: {exc}"}
+        job.finished_at = time.time()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  FastAPI  Application
+# ══════════════════════════════════════════════════════════════════
+
+app = FastAPI(title="robot_codex", version="1.0.0")
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "service": "robot_codex"}
+
+
+# ── POST /build_tool ────────────────────────────────────────────
+
+class BuildToolRequest(BaseModel):
+    description: str = Field(
+        description=(
+            "Plain-text description of what you need. "
+            "Be specific about the desired functionality. "
+            "The AI will decide whether to build a new tool or extend an existing one."
+        )
+    )
+    suggested_name: str = Field(
+        default="",
+        description=(
+            "Optional: suggested name for the tool (lowercase, underscores). "
+            "If empty, a name will be derived from the description."
+        )
+    )
+
+class BuildToolResponse(BaseModel):
+    ok: bool = True
+    job_id: str = ""
+    tool_name: str = ""
+    summary: str = ""
 
 
 @app.post("/build_tool", response_model=BuildToolResponse)
 async def build_tool(req: BuildToolRequest):
-    """Build a brand-new MCP tool server from a description.
+    """Describe a new tool in plain text. The codex agent builds it as MCP in my_tools/.
 
-    Runs **asynchronously** — returns a job_id immediately.
-    Poll ``/build_status`` with the job_id to track progress.
+    The AI automatically checks existing tools and decides whether to:
+    - Build a completely new tool
+    - Extend an existing tool with new endpoints
+    - Report that the capability already exists
+
+    Returns a job_id immediately. Use /job_detail to track progress.
+    Max runtime: ~10 minutes.
     """
-    # Sanitize name
-    name = re.sub(r"[^a-z0-9_]", "_", req.tool_name.lower().strip())
+    # Derive name from description if not provided
+    if req.suggested_name:
+        name = re.sub(r"[^a-z0-9_]", "_", req.suggested_name.lower().strip())
+    else:
+        words = re.sub(r"[^a-z0-9 ]", "", req.description.lower()).split()[:3]
+        name = "_".join(words) if words else "new_tool"
     if not name:
-        return BuildToolResponse(ok=False, summary="Invalid tool name")
+        name = "new_tool"
 
-    # Prevent duplicate jobs for the same tool
+    # Check for duplicate running jobs
     existing = _has_running_job_for(name)
     if existing:
         return BuildToolResponse(
-            ok=True,
-            tool_name=name,
-            summary=f"A job is already running for this tool — job_id={existing.job_id} ({existing.phase})",
-            job_id=existing.job_id,
+            ok=True, job_id=existing.job_id, tool_name=name,
+            summary=f"A job is already running for '{name}' — job_id={existing.job_id}",
         )
 
-    tool_dir = MY_TOOLS_DIR / name
-    port = _next_free_port()
-    mcp_port = port + 600
+    job = _create_job(JobKind.BUILD, name, req.description)
+    job.log(f"Build queued: {req.description[:200]}")
 
-    # Create directory
-    tool_dir.mkdir(parents=True, exist_ok=True)
-
-    # Write port file
-    (tool_dir / "port.txt").write_text(str(port))
-
-    LOG.info("🔨 Building tool '%s' on port %d — launching async job…", name, port)
-
-    # Create a job and run in background thread
-    job = _create_job(JobKind.BUILD, name)
-    job.log(f"Build queued — tool={name}, port={port}")
-
-    thread = threading.Thread(
-        target=_run_build_tool_sync,
-        args=(job, name, req.description, port, mcp_port, tool_dir),
-        daemon=True,
-    )
+    thread = threading.Thread(target=_run_build_sync, args=(job,), daemon=True)
     thread.start()
 
     return BuildToolResponse(
-        ok=True,
-        tool_name=name,
-        port=port,
-        mcp_port=mcp_port,
-        summary=f"Build started — job_id={job.job_id}. Poll build_status for progress.",
-        job_id=job.job_id,
+        ok=True, job_id=job.job_id, tool_name=name,
+        summary=f"Build started — job_id={job.job_id}. Use job_detail to track progress.",
     )
 
 
-# ── POST /build_status ─────────────────────────────────────────
+# ── POST /repair_tool ──────────────────────────────────────────
 
-class BuildStatusRequest(BaseModel):
-    job_id: str = Field(description="The job_id returned by build_tool or repair")
+class RepairToolRequest(BaseModel):
+    description: str = Field(
+        description=(
+            "Plain-text description of what is broken. "
+            "Can mention a specific tool name, or just describe the problem. "
+            "The AI will figure out what to fix (my_tools or system-level)."
+        )
+    )
 
-class BuildStatusResponse(BaseModel):
+class RepairToolResponse(BaseModel):
     ok: bool = True
     job_id: str = ""
-    kind: str = ""
     tool_name: str = ""
-    state: str = ""
-    phase: str = ""
-    elapsed_seconds: float = 0.0
-    progress: list[str] = []
-    result: dict[str, Any] = {}
+    summary: str = ""
 
 
-@app.post("/build_status", response_model=BuildStatusResponse)
-async def build_status(req: BuildStatusRequest):
-    """Check the current status of a build or repair job.
+@app.post("/repair_tool", response_model=RepairToolResponse)
+async def repair_tool(req: RepairToolRequest):
+    """Describe what is broken in plain text. The codex agent figures out what to fix.
 
-    Returns the current phase (e.g. 'sending build prompt to AI',
-    'starting server', 'done'), a progress log of completed steps,
-    and the final result once the job finishes.
-    Call this to monitor long-running builds.
+    The AI will:
+    - Auto-detect the broken tool from your description
+    - If no tool mentioned, scan for broken tools
+    - Fix the code, restart the server, re-register with OpenCode
+
+    Can also handle system-level repairs (missing packages, config issues).
+    Returns a job_id immediately. Use /job_detail to track progress.
+    Max runtime: ~10 minutes.
     """
-    job = _get_job(req.job_id)
-    if job is None:
-        return BuildStatusResponse(ok=False, job_id=req.job_id, state="not_found",
-                                   phase="Unknown job_id")
-    return BuildStatusResponse(
-        ok=True,
-        job_id=job.job_id,
-        kind=job.kind.value,
-        tool_name=job.tool_name,
-        state=job.state.value,
-        phase=job.phase,
-        elapsed_seconds=job.elapsed(),
-        progress=list(job.progress),
-        result=dict(job.result) if job.result else {},
+    # Try to detect tool name for duplicate check
+    tool_hint = "unknown"
+    if MY_TOOLS_DIR.exists():
+        for d in sorted(MY_TOOLS_DIR.iterdir()):
+            if d.is_dir() and d.name.lower() in req.description.lower():
+                tool_hint = d.name
+                break
+
+    existing = _has_running_job_for(tool_hint)
+    if existing and tool_hint != "unknown":
+        return RepairToolResponse(
+            ok=True, job_id=existing.job_id, tool_name=tool_hint,
+            summary=f"A repair job is already running for '{tool_hint}' — job_id={existing.job_id}",
+        )
+
+    job = _create_job(JobKind.REPAIR, tool_hint, req.description)
+    job.log(f"Repair queued: {req.description[:200]}")
+
+    thread = threading.Thread(target=_run_repair_sync, args=(job,), daemon=True)
+    thread.start()
+
+    return RepairToolResponse(
+        ok=True, job_id=job.job_id, tool_name=tool_hint,
+        summary=f"Repair started — job_id={job.job_id}. Use job_detail to track progress.",
     )
 
 
 # ── POST /list_jobs ─────────────────────────────────────────────
 
+class JobSummary(BaseModel):
+    job_id: str = Field(description="Unique job identifier")
+    kind: str = Field(description="build or repair")
+    tool_name: str = Field(description="Tool being built or repaired")
+    state: str = Field(description="queued / running / done / failed")
+    phase: str = Field(description="Current step")
+    elapsed_seconds: float = Field(description="Time since job was created")
+
 class ListJobsResponse(BaseModel):
     ok: bool = True
-    jobs: list[dict[str, Any]] = []
+    total: int = 0
+    jobs: list[JobSummary] = []
 
 
 @app.post("/list_jobs", response_model=ListJobsResponse)
 async def list_jobs():
-    """List all recent build and repair jobs with their current status.
+    """List all build and repair jobs with high-level info.
 
-    Shows job_id, kind (build/repair), tool_name, state (queued/running/done/failed),
-    current phase, and elapsed time. Useful to see what the codex agent is working on.
+    Returns job_id, type, tool name, state, current phase, and elapsed time.
+    Use job_detail with a job_id from this list to get full details.
     """
     with _jobs_lock:
         items = sorted(_jobs.values(), key=lambda j: j.created_at, reverse=True)
     return ListJobsResponse(
+        total=len(items),
         jobs=[
-            {
-                "job_id": j.job_id,
-                "kind": j.kind.value,
-                "tool_name": j.tool_name,
-                "state": j.state.value,
-                "phase": j.phase,
-                "elapsed_seconds": j.elapsed(),
-            }
-            for j in items[:20]  # last 20 jobs
-        ]
-    )
-
-
-# ── POST /tool_inventory ────────────────────────────────────────
-
-class ToolInfo(BaseModel):
-    tool_name: str = Field(description="Name of the tool folder")
-    exists: bool = Field(description="Whether server.py exists on disk")
-    port: int = Field(default=0, description="API port")
-    mcp_port: int = Field(default=0, description="MCP port")
-    process_alive: bool = Field(default=False, description="Whether the process is running")
-    healthy: bool = Field(default=False, description="Whether /healthz returns ok")
-    has_errors: bool = Field(default=False, description="Whether server.log has errors")
-    status: str = Field(default="unknown", description="One of: healthy, stopped, broken, missing")
-
-
-class ToolInventoryResponse(BaseModel):
-    ok: bool = True
-    total_tools: int = 0
-    tools: list[ToolInfo] = []
-
-
-@app.post("/tool_inventory", response_model=ToolInventoryResponse)
-async def tool_inventory():
-    """Return a detailed inventory of every tool in my_tools/.
-
-    For each tool reports whether:
-    - The code exists on disk (server.py present)
-    - The process is alive (pid file check)
-    - The healthz endpoint responds
-    - The server.log has errors
-
-    Status summary:
-    - "healthy"  — running + healthz ok + no errors
-    - "stopped"  — code exists but process not running (needs start)
-    - "broken"   — process dead or unhealthy or has errors (needs repair)
-    - "missing"  — directory exists but no server.py (needs build)
-    """
-    if not MY_TOOLS_DIR.exists():
-        return ToolInventoryResponse()
-
-    tools: list[ToolInfo] = []
-
-    for tool_dir in sorted(MY_TOOLS_DIR.iterdir()):
-        if not tool_dir.is_dir() or tool_dir.name.startswith(("_", ".")):
-            continue
-
-        name = tool_dir.name
-        server_py = tool_dir / "server.py"
-        port_file = tool_dir / "port.txt"
-
-        if not server_py.exists():
-            tools.append(ToolInfo(tool_name=name, exists=False, status="missing"))
-            continue
-
-        port = int(port_file.read_text().strip()) if port_file.exists() else 0
-        mcp_port = port + 600 if port else 0
-
-        info = _read_tool(name)
-        if "error" in info:
-            tools.append(ToolInfo(
-                tool_name=name, exists=True, port=port, mcp_port=mcp_port,
-                status="broken",
-            ))
-            continue
-
-        process_alive = info.get("process_alive", False)
-        healthy = info.get("healthy", False)
-        has_errors = info.get("has_errors", False)
-
-        if healthy and not has_errors:
-            status = "healthy"
-        elif not process_alive:
-            status = "stopped"
-        else:
-            status = "broken"
-
-        tools.append(ToolInfo(
-            tool_name=name,
-            exists=True,
-            port=port,
-            mcp_port=mcp_port,
-            process_alive=process_alive,
-            healthy=healthy,
-            has_errors=has_errors,
-            status=status,
-        ))
-
-    return ToolInventoryResponse(
-        total_tools=len(tools),
-        tools=tools,
-    )
-
-
-# ── POST /ensure_all_tools ─────────────────────────────────────
-
-class EnsureAllToolsResponse(BaseModel):
-    ok: bool = True
-    started: list[str] = Field(default_factory=list, description="Tools that were started successfully")
-    repair_jobs: dict[str, str] = Field(default_factory=dict, description="tool_name → job_id for tools sent to repair")
-    already_healthy: list[str] = Field(default_factory=list, description="Tools that were already running fine")
-    failed: list[str] = Field(default_factory=list, description="Tools that failed to start and couldn't be repaired")
-    registered: list[str] = Field(default_factory=list, description="Tools re-registered with main OpenCode")
-    cleanup_removed: list[str] = Field(default_factory=list, description="Orphaned tools that were cleaned up (removed from disk)")
-    summary: str = ""
-
-
-@app.post("/ensure_all_tools", response_model=EnsureAllToolsResponse)
-async def ensure_all_tools():
-    """Ensure every tool in my_tools/ is running and healthy.
-
-    This is the main "boot recovery" endpoint.  Called by the supervisor
-    after a fresh OS reboot (or when main.py restarts).
-
-    For each tool:
-    1. If healthy → skip (already good).
-    2. If stopped (code exists, process dead, no errors) → start it + register.
-    3. If broken (errors in log, unhealthy) → attempt restart first.
-       If still broken after restart → queue a repair job (AI-powered).
-    4. If missing (no server.py) → skip (needs build_tool, not auto-repair).
-
-    Returns immediately with results for start/skip, plus job_ids for
-    any async repair jobs that were queued.
-    """
-    if not MY_TOOLS_DIR.exists():
-        return EnsureAllToolsResponse(summary="my_tools/ directory does not exist")
-
-    # First, clean up any tools that were manually removed from disk
-    cleanup_removed = _cleanup_orphaned_tools()
-
-    started: list[str] = []
-    repair_jobs: dict[str, str] = {}
-    already_healthy: list[str] = []
-    failed: list[str] = []
-    registered: list[str] = []
-
-    tool_dirs = sorted(
-        d for d in MY_TOOLS_DIR.iterdir()
-        if d.is_dir() and not d.name.startswith(("_", "."))
-    )
-
-    for tool_dir in tool_dirs:
-        name = tool_dir.name
-        server_py = tool_dir / "server.py"
-
-        if not server_py.exists():
-            LOG.info("ensure_all_tools: %s — no server.py, skipping (needs build)", name)
-            continue
-
-        info = _read_tool(name)
-        if "error" in info:
-            LOG.warning("ensure_all_tools: %s — read error: %s", name, info["error"])
-            failed.append(name)
-            continue
-
-        port = info["port"]
-        mcp_port = info["mcp_port"]
-
-        # Case 1: already healthy
-        if info["healthy"] and not info["has_errors"]:
-            LOG.info("ensure_all_tools: %s — already healthy on port %d", name, port)
-            already_healthy.append(name)
-            # Still re-register (OpenCode might have restarted too)
-            if _re_register_tool(name, mcp_port):
-                registered.append(name)
-            continue
-
-        # Case 2: stopped — just start it
-        if not info["process_alive"] and not info["has_errors"]:
-            LOG.info("ensure_all_tools: %s — stopped, starting on port %d", name, port)
-            ok = _restart_tool(name, port)
-            if ok:
-                started.append(name)
-                if _re_register_tool(name, mcp_port):
-                    registered.append(name)
-            else:
-                # Start failed — check if there are errors now, then repair
-                LOG.warning("ensure_all_tools: %s — start failed, queuing repair", name)
-                job = _create_job(JobKind.REPAIR, name)
-                job.log(f"Auto-repair queued after failed start — tool={name}")
-                thread = threading.Thread(
-                    target=_run_repair_sync,
-                    args=(job, name),
-                    daemon=True,
-                )
-                thread.start()
-                repair_jobs[name] = job.job_id
-            continue
-
-        # Case 3: broken — try restart first, then repair if needed
-        LOG.info("ensure_all_tools: %s — broken (alive=%s, healthy=%s, errors=%s), trying restart",
-                 name, info["process_alive"], info["healthy"], info["has_errors"])
-        ok = _restart_tool(name, port)
-        if ok:
-            started.append(name)
-            if _re_register_tool(name, mcp_port):
-                registered.append(name)
-        else:
-            # Restart didn't help — queue AI repair
-            LOG.warning("ensure_all_tools: %s — restart failed, queuing AI repair", name)
-            job = _create_job(JobKind.REPAIR, name)
-            job.log(f"Auto-repair queued after failed restart — tool={name}")
-            thread = threading.Thread(
-                target=_run_repair_sync,
-                args=(job, name),
-                daemon=True,
+            JobSummary(
+                job_id=j.job_id,
+                kind=j.kind.value,
+                tool_name=j.tool_name,
+                state=j.state.value,
+                phase=j.phase,
+                elapsed_seconds=j.elapsed(),
             )
-            thread.start()
-            repair_jobs[name] = job.job_id
-
-    parts = []
-    if cleanup_removed:
-        parts.append(f"{len(cleanup_removed)} orphans cleaned up: {', '.join(cleanup_removed)}")
-    if already_healthy:
-        parts.append(f"{len(already_healthy)} already healthy")
-    if started:
-        parts.append(f"{len(started)} started: {', '.join(started)}")
-    if repair_jobs:
-        parts.append(f"{len(repair_jobs)} sent to repair: {', '.join(repair_jobs.keys())}")
-    if failed:
-        parts.append(f"{len(failed)} failed: {', '.join(failed)}")
-    if registered:
-        parts.append(f"{len(registered)} registered with OpenCode")
-    summary = " | ".join(parts) if parts else "No tools found"
-
-    LOG.info("ensure_all_tools result: %s", summary)
-
-    return EnsureAllToolsResponse(
-        started=started,
-        repair_jobs=repair_jobs,
-        already_healthy=already_healthy,
-        failed=failed,
-        registered=registered,
-        cleanup_removed=cleanup_removed,
-        summary=summary,
+            for j in items[:30]
+        ],
     )
 
 
-# ── POST /fulfill_capability ───────────────────────────────────
+# ── POST /job_detail ────────────────────────────────────────────
 
-def _build_tool_inventory_for_ai() -> str:
-    """Build a human-readable summary of all existing tools for the AI to reason about."""
-    if not MY_TOOLS_DIR.exists():
-        return "(no my_tools/ directory — no tools exist yet)"
+class JobDetailRequest(BaseModel):
+    job_id: str = Field(description="The job_id from list_jobs")
 
-    sections: list[str] = []
-    for tool_dir in sorted(MY_TOOLS_DIR.iterdir()):
-        if not tool_dir.is_dir() or tool_dir.name.startswith(("_", ".")):
-            continue
-        name = tool_dir.name
-        server_py = tool_dir / "server.py"
-        port_file = tool_dir / "port.txt"
-
-        if not server_py.exists():
-            sections.append(f"### {name}\n- Status: EMPTY (no server.py)\n- Can be used for a new build.\n")
-            continue
-
-        port = int(port_file.read_text().strip()) if port_file.exists() else 0
-        source = server_py.read_text("utf-8", errors="replace")
-
-        # Extract endpoint info from source — look for @app.post and class definitions
-        endpoints: list[str] = []
-        for line in source.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("@app.post(") or stripped.startswith("@app.get("):
-                endpoints.append(stripped)
-            elif stripped.startswith("class ") and "Request" in stripped:
-                endpoints.append(stripped)
-
-        info = _read_tool(name)
-        status = "healthy" if info.get("healthy") else ("running" if info.get("process_alive") else "stopped")
-
-        section = f"### {name}\n"
-        section += f"- Port: {port}, Status: {status}\n"
-        section += f"- Endpoints: {', '.join(endpoints[:10]) if endpoints else '(none found)'}\n"
-        section += f"- Source length: {len(source)} chars\n"
-        # Include the first ~80 lines (imports + models + endpoint signatures) for context
-        source_preview = "\n".join(source.splitlines()[:80])
-        section += f"- Source preview:\n```python\n{source_preview}\n```\n"
-        sections.append(section)
-
-    if not sections:
-        return "(no tools found in my_tools/)"
-
-    return "\n".join(sections)
-
-
-def _build_fulfill_prompt(capability: str, inventory: str, context: str) -> str:
-    return textwrap.dedent(f"""\
-        [FULFILL CAPABILITY REQUEST]
-
-        The robot supervisor needs a capability. Your job is to decide the best
-        course of action and then EXECUTE it (write code, not just talk about it).
-
-        ## Requested capability
-        {capability}
-
-        ## Additional context from the supervisor
-        {context}
-
-        ## Existing tools in my_tools/
-        {inventory}
-
-        ## Your decision process
-        Analyze the request and the existing tools, then decide ONE of:
-
-        1. **EXISTS** — A tool already provides exactly this capability.
-           → Respond: `DECISION: EXISTS | tool=<name> | reason=<why it already works>`
-           → Do nothing else.
-
-        2. **EXTEND** — An existing tool is close but needs new endpoints or features.
-           → Respond first: `DECISION: EXTEND | tool=<name> | reason=<what needs adding>`
-           → Then WRITE the updated server.py with the new functionality added.
-           → Use bash: `cat > <tool_dir>/server.py << 'PYEOF' ... PYEOF`
-           → PRESERVE all existing endpoints — only ADD new ones.
-           → Preserve the bootstrap section at the bottom unchanged.
-           → Verify syntax: `python3 -c "import ast; ast.parse(open('<path>').read())"`
-           → Do NOT start the server.
-           → End with: `EXTENDED: <description of what was added>`
-
-        3. **BUILD** — No existing tool covers this. Build a new one.
-           → Respond first: `DECISION: BUILD | tool=<suggested_name> | reason=<why new>`
-           → Then follow the standard BUILD procedure from your instructions.
-           → End with: `BUILT: <description>`
-
-        ## Rules
-        - Be pragmatic. If an existing tool is 80%+ there, EXTEND it — don't rebuild.
-        - When extending, preserve ALL existing functionality. Only add.
-        - Tool names: lowercase, underscores, e.g. 'web_search'.
-        - Python only, uv add for packages, httpx for HTTP.
-        - FastAPI + FastMCP pattern. Every POST endpoint = MCP tool.
-        - DO NOT start servers or register them.
-    """)
-
-
-class FulfillCapabilityRequest(BaseModel):
-    capability: str = Field(description="Description of what the robot needs — be specific about the desired functionality")
-    context: str = Field(default="", description="Optional extra context (e.g. what the human asked the robot to do)")
-
-
-class FulfillCapabilityResponse(BaseModel):
+class JobDetailResponse(BaseModel):
     ok: bool = True
-    decision: str = Field(default="", description="One of: exists, extend, build, error")
-    tool_name: str = Field(default="", description="The tool that fulfills (or will fulfill) the capability")
-    port: int = Field(default=0, description="Port of the tool")
-    mcp_port: int = Field(default=0, description="MCP port of the tool")
-    action_taken: str = Field(default="", description="What was done: nothing, extended, built")
-    started: bool = Field(default=False, description="Whether the tool was (re)started")
-    registered: bool = Field(default=False, description="Whether it was registered with main OpenCode")
-    healthy: bool = Field(default=False, description="Whether it's healthy after the action")
-    summary: str = ""
-    job_id: str = Field(default="", description="Job ID if async work was queued")
+    job_id: str = ""
+    kind: str = ""
+    tool_name: str = ""
+    description: str = Field(default="", description="Original request text")
+    state: str = ""
+    phase: str = ""
+    elapsed_seconds: float = 0.0
+    turns_completed: int = 0
+    progress: list[str] = Field(default_factory=list, description="Step-by-step log")
+    result: dict[str, Any] = Field(default_factory=dict, description="Final result")
 
 
-def _run_fulfill_sync(job: Job, capability: str, context: str) -> None:
-    """Background worker — asks AI to decide and act, then restarts/registers."""
-    try:
-        job.state = JobState.RUNNING
+@app.post("/job_detail", response_model=JobDetailResponse)
+async def job_detail(req: JobDetailRequest):
+    """Get detailed status of a specific job by job_id.
 
-        # 1. Build inventory of existing tools
-        job.phase = "scanning existing tools"
-        job.log("Scanning existing tools for AI decision…")
-        inventory = _build_tool_inventory_for_ai()
-
-        # 2. Ask AI to decide
-        job.phase = "AI deciding: exists / extend / build"
-        job.log("Sending capability request to code AI…")
-        prompt = _build_fulfill_prompt(capability, inventory, context)
-        try:
-            client = _get_client()
-            client.new_session()  # fresh session for clean reasoning
-            reply = client.send(prompt)
-            LOG.info("Fulfill AI reply: %s", reply[:500])
-            for tc in client.last_tool_calls:
-                job.log(tc)
-            if reply.strip():
-                job.log(f"AI says: {reply[:400]}")
-        except Exception as exc:
-            job.phase = "AI error"
-            job.log(f"AI failed: {exc}")
-            job.state = JobState.FAILED
-            job.result = {"ok": False, "decision": "error", "summary": f"AI failed: {exc}"}
-            job.finished_at = time.time()
-            return
-
-        # 3. Parse the decision
-        reply_upper = reply.upper()
-        decision = "unknown"
-        tool_name = ""
-
-        if "DECISION: EXISTS" in reply_upper:
-            decision = "exists"
-            # Extract tool name from reply
-            m = re.search(r"DECISION:\s*EXISTS\s*\|\s*tool\s*=\s*(\S+)", reply, re.IGNORECASE)
-            if m:
-                tool_name = m.group(1).strip().rstrip("|").strip()
-        elif "DECISION: EXTEND" in reply_upper or "EXTENDED:" in reply_upper:
-            decision = "extend"
-            m = re.search(r"DECISION:\s*EXTEND\s*\|\s*tool\s*=\s*(\S+)", reply, re.IGNORECASE)
-            if m:
-                tool_name = m.group(1).strip().rstrip("|").strip()
-        elif "DECISION: BUILD" in reply_upper or "BUILT:" in reply_upper:
-            decision = "build"
-            m = re.search(r"DECISION:\s*BUILD\s*\|\s*tool\s*=\s*(\S+)", reply, re.IGNORECASE)
-            if m:
-                tool_name = m.group(1).strip().rstrip("|").strip()
-        elif "FAILED:" in reply_upper or "UNFIXABLE:" in reply_upper:
-            decision = "error"
-
-        job.log(f"Decision: {decision}, tool: {tool_name or '(unknown)'}")
-
-        # 4. Handle EXISTS — nothing to do
-        if decision == "exists":
-            info = _read_tool(tool_name) if tool_name else {}
-            port = info.get("port", 0)
-            mcp_port = info.get("mcp_port", 0)
-            healthy = info.get("healthy", False)
-
-            # Make sure it's registered (might not be after reboot)
-            registered = False
-            if mcp_port and healthy:
-                registered = _re_register_tool(tool_name, mcp_port)
-
-            job.phase = "done"
-            job.state = JobState.DONE
-            job.result = {
-                "ok": True, "decision": "exists", "tool_name": tool_name,
-                "port": port, "mcp_port": mcp_port, "action_taken": "nothing",
-                "started": False, "registered": registered, "healthy": healthy,
-                "summary": f"Tool '{tool_name}' already provides this capability.",
-            }
-            job.finished_at = time.time()
-            return
-
-        # 5. Handle EXTEND or BUILD — AI should have written code
-        if decision in ("extend", "build"):
-            action = "extended" if decision == "extend" else "built"
-
-            # For BUILD, create directory + port.txt if needed
-            if decision == "build" and tool_name:
-                tool_dir = MY_TOOLS_DIR / tool_name
-                tool_dir.mkdir(parents=True, exist_ok=True)
-                port_file = tool_dir / "port.txt"
-                if not port_file.exists():
-                    port = _next_free_port()
-                    port_file.write_text(str(port))
-                    job.log(f"Created tool dir and assigned port {port}")
-
-            if not tool_name:
-                # Try to find tool name from the AI's output (look for paths)
-                m = re.search(r"my_tools/(\w+)/server\.py", reply)
-                if m:
-                    tool_name = m.group(1)
-                    job.log(f"Inferred tool name from AI output: {tool_name}")
-
-            if not tool_name:
-                job.phase = "error"
-                job.log("Could not determine tool name from AI response")
-                job.state = JobState.FAILED
-                job.result = {"ok": False, "decision": decision, "summary": "AI did not specify a tool name"}
-                job.finished_at = time.time()
-                return
-
-            info = _read_tool(tool_name)
-            port = info.get("port", 0) if "error" not in info else 0
-            mcp_port = port + 600 if port else 0
-
-            # Verify server.py exists and has valid syntax
-            server_py = MY_TOOLS_DIR / tool_name / "server.py"
-            if not server_py.exists():
-                job.phase = "error"
-                job.log(f"AI said {action} but server.py not found at {server_py}")
-                job.state = JobState.FAILED
-                job.result = {"ok": False, "decision": decision, "tool_name": tool_name,
-                              "summary": f"AI said {action} but didn't write server.py"}
-                job.finished_at = time.time()
-                return
-
-            job.phase = "verifying syntax"
-            job.log("Verifying Python syntax…")
-            try:
-                import ast
-                ast.parse(server_py.read_text("utf-8"))
-                job.log("✅ Syntax OK")
-            except SyntaxError as exc:
-                job.log(f"⚠️ Syntax error: {exc} — attempting repair…")
-                repair_info = _read_tool(tool_name)
-                try:
-                    repair_reply = client.send(_build_repair_prompt(repair_info))
-                    for tc in client.last_tool_calls:
-                        job.log(tc)
-                except Exception:
-                    pass
-                try:
-                    ast.parse(server_py.read_text("utf-8"))
-                    job.log("✅ Syntax OK after repair")
-                except SyntaxError as exc2:
-                    job.phase = "syntax error"
-                    job.log(f"❌ Still broken: {exc2}")
-                    job.state = JobState.FAILED
-                    job.result = {"ok": False, "decision": decision, "tool_name": tool_name,
-                                  "summary": f"Syntax error unfixable: {exc2}"}
-                    job.finished_at = time.time()
-                    return
-
-            # Restart the tool
-            job.phase = "restarting"
-            job.log(f"Restarting {tool_name} on port {port}…")
-            started = _restart_tool(tool_name, port) if port else False
-            if started:
-                job.log("✅ Server started")
-            else:
-                job.log("❌ Server failed to start")
-
-            # Register with main OpenCode
-            registered = False
-            if started and mcp_port:
-                job.phase = "registering"
-                registered = _re_register_tool(tool_name, mcp_port)
-                if registered:
-                    job.log("✅ Registered with OpenCode")
-
-            # Health check
-            healthy = False
-            if started:
-                try:
-                    r = requests.get(f"http://127.0.0.1:{port}/healthz", timeout=5)
-                    healthy = r.ok
-                except Exception:
-                    pass
-
-            job.phase = "done" if healthy else "done (unhealthy)"
-            job.state = JobState.DONE if healthy else JobState.FAILED
-            job.result = {
-                "ok": True, "decision": decision, "tool_name": tool_name,
-                "port": port, "mcp_port": mcp_port, "action_taken": action,
-                "started": started, "registered": registered, "healthy": healthy,
-                "summary": f"{action.capitalize()} '{tool_name}' — {'✅ healthy' if healthy else '❌ unhealthy'}",
-            }
-            job.finished_at = time.time()
-            job.log(f"Fulfill finished in {job.elapsed()}s — {action} '{tool_name}' ({'healthy' if healthy else 'unhealthy'})")
-            return
-
-        # 6. Unknown / error decision
-        job.phase = "error"
-        job.state = JobState.FAILED
-        job.result = {"ok": False, "decision": decision, "summary": f"AI decision unclear: {reply[:300]}"}
-        job.finished_at = time.time()
-
-    except Exception as exc:
-        job.phase = "unexpected error"
-        job.log(f"Unexpected error: {exc}")
-        job.state = JobState.FAILED
-        job.result = {"ok": False, "decision": "error", "summary": f"Unexpected error: {exc}"}
-        job.finished_at = time.time()
-
-
-@app.post("/fulfill_capability", response_model=FulfillCapabilityResponse)
-async def fulfill_capability(req: FulfillCapabilityRequest):
-    """Smart capability fulfillment — AI decides whether to reuse, extend, or build.
-
-    Send a description of what capability the robot needs. The codex agent will:
-    1. Scan all existing tools and their endpoints.
-    2. Ask its AI to decide: does a tool already cover this? Should one be extended?
-       Or should a new one be built from scratch?
-    3. Execute the decision (write code, restart, register).
-
-    Runs **asynchronously** — returns a job_id immediately.
-    Poll ``/build_status`` with the job_id to track progress.
+    Returns the full progress log (every step the AI took),
+    the original request description, current phase, and the final
+    result once the job finishes.
     """
-    job = _create_job(JobKind.BUILD, req.capability[:40])
-    job.log(f"Fulfill capability queued: {req.capability[:200]}")
-
-    thread = threading.Thread(
-        target=_run_fulfill_sync,
-        args=(job, req.capability, req.context),
-        daemon=True,
-    )
-    thread.start()
-
-    return FulfillCapabilityResponse(
+    job = _get_job(req.job_id)
+    if job is None:
+        return JobDetailResponse(
+            ok=False, job_id=req.job_id, state="not_found",
+            phase=f"Job '{req.job_id}' not found",
+        )
+    return JobDetailResponse(
         ok=True,
-        decision="pending",
-        summary=f"Analyzing capability request — job_id={job.job_id}. Poll build_status for progress.",
         job_id=job.job_id,
+        kind=job.kind.value,
+        tool_name=job.tool_name,
+        description=job.description,
+        state=job.state.value,
+        phase=job.phase,
+        elapsed_seconds=job.elapsed(),
+        turns_completed=job.turns_completed,
+        progress=list(job.progress),
+        result=dict(job.result) if job.result else {},
     )
 
+
+# ══════════════════════════════════════════════════════════════════
+#  Main
+# ══════════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(description="Codex Agent MCP Server")
@@ -2449,7 +1421,7 @@ def main():
     api_port = args.port
     mcp_port = api_port + 600   # 8612
 
-    # Setup logging — use config log_level for console, always DEBUG to file
+    # Setup logging
     log_file = BASE_DIR / "log.out"
     cfg_log_level = _CFG.get("log_level", "INFO").upper()
 
@@ -2472,8 +1444,8 @@ def main():
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
 
-    # Start the dedicated OpenCode instance for AI-powered repairs
-    LOG.info("Booting repair agent MCP server on port %d (MCP: %d)", api_port, mcp_port)
+    # Start the dedicated OpenCode instance
+    LOG.info("Booting codex agent on port %d (MCP: %d)", api_port, mcp_port)
     _start_opencode_serve()
     _wait_for_opencode(retries=30, delay=2.0)
 
