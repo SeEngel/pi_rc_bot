@@ -14,6 +14,8 @@ EnvironmentFile=-%h/Desktop/pi_rc_bot/.env
 ExecStart=/usr/bin/env uv run python main.py
 Restart=on-failure
 RestartSec=2
+StartLimitIntervalSec=30
+StartLimitBurst=5
 
 [Install]
 WantedBy=default.target

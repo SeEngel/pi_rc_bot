@@ -29,6 +29,12 @@ systemctl --user disable --now pi_rc_services.service >/dev/null 2>&1 || true
 systemctl --user disable --now pi_rc_brain_services.service >/dev/null 2>&1 || true
 systemctl --user disable --now pi_rc_move_services.service >/dev/null 2>&1 || true
 
+# Kill any lingering service processes (child processes may survive systemd stop).
+if [[ -x "${ROOT_DIR}/services/kill_all.sh" ]]; then
+	log "Running kill_all.sh to clean up lingering processes."
+	bash "${ROOT_DIR}/services/kill_all.sh" 2>/dev/null || true
+fi
+
 log "Removing installed unit files from: ${UNIT_DST_DIR}"
 rm -f "${UNIT_DST_DIR}/pi_rc_advisor.service" \
       "${UNIT_DST_DIR}/pi_rc_advisor_split_brain.service" \
