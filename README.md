@@ -2,6 +2,8 @@
 
 An autonomous robotic system for the PiCar-X platform, powered by OpenCode (LLM supervisor) and distributed MCP microservices.
 
+> **📖 Detailed OpenCode documentation:** The [`OpenCode/README.md`](OpenCode/README.md) contains in-depth operational documentation — OpenCode HTTP API, installation, configuration, LLM provider setup (OpenAI / OpenRouter), API key management, boot sequence, and troubleshooting.
+
 ## Hardware
 
 - **Raspberry Pi 5** (16GB RAM)

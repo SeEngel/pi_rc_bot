@@ -495,6 +495,8 @@ The agent can create new MCP tools at runtime:
 3. Hot-registers it with OpenCode via `POST /mcp`
 4. The tool is immediately available for subsequent turns
 
+> **📖 Deep-dive:** See [Dynamic Tool Creation — Self-Extending Agent via Codex Agent](../README.md#dynamic-tool-creation--self-extending-agent-via-codex-agent) in the root README for a detailed walkthrough with Mermaid diagrams covering the full end-to-end flow, tool lifecycle, self-repair, and the two-level OpenCode architecture.
+
 ### Session Rotation
 
 After every 10 turns, the supervisor creates a fresh OpenCode session to prevent context window overflow.
