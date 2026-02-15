@@ -11,6 +11,7 @@ dependencies = [
     "fastapi>=0.129.0",
     "fastmcp>=2.14.5",
     "feedparser>=6.0.12",
+    "ffmpeg-python>=0.2.0",
     "google-api-python-client>=2.190.0",
     "google-auth>=2.48.0",
     "google-auth-oauthlib>=1.2.4",
