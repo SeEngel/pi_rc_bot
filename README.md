@@ -281,7 +281,7 @@ Because OpenCode also supports **hot-registration of MCP servers** via its `/mcp
 
 ### Why OpenCode Makes This Possible
 
-OpenCode exposes a **headless HTTP API** (`opencode serve`) that turns any LLM into a fully autonomous coding agent with file editing, terminal access, and tool-use capabilities. The Codex Agent runs its **own, separate OpenCode instance** (port 4097) backed by a strong code model (e.g., Gemini 2.5 Flash, Qwen3 Coder). This gives it the same power as a human developer sitting at a terminal: it can write files, install packages, and verify syntax — all autonomously.
+OpenCode exposes a **headless HTTP API** (`opencode serve`) that turns any LLM into a fully autonomous coding agent with file editing, terminal access, and tool-use capabilities. The Codex Agent runs its **own, separate OpenCode instance** (port 4097) backed by a strong code model. This gives it the same power as a human developer sitting at a terminal: it can write files, install packages, and verify syntax — all autonomously.
 
 Because OpenCode also supports **hot-registration of MCP servers** via its `/mcp` HTTP endpoint, newly created tools can be injected into the main agent's tool palette at runtime, without restarting anything.
 
